@@ -1,14 +1,14 @@
 {
   "serviceKey": "gbc-porting",
-  "name": "GBA Porting",
-  "description": "Account-scoped browser GB/GBC/GBA player with VBA Link 1.7.2 save compatibility",
+  "name": "GBC Porting",
+  "description": "Account-scoped browser GB/GBC/GBA player with authenticated two-user GBA cable rooms",
   "requesterName": "Imported value is ignored by /service",
   "requesterEmail": "imported-value-is-ignored@example.com",
   "permissions": [
     {
       "key": "user",
       "label": "User",
-      "description": "Play ROMs and use account-scoped quick state and battery saves"
+      "description": "Play ROMs, use account-scoped saves, and create or join two-user GBA cable rooms"
     }
   ],
   "oidcClients": [

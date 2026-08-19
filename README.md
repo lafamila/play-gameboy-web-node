@@ -1,6 +1,6 @@
-# GBA Porting POC
+# GBC Porting
 
-VisualBoyAdvance Link 1.7.2-compatible GB/GBC/GBA emulation in the browser. The POC runs the original VBA 1.7.2 cores as WebAssembly and preserves the legacy gzip save-state formats.
+VisualBoyAdvance 1.7.2 GB/GBC/GBA emulation in the browser with VBA Link 1.72-derived two-user GBA cable rooms. Legacy gzip save-state and battery formats remain compatible.
 
 ## Features
 
@@ -14,6 +14,9 @@ VisualBoyAdvance Link 1.7.2-compatible GB/GBC/GBA emulation in the browser. The 
 - Reference fixtures from the local `data/` directory
 - GB/GBC 160x144 and GBA 240x160 automatic display switching
 - Persistent Speed toggle using VBA's speed input mode
+- Authenticated two-account GBA cable rooms over same-origin WebSocket
+- FireRed/LeafGreen/Ruby/Sapphire/Emerald region-compatible room matching
+- Transfer-sequence barrier, paired checkpoints and atomic two-account battery commit
 
 ## Permissions
 
@@ -30,7 +33,8 @@ VisualBoyAdvance Link 1.7.2-compatible GB/GBC/GBA emulation in the browser. The 
 Copy `.env.example` to `.env` and fill the MariaDB password, OIDC client secret and session encryption key. The DB connection reuses todo-api-fastapi's MariaDB host, port, user and password; only `DB_NAME=gbc_porting` differs.
 
 ```bash
-npm start
+npm run build:core
+npm run dev
 ```
 
 Open `http://127.0.0.1:4173`.
@@ -44,7 +48,7 @@ Import [auth/service-onboarding.json](./auth/service-onboarding.json) in auth-ap
 1. Copy the one-time confidential client secret to `GBC_PORTING_OIDC_CLIENT_SECRET`.
 2. Generate `GBC_PORTING_SESSION_ENCRYPTION_KEY` with `openssl rand -base64 32`.
 3. Keep the local callback `http://localhost:4173/auth/callback` for development.
-4. When the production domain is decided, submit an onboarding update that adds `https://{domain}/auth/callback` and set `PUBLIC_BASE_URL` and `GBC_PORTING_OIDC_REDIRECT_URI` to that domain.
+4. Production uses `https://play.lafamila.xyz/auth/callback`; set `PUBLIC_BASE_URL` and `GBC_PORTING_OIDC_REDIRECT_URI` accordingly.
 
 No auth service credential is needed for the current scope.
 
@@ -54,7 +58,20 @@ Rebuild the pinned VBA 1.7.2 WebAssembly core:
 npm run build:core
 ```
 
-The build downloads the official source archive and Emscripten 4.0.15 into `.build/`. Set `EMSDK_DIR` to reuse an existing Emscripten installation.
+The build downloads the pinned VisualBoyAdvance 1.7.2 source, the VBA Link 1.72 patch source, and Emscripten 4.0.15 into `.build/`. Both source archives are checksum-verified and served beside the WASM bundle. Set `EMSDK_DIR` to reuse an existing Emscripten installation.
+
+## Link Cable
+
+1. Both users load a GBA ROM and enter `Link Cable`.
+2. The host creates a room and sends its room ID and invite code to the guest.
+3. The guest joins with a compatible ROM. Pokemon Gen 3 titles may differ when their region code matches.
+4. Both users select `Ready`; the host selects `Start`.
+5. The browsers exchange only GBA serial words. Gameplay and rendering remain local.
+6. Leave the in-game trade room so both games write their battery save, then select `Finish + save` on both browsers.
+
+While a room is active, speed mode and individual quick-state load/import are disabled. Periodic resume checkpoints are accepted only as a synchronized pair. Battery saves are written only when both participants submit successfully; disconnecting or aborting cannot commit one side alone.
+
+GB/GBC link cable is not supported because the VBA Link 1.72 source itself does not implement it.
 
 ## Verify
 
@@ -64,7 +81,16 @@ npm run test:core
 npm run test:browser
 ```
 
-`npm run test:browser` starts an isolated auth test session, in-memory test database and Chrome profile. It verifies the visitor gate, access request, superadmin controls, ROM upload and boot, video/audio output, keyboard input, three distinct reference states, `.sg1` and `.sa1` roundtrips, wrong-ROM/corrupt-state rejection, account save restore, and desktop/mobile rendering. Runtime code uses MariaDB; the memory adapter is rejected outside `NODE_ENV=test`.
+`npm run test:browser` starts an isolated auth test session, in-memory test database and Chrome profile. The Node suite additionally opens two authenticated HTTP/WebSocket sessions and verifies room admission, serial-word exchange, mixed-ROM save locking, paired checkpoints and atomic battery commit. Runtime code uses MariaDB; the memory adapter is rejected outside `NODE_ENV=test`.
+
+## Docker
+
+```bash
+docker build -t teddy-gbc-porting:local .
+docker run --rm -p 4173:4173 --env-file .env teddy-gbc-porting:local
+```
+
+This is `STANDALONE_DEPLOY`: the repo owns its image and deployment settings and is not registered as an app container in the root compose files.
 
 ## Controls
 
@@ -90,8 +116,8 @@ The `superadmin` file-transfer restriction is an application permission boundary
 
 ## Status
 
-See [POC_STATUS.md](./POC_STATUS.md). Local AUTH and account-isolation checks pass. Loading a web-exported `.sg1` in the supplied Windows VBA Link executable remains deferred until a Windows environment is available.
+See [POC_STATUS.md](./POC_STATUS.md). Core/API/WebSocket checks pass locally. Loading a web-exported `.sg1` in the supplied Windows VBA Link executable and a full manual in-game trade remain explicit environment/manual checks.
 
 ## License
 
-The VBA-derived WebAssembly bridge and core are distributed under GPL-2.0-or-later. See [LICENSE](./LICENSE) and [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). The original source archive is also served from `Core source` in the application header.
+The VBA-derived WebAssembly bridge, link transport and core are distributed under GPL-2.0-or-later. See [LICENSE](./LICENSE) and [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md). Both pinned source archives are served from the application.

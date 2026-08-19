@@ -18,4 +18,14 @@ The WebAssembly build uses the original GBA emulation and v8 state serialization
 
 The unmodified upstream source archive is copied to `core/dist/VisualBoyAdvance-src-1.7.2.zip` during the build and is downloadable from the running application.
 
+## VBA Link 1.72
+
+The GBA multiplayer register behavior and transfer timing in `core/vba172_link.cpp` are derived from denopqrihg's VBA Link 1.72 GPL source.
+
+- Source archive: `https://vbalink.info/downloads/V172lsrc.zip`
+- Pinned SHA-256: `bba595fce888e2af151d99b4351de4f16aa2cf8671aebfe08a0e37b3bbad944b`
+- License: GPL-2.0-or-later
+
+The pinned patch source is copied to `core/dist/V172lsrc.zip` during the build. Windows shared-memory and WinSock code are not compiled into the browser; the application supplies an authenticated WebSocket barrier instead.
+
 ROMs, battery saves and quick states under `data/` are user-provided fixtures and are not part of the licensed emulator source distribution.

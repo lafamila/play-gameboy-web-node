@@ -5,10 +5,13 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import { WebSocketServer, WebSocket } from 'ws';
 
 import { AuthClient, AuthError } from './lib/auth.mjs';
 import { createConfig } from './lib/config.mjs';
 import { createDatabase } from './lib/database.mjs';
+import { LinkRoomError } from './lib/link-room.mjs';
+import { LinkService } from './lib/link-service.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
@@ -31,26 +34,31 @@ export async function createApp(options = {}) {
   const config = options.config ?? createConfig({ root: ROOT });
   const database = options.database ?? await createDatabase(config.database, { allowMemory: config.authTestMode });
   const auth = options.auth ?? new AuthClient(config, database);
+  const linkService = options.linkService ?? new LinkService({ database });
+  await linkService.initialize?.();
   await mkdir(config.romStorageDir, { recursive: true });
   await syncRomCatalog(config, database);
 
   const server = createServer((request, response) => {
-    void handleRequest({ request, response, config, database, auth }).catch((error) => {
+    void handleRequest({ request, response, config, database, auth, linkService }).catch((error) => {
       if (response.headersSent) {
         response.destroy(error);
         return;
       }
-      const statusCode = error.statusCode || (error.code === 'ENOENT' ? 404 : 500);
+      const statusCode = error.statusCode || linkErrorStatus(error) || (error.code === 'ENOENT' ? 404 : 500);
       json(response, statusCode, { error: statusCode === 500 ? 'Server error' : error.message });
       if (statusCode === 500) console.error(error);
     });
   });
+  const linkSockets = attachLinkWebSockets({ server, config, auth, linkService });
   return {
     server,
     config,
     database,
     auth,
+    linkService,
     close: async () => {
+      await linkSockets.close();
       if (server.listening) await new Promise((resolve) => server.close(resolve));
       await database.close();
     },
@@ -58,7 +66,7 @@ export async function createApp(options = {}) {
 }
 
 async function handleRequest(context) {
-  const { request, response, config, database, auth } = context;
+  const { request, response, config, database, auth, linkService } = context;
   const url = new URL(request.url, config.publicBaseUrl);
 
   if (request.method === 'GET' && url.pathname === '/api/health') {
@@ -162,6 +170,62 @@ async function handleRequest(context) {
     });
     await database.upsertRom({ ...record, filename: storedName, path: storedPath, createdBy: session.accountId });
     return json(response, 201, { ...record, filename: storedName });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/link/rooms') {
+    requirePermission(session, ['user', 'superadmin']);
+    requireCsrf(request, session, config);
+    const body = await readJsonRequest(request, 32 * 1024);
+    const result = await linkService.createRoom({ accountId: session.accountId, romId: body.romId });
+    return json(response, 201, result);
+  }
+
+  const linkRoomMatch = url.pathname.match(/^\/api\/link\/rooms\/([0-9a-f-]+)(?:\/(join|ready|start|abort|battery))?$/i);
+  if (linkRoomMatch) {
+    requirePermission(session, ['user', 'superadmin']);
+    const [, roomId, action] = linkRoomMatch;
+    if (request.method === 'GET' && !action) {
+      return json(response, 200, { room: await linkService.getRoom({ roomId, accountId: session.accountId }) });
+    }
+    if (request.method === 'POST' && action) {
+      requireCsrf(request, session, config);
+      if (action === 'join') {
+        const body = await readJsonRequest(request, 32 * 1024);
+        const room = await linkService.joinRoom({
+          roomId,
+          accountId: session.accountId,
+          inviteCode: body.inviteCode,
+          romId: body.romId,
+        });
+        return json(response, 200, { room });
+      }
+      if (action === 'ready') {
+        const body = await readJsonRequest(request, 8 * 1024);
+        const room = await linkService.setReady({
+          roomId, accountId: session.accountId, ready: body.ready !== false,
+        });
+        return json(response, 200, { room });
+      }
+      if (action === 'start') {
+        return json(response, 200, {
+          room: await linkService.startRoom({ roomId, accountId: session.accountId }),
+        });
+      }
+      if (action === 'abort') {
+        const body = await readJsonRequest(request, 8 * 1024);
+        return json(response, 200, {
+          room: await linkService.abortRoom({
+            roomId, accountId: session.accountId, reason: body.reason || 'cancelled',
+          }),
+        });
+      }
+      if (action === 'battery') {
+        const payload = await readRequest(request, config.maxSaveBytes);
+        return json(response, 200, await linkService.submitBattery({
+          roomId, accountId: session.accountId, payload,
+        }));
+      }
+    }
   }
 
   const romMatch = url.pathname.match(/^\/api\/roms\/([a-f0-9]{64})\/file$/);
@@ -344,6 +408,140 @@ async function readRequest(request, limit) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
+}
+
+async function readJsonRequest(request, limit) {
+  const payload = await readRequest(request, limit);
+  try {
+    return JSON.parse(payload.toString('utf8'));
+  } catch {
+    throw new AuthError(400, 'Invalid JSON body');
+  }
+}
+
+function attachLinkWebSockets({ server, config, auth, linkService }) {
+  const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+  const sockets = new Map();
+
+  function accountSockets(roomId, accountId, create = false) {
+    let room = sockets.get(roomId);
+    if (!room && create) {
+      room = new Map();
+      sockets.set(roomId, room);
+    }
+    let account = room?.get(accountId);
+    if (!account && create) {
+      account = new Set();
+      room.set(accountId, account);
+    }
+    return account;
+  }
+
+  function send(target, message) {
+    if (target.readyState === WebSocket.OPEN) target.send(JSON.stringify(message));
+  }
+
+  const onServiceMessage = ({ roomId, targetAccountId, message }) => {
+    const room = sockets.get(roomId);
+    if (!room) return;
+    for (const [accountId, targets] of room) {
+      if (targetAccountId && accountId !== targetAccountId) continue;
+      for (const target of targets) send(target, message);
+    }
+  };
+  linkService.on('message', onServiceMessage);
+
+  server.on('upgrade', (request, socket, head) => {
+    void (async () => {
+      const url = new URL(request.url, config.publicBaseUrl);
+      const match = url.pathname.match(/^\/api\/link\/rooms\/([0-9a-f-]+)\/socket$/i);
+      const origin = request.headers.origin;
+      if (!match || (origin && origin !== new URL(config.publicBaseUrl).origin)) {
+        rejectUpgrade(socket, 403, 'Forbidden');
+        return;
+      }
+      const session = await auth.getSession(cookies(request)[config.sessionCookieName]);
+      requirePermission(session, ['user', 'superadmin']);
+      const roomId = match[1];
+      const room = await linkService.connect({ roomId, accountId: session.accountId });
+      webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+        webSocketServer.emit('connection', webSocket, { roomId, accountId: session.accountId, room });
+      });
+    })().catch((error) => {
+      rejectUpgrade(socket, error.statusCode || linkErrorStatus(error) || 500, error.message);
+    });
+  });
+
+  webSocketServer.on('connection', (webSocket, context) => {
+    const { roomId, accountId, room } = context;
+    accountSockets(roomId, accountId, true).add(webSocket);
+    webSocket.isAlive = true;
+    send(webSocket, { type: 'connected', room });
+    webSocket.on('pong', () => { webSocket.isAlive = true; });
+    webSocket.on('message', (payload, isBinary) => {
+      void (async () => {
+        if (isBinary) throw new AuthError(400, 'Binary link messages are not supported');
+        let message;
+        try { message = JSON.parse(payload.toString('utf8')); }
+        catch { throw new AuthError(400, 'Invalid link message JSON'); }
+        await linkService.handleMessage({ roomId, accountId, message });
+      })().catch((error) => send(webSocket, {
+        type: 'error', code: error.code || 'LINK_ERROR', message: error.message,
+      }));
+    });
+    webSocket.on('close', () => {
+      const account = accountSockets(roomId, accountId);
+      account?.delete(webSocket);
+      if (account?.size === 0) {
+        sockets.get(roomId)?.delete(accountId);
+        void linkService.disconnect({ roomId, accountId }).catch(() => {});
+      }
+      if (sockets.get(roomId)?.size === 0) sockets.delete(roomId);
+    });
+  });
+
+  const heartbeat = setInterval(() => {
+    for (const client of webSocketServer.clients) {
+      if (!client.isAlive) {
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, 30_000);
+  heartbeat.unref();
+
+  return {
+    close: async () => {
+      clearInterval(heartbeat);
+      linkService.off('message', onServiceMessage);
+      for (const client of webSocketServer.clients) client.terminate();
+      await new Promise((resolve) => webSocketServer.close(resolve));
+    },
+  };
+}
+
+function rejectUpgrade(socket, statusCode, message) {
+  if (socket.destroyed) return;
+  const body = String(message || 'Rejected');
+  socket.end(
+    `HTTP/1.1 ${statusCode} Rejected\r\nConnection: close\r\nContent-Type: text/plain\r\n` +
+    `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+}
+
+function linkErrorStatus(error) {
+  if (error instanceof LinkRoomError) {
+    if (['ROOM_NOT_FOUND'].includes(error.code)) return 404;
+    if (['FORBIDDEN'].includes(error.code)) return 403;
+    if (['INVALID_INPUT', 'INVITE_MISMATCH', 'INCOMPATIBLE_CLIENT'].includes(error.code)) return 400;
+    return 409;
+  }
+  if (error?.code === 'ROM_NOT_FOUND' || error?.code === 'LINK_ROOM_NOT_FOUND') return 404;
+  if (typeof error?.code === 'string' &&
+      (error.code.startsWith('LINK_') || error.code.startsWith('SAVE_'))) return 409;
+  return 0;
 }
 
 async function sendFile(response, filename, cacheControl = 'no-cache') {

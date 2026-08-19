@@ -15,6 +15,7 @@ fi
 
 SOURCES=(
   "${ROOT_DIR}/core/vba172_web.cpp"
+  "${ROOT_DIR}/core/vba172_link.cpp"
   "${ROOT_DIR}/core/vba172_util.cpp"
   "${SOURCE_DIR}/src/GBA.cpp"
   "${SOURCE_DIR}/src/Globals.cpp"

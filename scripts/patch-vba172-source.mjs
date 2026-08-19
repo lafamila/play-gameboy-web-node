@@ -95,3 +95,72 @@ if (!source.includes('legacyLastTime')) {
   }
   await writeFile(filename, source);
 }
+
+const gbaFilename = path.join(sourceRoot, 'src', 'GBA.cpp');
+let gbaSource = await readFile(gbaFilename, 'utf8');
+if (!gbaSource.includes('extern void StartLink(u16);')) {
+  const replacements = [
+    [
+`extern int emulating;
+`,
+`extern int emulating;
+
+// Browser link transport, derived from VBA Link 1.72.
+extern int linktime;
+extern void StartLink(u16);
+extern void StartGPLink(u16);
+extern void StartJOYLink(u16);
+extern void LinkUpdate();
+`,
+    ],
+    [
+`  case 0x128:
+    if(value & 0x80) {
+      value &= 0xff7f;
+      if(value & 1 && (value & 0x4000)) {
+        UPDATE_REG(0x12a, 0xFF);
+        IF |= 0x80;
+        UPDATE_REG(0x202, IF);
+        value &= 0x7f7f;
+      }
+    }
+    UPDATE_REG(0x128, value);
+    break;
+`,
+`  case 0x128:
+    StartLink(value);
+    break;
+  case 0x12a:
+    UPDATE_REG(0x12a, value);
+    break;
+  case 0x134:
+    StartGPLink(value);
+    break;
+  case 0x140:
+    StartJOYLink(value);
+    break;
+`,
+    ],
+    [
+`      ticks -= clockTicks;
+
+      cpuLoopTicks = CPUUpdateTicks();
+`,
+`      ticks -= clockTicks;
+
+      linktime += clockTicks;
+      LinkUpdate();
+
+      cpuLoopTicks = CPUUpdateTicks();
+`,
+    ],
+  ];
+
+  for (const [before, after] of replacements) {
+    if (!gbaSource.includes(before)) {
+      throw new Error(`VBA 1.7.2 GBA link patch context not found in ${gbaFilename}`);
+    }
+    gbaSource = gbaSource.replace(before, after);
+  }
+  await writeFile(gbaFilename, gbaSource);
+}

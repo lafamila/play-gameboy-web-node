@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { WebSocket } from 'ws';
 
 import { createConfig } from '../lib/config.mjs';
 import { createApp } from '../server.mjs';
@@ -26,8 +27,10 @@ async function withServer(callback) {
   const app = await createApp({ config });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   const { port } = app.server.address();
+  const origin = `http://127.0.0.1:${port}`;
+  app.config.publicBaseUrl = origin;
   try {
-    await callback({ origin: `http://127.0.0.1:${port}`, app });
+    await callback({ origin, app });
   } finally {
     await app.close();
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -54,6 +57,32 @@ async function login(origin, accountId, permission) {
 async function fixture(extension, includes = '') {
   const filename = (await readdir(DATA)).find((name) => name.endsWith(extension) && name.includes(includes));
   return readFile(path.join(DATA, filename));
+}
+
+function waitForSocketMessage(socket, type) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${type}`)), 5000);
+    const onMessage = (payload) => {
+      const message = JSON.parse(payload.toString('utf8'));
+      if (message.type !== type) return;
+      clearTimeout(timeout);
+      socket.off('message', onMessage);
+      resolve(message);
+    };
+    socket.on('message', onMessage);
+  });
+}
+
+async function openLinkSocket(origin, roomId, cookie) {
+  const socket = new WebSocket(
+    `${origin.replace(/^http/, 'ws')}/api/link/rooms/${roomId}/socket`,
+    { headers: { Cookie: cookie, Origin: origin } },
+  );
+  await new Promise((resolve, reject) => {
+    socket.once('open', resolve);
+    socket.once('error', reject);
+  });
+  return socket;
 }
 
 test('unauthenticated clients can render login shell but cannot read ROM data', () => withServer(async ({ origin }) => {
@@ -169,4 +198,73 @@ test('static WebAssembly keeps isolation headers and source archive', () => with
   assert.equal(wasm.headers.get('content-type'), 'application/wasm');
   assert.equal(wasm.headers.get('cross-origin-embedder-policy'), 'require-corp');
   assert.equal((await fetch(`${origin}/core/VisualBoyAdvance-src-1.7.2.zip`)).status, 200);
+  assert.equal((await fetch(`${origin}/core/V172lsrc.zip`)).status, 200);
+}));
+
+test('two authenticated browser sessions exchange a cable word and atomically commit batteries', () => withServer(async ({ origin }) => {
+  const host = await login(origin, 'link-host', 'user');
+  const guest = await login(origin, 'link-guest', 'user');
+  const roms = await fetch(`${origin}/api/roms`, { headers: host.headers }).then((response) => response.json());
+  const rom = roms.find((item) => item.platform === 'gba');
+  assert.ok(rom);
+
+  const createdResponse = await fetch(`${origin}/api/link/rooms`, {
+    method: 'POST',
+    headers: { ...host.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ romId: rom.id }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = await createdResponse.json();
+  const roomId = created.room.id;
+
+  const joined = await fetch(`${origin}/api/link/rooms/${roomId}/join`, {
+    method: 'POST',
+    headers: { ...guest.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ romId: rom.id, inviteCode: created.inviteCode }),
+  });
+  assert.equal(joined.status, 200);
+  for (const actor of [host, guest]) {
+    const ready = await fetch(`${origin}/api/link/rooms/${roomId}/ready`, {
+      method: 'POST',
+      headers: { ...actor.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ready: true }),
+    });
+    assert.equal(ready.status, 200);
+  }
+  const started = await fetch(`${origin}/api/link/rooms/${roomId}/start`, {
+    method: 'POST', headers: host.headers,
+  });
+  assert.equal(started.status, 200);
+
+  const hostSocket = await openLinkSocket(origin, roomId, host.headers.Cookie);
+  const guestSocket = await openLinkSocket(origin, roomId, guest.headers.Cookie);
+  try {
+    const offer = waitForSocketMessage(guestSocket, 'link-offer');
+    const hostPair = waitForSocketMessage(hostSocket, 'link-pair');
+    const guestPair = waitForSocketMessage(guestSocket, 'link-pair');
+    hostSocket.send(JSON.stringify({ type: 'link-offer', sequence: 0, speed: 3, data: 0x1234 }));
+    assert.deepEqual(await offer, { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234 });
+    guestSocket.send(JSON.stringify({ type: 'link-response', sequence: 0, speed: 3, data: 0xabcd }));
+    assert.deepEqual(await hostPair, {
+      type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd,
+    });
+    assert.deepEqual(await guestPair, {
+      type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd,
+    });
+
+    const battery = await fixture('.sa1');
+    const first = await fetch(`${origin}/api/link/rooms/${roomId}/battery`, {
+      method: 'POST', headers: host.headers, body: battery,
+    });
+    assert.equal((await first.json()).status, 'finishing');
+    const second = await fetch(`${origin}/api/link/rooms/${roomId}/battery`, {
+      method: 'POST', headers: guest.headers, body: battery,
+    });
+    assert.equal((await second.json()).status, 'completed');
+    assert.equal((await fetch(`${origin}/api/saves/${rom.id}/battery`, { headers: host.headers })).status, 200);
+    assert.equal((await fetch(`${origin}/api/saves/${rom.id}/battery`, { headers: guest.headers })).status, 200);
+  } finally {
+    hostSocket.close();
+    guestSocket.close();
+  }
 }));

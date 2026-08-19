@@ -224,6 +224,21 @@ async function main() {
     assert.ok(startup.frameCount >= 20, JSON.stringify(startup));
     assert.ok(startup.audioSamples >= 1000, JSON.stringify(startup));
     assert.ok(startup.visiblePixels >= 1000, JSON.stringify(startup));
+    assert.equal(await evaluate('document.getElementById("link-create").disabled'), false);
+    await click('link-create');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().linkRoom?.status === "waiting" && window.__gbaPoc.diagnostics().linkRoom?.socketOpen',
+      'link room socket',
+    );
+    assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), true);
+    await click('link-abort');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().linkRoom?.status === "aborted"',
+      'link room abort',
+    );
+    await click('link-close');
+    await waitExpression('window.__gbaPoc.diagnostics().linkRoom === null', 'link room close');
+    assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), false);
 
     await cdp.send('Input.dispatchKeyEvent', {
       type: 'keyDown', key: 'x', code: 'KeyX', windowsVirtualKeyCode: 88, nativeVirtualKeyCode: 88,

@@ -15,6 +15,7 @@
 #include "Sound.h"
 #include "gb/GB.h"
 #include "gb/gbGlobals.h"
+#include "vba172_link.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -153,6 +154,7 @@ void ShutdownLoaded() {
   g_emulator = nullptr;
   g_system = -1;
   emulating = 0;
+  vbaLinkReset();
 }
 
 }  // namespace
@@ -234,6 +236,7 @@ VBA_EXPORT int vba_load_rom(const uint8_t* data, int size, int system) {
     return 0;
   }
   ShutdownLoaded();
+  vbaLinkReset();
   ConfigureColorMap();
   if (system == 0) {
     if (!CPULoadRom(romPath)) {
@@ -276,10 +279,12 @@ VBA_EXPORT int vba_load_rom(const uint8_t* data, int size, int system) {
 
 VBA_EXPORT int vba_run_frame() {
   if (!g_loaded) return 0;
+  if (vbaLinkWaiting()) return 2;
   const uint64_t target = g_frame_counter + 1;
   for (int attempt = 0; attempt < 4 && g_frame_counter < target; ++attempt) {
     g_emulator->emuMain(g_emulator->emuCount);
     ++g_emulation_steps;
+    if (vbaLinkWaiting()) return 2;
   }
   return g_frame_counter >= target ? 1 : 0;
 }
@@ -375,6 +380,26 @@ VBA_EXPORT const char* vba_last_error() { return g_last_error.c_str(); }
 
 VBA_EXPORT int vba_state_version() { return g_system == 1 ? 10 : SAVE_GAME_VERSION; }
 
+VBA_EXPORT int vba_link_set_player(int player_id) {
+  if (!g_loaded || g_system != 0) return 0;
+  return vbaLinkSetPlayer(player_id);
+}
+VBA_EXPORT int vba_link_player() { return vbaLinkPlayer(); }
+VBA_EXPORT int vba_link_waiting() { return vbaLinkWaiting(); }
+VBA_EXPORT int vba_link_transfer_active() { return vbaLinkTransferActive(); }
+VBA_EXPORT int vba_link_request_pending() { return vbaLinkRequestPending(); }
+VBA_EXPORT int vba_link_request_sequence() { return vbaLinkRequestSequence(); }
+VBA_EXPORT int vba_link_request_speed() { return vbaLinkRequestSpeed(); }
+VBA_EXPORT int vba_link_request_data() { return vbaLinkRequestData(); }
+VBA_EXPORT int vba_link_prepare_remote(int sequence, int speed, int master_data) {
+  return vbaLinkPrepareRemote(sequence, speed, master_data);
+}
+VBA_EXPORT int vba_link_apply_pair(int sequence, int speed, int master_data,
+                                  int slave_data) {
+  return vbaLinkApplyPair(sequence, speed, master_data, slave_data);
+}
+VBA_EXPORT void vba_link_cancel_wait() { vbaLinkCancelWait(); }
+
 VBA_EXPORT void vba_shutdown() {
   ShutdownLoaded();
 }
@@ -382,6 +407,40 @@ VBA_EXPORT void vba_shutdown() {
 }  // extern "C"
 
 #ifdef VBA_NATIVE_TEST
+bool RunNativeLinkProbe() {
+  if (!vba_link_set_player(0)) {
+    fprintf(stderr, "LINK probe configure failed\n");
+    return false;
+  }
+  WRITE16LE(&ioMem[0x134], 0);
+  WRITE16LE(&ioMem[0x12a], 0x1234);
+  StartLink(0x6083);
+  if (!vba_link_request_pending() || !vba_link_waiting() ||
+      vba_link_request_sequence() != 0 || vba_link_request_speed() != 3 ||
+      vba_link_request_data() != 0x1234) {
+    fprintf(stderr, "LINK probe request=%d wait=%d seq=%d speed=%d data=%04x\n",
+            vba_link_request_pending(), vba_link_waiting(),
+            vba_link_request_sequence(), vba_link_request_speed(),
+            vba_link_request_data());
+    return false;
+  }
+  if (!vba_link_apply_pair(0, 3, 0x1234, 0xabcd)) {
+    fprintf(stderr, "LINK probe pair failed\n");
+    return false;
+  }
+  linktime = 100000;
+  LinkUpdate();
+  const bool passed = !vba_link_transfer_active() && !vba_link_waiting() &&
+                      READ16LE(&ioMem[0x120]) == 0x1234 &&
+                      READ16LE(&ioMem[0x122]) == 0xabcd;
+  if (!passed) {
+    fprintf(stderr, "LINK probe active=%d wait=%d data=%04x/%04x\n",
+            vba_link_transfer_active(), vba_link_waiting(),
+            READ16LE(&ioMem[0x120]), READ16LE(&ioMem[0x122]));
+  }
+  return vba_link_set_player(-1) && passed;
+}
+
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: vba172-test ROM STATE|- [OUTPUT]\n");
@@ -401,6 +460,10 @@ int main(int argc, char** argv) {
   const int system = isGb ? 1 : 0;
   if (!vba_load_rom(rom_data.data(), static_cast<int>(rom_data.size()), system)) {
     fprintf(stderr, "ROM: %s\n", vba_last_error());
+    return 1;
+  }
+  if (system == 0 && !RunNativeLinkProbe()) {
+    fprintf(stderr, "LINK: browser cable transport probe failed\n");
     return 1;
   }
   if (std::string(argv[2]) != "-") {

@@ -9,6 +9,9 @@ OUTPUT_DIR="${ROOT_DIR}/core/dist"
 EMSDK_DIR="${EMSDK_DIR:-${BUILD_DIR}/emsdk}"
 SOURCE_URL="https://downloads.sourceforge.net/project/vba/VisualBoyAdvance/1.7.2/VisualBoyAdvance-src-1.7.2.zip"
 SOURCE_SHA256="83e1b72433cb14e3a468575a13d5165a271dd24599ac30755fb5bc6d5727129a"
+LINK_SOURCE_ARCHIVE="${BUILD_DIR}/V172lsrc.zip"
+LINK_SOURCE_URL="https://vbalink.info/downloads/V172lsrc.zip"
+LINK_SOURCE_SHA256="bba595fce888e2af151d99b4351de4f16aa2cf8671aebfe08a0e37b3bbad944b"
 EMSDK_VERSION="4.0.15"
 
 mkdir -p "${BUILD_DIR}" "${OUTPUT_DIR}"
@@ -20,6 +23,16 @@ fi
 ACTUAL_SHA256="$(shasum -a 256 "${SOURCE_ARCHIVE}" | awk '{print $1}')"
 if [[ "${ACTUAL_SHA256}" != "${SOURCE_SHA256}" ]]; then
   echo "Unexpected VisualBoyAdvance source checksum: ${ACTUAL_SHA256}" >&2
+  exit 1
+fi
+
+if [[ ! -f "${LINK_SOURCE_ARCHIVE}" ]]; then
+  curl -L "${LINK_SOURCE_URL}" -o "${LINK_SOURCE_ARCHIVE}"
+fi
+
+ACTUAL_LINK_SHA256="$(shasum -a 256 "${LINK_SOURCE_ARCHIVE}" | awk '{print $1}')"
+if [[ "${ACTUAL_LINK_SHA256}" != "${LINK_SOURCE_SHA256}" ]]; then
+  echo "Unexpected VBA Link 1.72 source checksum: ${ACTUAL_LINK_SHA256}" >&2
   exit 1
 fi
 
@@ -44,6 +57,7 @@ source "${EMSDK_DIR}/emsdk_env.sh" >/dev/null
 
 SOURCES=(
   "${ROOT_DIR}/core/vba172_web.cpp"
+  "${ROOT_DIR}/core/vba172_link.cpp"
   "${ROOT_DIR}/core/vba172_util.cpp"
   "${SOURCE_DIR}/src/GBA.cpp"
   "${SOURCE_DIR}/src/Globals.cpp"
@@ -72,7 +86,7 @@ SOURCES=(
   "${SOURCE_DIR}/src/gb/gbSound.cpp"
 )
 
-EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_shutdown"]'
+EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_link_set_player","_vba_link_player","_vba_link_waiting","_vba_link_transfer_active","_vba_link_request_pending","_vba_link_request_sequence","_vba_link_request_speed","_vba_link_request_data","_vba_link_prepare_remote","_vba_link_apply_pair","_vba_link_cancel_wait","_vba_shutdown"]'
 
 em++ \
   -std=gnu++14 \
@@ -101,5 +115,6 @@ em++ \
   -o "${OUTPUT_DIR}/vba172.js"
 
 cp -f "${SOURCE_ARCHIVE}" "${OUTPUT_DIR}/VisualBoyAdvance-src-1.7.2.zip"
+cp -f "${LINK_SOURCE_ARCHIVE}" "${OUTPUT_DIR}/V172lsrc.zip"
 
 echo "Built ${OUTPUT_DIR}/vba172.js and ${OUTPUT_DIR}/vba172.wasm"

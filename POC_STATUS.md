@@ -5,6 +5,7 @@ Status: **PROVISIONAL PASS**
 Target fixture:
 
 - VisualBoyAdvance Link 1.7.2
+- VBA Link 1.72 GBA cable transport source
 - VBA save-state format version 8
 - GBA ROM identity `POKEMON FIREBPRE`
 - BIOS disabled
@@ -33,9 +34,18 @@ Target fixture:
 | Visitor is restricted to access request | PASS | Browser and API tests hide the emulator and accept only the request flow |
 | User and superadmin boundaries are enforced | PASS | User management calls return 403; superadmin upload and file controls pass |
 | Saves are isolated by account | PASS | Two accounts retain distinct states for the same ROM composite key |
-| MariaDB schema is operational | PASS | `gbc_porting` created on todo's MariaDB connection with five service tables |
+| Link source provenance is pinned | PASS | `V172lsrc.zip` SHA-256 is verified before every core build and served beside WASM |
+| GBA serial register/timing transport | PASS | Native probe verifies multiplayer request, paired word registers, IRQ completion and idle reset |
+| Two authenticated users can join a room | PASS | HTTP/WebSocket integration opens two account sessions and enforces host/guest slots |
+| Compatible mixed ROMs use participant saves | PASS | FireRed/LeafGreen-style ROM IDs acquire independent account/ROM revision locks |
+| Cable transfer barrier works | PASS | Both slots must submit the same monotonic sequence before either receives `link-pair` |
+| Disconnect replay works | PASS | Reconnect `sync` replays a completed pair or pending host offer without advancing sequence |
+| Link checkpoints are paired | PASS | A checkpoint becomes resumable only after both participant state payloads arrive |
+| Link battery commit is atomic | PASS | Both account/ROM battery rows update in one MariaDB transaction; conflicts update neither |
+| MariaDB schema is operational | PASS | `gbc_porting` link migration applied on the existing todo MariaDB connection |
+| Full in-game FireRed trade persists after room close | DEFERRED-MANUAL | Requires two progressed trainer saves and interactive trade-room completion |
 | Web export resumes in supplied Windows executable | DEFERRED-WINDOWS | Requires a Windows environment with the bundled VBA Link 1.7.2 executable |
 
 ## Promotion Gate
 
-This POC can be treated as technically successful under the agreed local acceptance rule. Promotion to `STANDALONE_DEPLOY` should be a separate workspace lifecycle change and must retain `DEFERRED-WINDOWS` until the final VBA Link import test is performed.
+The repository is registered as `STANDALONE_DEPLOY / draft`: it has a reproducible image and complete two-user cable infrastructure, but it is not marked active until the manual in-game trade check passes. `DEFERRED-WINDOWS` remains explicit until the final VBA Link import test is performed.

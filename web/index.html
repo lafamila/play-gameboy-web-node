@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-    <title>GBA Porting POC</title>
+    <title>GBC Porting</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -12,12 +12,12 @@
     </section>
 
     <section id="login-view" class="gate-view" hidden>
-      <h1>GBA Porting</h1>
+      <h1>GBC Porting</h1>
       <a id="login-link" class="primary-link" href="/auth/login">Login</a>
     </section>
 
     <section id="visitor-view" class="gate-view" hidden>
-      <h1>GBA Porting</h1>
+      <h1>GBC Porting</h1>
       <span id="visitor-account" class="gate-status"></span>
       <button id="request-access" class="primary" type="button">Request user access</button>
       <span id="access-request-status" class="gate-status"></span>
@@ -27,7 +27,7 @@
     <div id="app-view" hidden>
     <header class="topbar">
       <div>
-        <h1>GBA Porting</h1>
+        <h1>GBC Porting</h1>
         <span class="build-tag">VBA 1.7.2 / state v8</span>
       </div>
       <div class="top-actions">
@@ -90,6 +90,34 @@
         </div>
 
         <aside class="save-column">
+          <section class="save-section link-section">
+            <div class="section-heading">
+              <h2>Link Cable</h2>
+              <span id="link-socket-status" class="link-socket-status">Offline</span>
+            </div>
+            <div id="link-lobby" class="link-lobby">
+              <button id="link-create" class="primary" type="button" disabled>Create room</button>
+              <input id="link-room-input" type="text" inputmode="text" autocomplete="off" placeholder="Room ID" aria-label="Room ID" />
+              <input id="link-invite-input" type="text" inputmode="text" autocomplete="off" placeholder="Invite code" aria-label="Invite code" />
+              <button id="link-join" type="button" disabled>Join</button>
+            </div>
+            <div id="link-room" class="link-room" hidden>
+              <dl class="link-details">
+                <div><dt>Room</dt><dd id="link-room-id"></dd></div>
+                <div id="link-invite-row" hidden><dt>Invite</dt><dd id="link-invite-code"></dd></div>
+                <div><dt>Status</dt><dd id="link-room-status"></dd></div>
+              </dl>
+              <ol id="link-participants" class="link-participants"></ol>
+              <div class="action-grid link-actions">
+                <button id="link-ready" type="button">Ready</button>
+                <button id="link-start" class="primary" type="button">Start</button>
+                <button id="link-finish" class="primary" type="button">Finish + save</button>
+                <button id="link-abort" class="danger" type="button">Abort</button>
+                <button id="link-close" type="button" hidden>Close</button>
+              </div>
+            </div>
+          </section>
+
           <section class="save-section">
             <h2>Quick State</h2>
             <div class="action-grid">

@@ -2,6 +2,8 @@ import createVbaModule from '/core/vba172.js';
 
 const FRAME_RATE = 59.7275;
 const CORE_SAMPLE_RATE = 44100;
+const LINK_CHECKPOINT_INTERVAL = 30_000;
+const LINK_ROOM_POLL_INTERVAL = 3_000;
 
 const elements = Object.fromEntries([
   'auth-loading', 'login-view', 'login-link', 'visitor-view', 'app-view', 'visitor-account',
@@ -12,7 +14,10 @@ const elements = Object.fromEntries([
   'speed-toggle',
   'quick-save', 'quick-load', 'export-state', 'import-state', 'import-state-label',
   'quick-state-meta', 'export-battery', 'import-battery', 'import-battery-label',
-  'battery-meta', 'fixture-list', 'event-log',
+  'battery-meta', 'fixture-list', 'event-log', 'link-socket-status', 'link-lobby',
+  'link-create', 'link-room-input', 'link-invite-input', 'link-join', 'link-room',
+  'link-room-id', 'link-invite-row', 'link-invite-code', 'link-room-status',
+  'link-participants', 'link-ready', 'link-start', 'link-finish', 'link-abort', 'link-close',
 ].map((id) => [id, document.getElementById(id)]));
 
 const canvasContext = elements.screen.getContext('2d', { alpha: false });
@@ -42,6 +47,24 @@ let audioPosition = 0;
 let batteryTimer;
 let sessionTimer;
 let currentSession;
+let emulatorControlsEnabled = false;
+let hasStoredQuickState = false;
+let linkRoom;
+let linkInviteCode = '';
+let linkSocket;
+let linkSocketGeneration = 0;
+let linkReconnectTimer;
+let linkRoomTimer;
+let linkCheckpointTimer;
+let linkRoomRefreshing = false;
+let linkCheckpointing = false;
+let linkCheckpointPendingSequence = null;
+let linkCheckpointPendingState = '';
+let linkFinishSubmitted = false;
+let linkCorePlayer = -1;
+let linkDetachPending = false;
+let linkLastOfferSequence = -1;
+let linkTransferActive = false;
 
 async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -61,7 +84,10 @@ function stopEmulation() {
   running = false;
   clearInterval(batteryTimer);
   cancelAnimationFrame(animationHandle);
+  closeLinkSocket();
+  clearLinkTimers();
   if (core) core._vba_shutdown();
+  linkCorePlayer = -1;
 }
 
 function setStatus(text, kind = 'idle') {
@@ -79,17 +105,52 @@ function logEvent(message, error = false) {
   }
 }
 
+function isLinkRoomOpen(room = linkRoom) {
+  return Boolean(room && !['completed', 'aborted'].includes(room.status));
+}
+
+function currentLinkParticipant(room = linkRoom) {
+  const accountId = currentSession?.account?.id;
+  return room?.participants?.find((participant) => participant?.accountId === accountId) || null;
+}
+
+function activeGbaSelected() {
+  return Boolean(activeRom?.platform === 'gba' && activeRom.id === elements['rom-select'].value);
+}
+
+function cableIdle() {
+  return Boolean(core && !core._vba_link_waiting() && !core._vba_link_transfer_active() &&
+    !core._vba_link_request_pending());
+}
+
 function setControls(enabled) {
-  for (const id of ['pause', 'mute', 'fullscreen', 'speed-toggle', 'quick-save', 'quick-load']) {
-    elements[id].disabled = !enabled;
-  }
-  const superadminEnabled = enabled && currentSession?.permission === 'superadmin';
-  for (const id of ['export-state', 'export-battery', 'import-state', 'import-battery']) {
-    elements[id].disabled = !superadminEnabled;
-  }
-  elements['import-state-label'].classList.toggle('disabled', !superadminEnabled);
-  elements['import-battery-label'].classList.toggle('disabled', !superadminEnabled);
+  emulatorControlsEnabled = enabled;
+  applyControlState();
   if (enabled) updateStoredStateControls();
+}
+
+function applyControlState() {
+  const roomOpen = isLinkRoomOpen();
+  for (const id of ['pause', 'mute', 'fullscreen']) elements[id].disabled = !emulatorControlsEnabled;
+  elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen;
+  elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen;
+  elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || !hasStoredQuickState;
+
+  const superadminEnabled = emulatorControlsEnabled && currentSession?.permission === 'superadmin';
+  elements['export-state'].disabled = !superadminEnabled || roomOpen;
+  elements['import-state'].disabled = !superadminEnabled || roomOpen;
+  elements['import-battery'].disabled = !superadminEnabled || roomOpen;
+  elements['export-battery'].disabled = !superadminEnabled;
+  elements['import-state-label'].classList.toggle('disabled', elements['import-state'].disabled);
+  elements['import-battery-label'].classList.toggle('disabled', elements['import-battery'].disabled);
+  elements['rom-select'].disabled = roomOpen;
+  elements['load-rom'].disabled = roomOpen || roms.length === 0;
+
+  const canEnterRoom = activeGbaSelected() && !linkRoom;
+  elements['link-create'].disabled = !canEnterRoom;
+  elements['link-join'].disabled = !canEnterRoom || !elements['link-room-input'].value.trim() ||
+    !elements['link-invite-input'].value.trim();
+  renderFixtures();
 }
 
 function coreError(fallback) {
@@ -117,7 +178,8 @@ function getExportBytes() {
 
 async function updateStoredStateControls() {
   if (!activeRom || !core) {
-    elements['quick-load'].disabled = true;
+    hasStoredQuickState = false;
+    applyControlState();
     return;
   }
   const response = await apiFetch(`/api/saves/${activeRom.id}/meta`);
@@ -125,13 +187,14 @@ async function updateStoredStateControls() {
   const metadata = await response.json();
   const state = metadata.saves.find((save) => save.kind === 'state');
   const battery = metadata.saves.find((save) => save.kind === 'battery');
-  elements['quick-load'].disabled = !state;
+  hasStoredQuickState = Boolean(state);
   elements['quick-state-meta'].textContent = state
     ? `Account state / ${new Date(Number(state.updatedAt)).toLocaleString()}`
     : 'No account state';
   elements['battery-meta'].textContent = battery
     ? `Account battery / ${new Date(Number(battery.updatedAt)).toLocaleString()}`
     : 'No account battery save';
+  applyControlState();
 }
 
 function ascii(bytes) {
@@ -220,7 +283,9 @@ function pullAudio(minimumSamples) {
 function renderAudio(event) {
   const left = event.outputBuffer.getChannelData(0);
   const right = event.outputBuffer.getChannelData(1);
-  if (!core || !running || paused || muted || speedMode) {
+  const linkBlocked = isLinkRoomOpen() &&
+    (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing || core?._vba_link_waiting());
+  if (!core || !running || paused || linkBlocked || muted || speedMode) {
     if (core && speedMode && audioPointer) {
       while (core._vba_audio_available() > 0) {
         core._vba_audio_read(audioPointer, Math.min(core._vba_audio_available(), 16384));
@@ -278,20 +343,35 @@ function gamepadMask() {
 
 function animationLoop(timestamp) {
   if (!running) return;
+  if (linkDetachPending && !core._vba_link_transfer_active()) detachLinkCore();
   const elapsed = lastFrameTime ? Math.min(timestamp - lastFrameTime, 100) : 0;
   lastFrameTime = timestamp;
   frameDebt += elapsed * (speedMode ? 4 : 1);
   const frameDuration = 1000 / FRAME_RATE;
-  if (!paused) {
+  const linkBlocked = isLinkRoomOpen() &&
+    (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing ||
+      (linkRoom.status === 'active' && linkCorePlayer < 0));
+  if (linkBlocked) frameDebt = Math.min(frameDebt, frameDuration);
+  if (!paused && !linkBlocked) {
     let frames = 0;
     const maxFrames = speedMode ? 12 : 3;
     while (frameDebt >= frameDuration && frames < maxFrames) {
       core._vba_set_joypad(keyMask | touchMask | gamepadMask() | (speedMode ? 1024 : 0));
-      core._vba_run_frame();
+      const result = core._vba_run_frame();
+      if (result === 2) {
+        maybeSendLinkOffer();
+        frameDebt = Math.min(frameDebt, frameDuration);
+        break;
+      }
       frameDebt -= frameDuration;
       ++frames;
     }
     if (frames) renderFrame();
+  }
+  const transferActive = Boolean(core._vba_link_transfer_active());
+  if (transferActive !== linkTransferActive) {
+    linkTransferActive = transferActive;
+    if (linkRoom) renderLinkRoom();
   }
   animationHandle = requestAnimationFrame(animationLoop);
 }
@@ -305,6 +385,457 @@ function startLoop() {
   elements.pause.textContent = 'Pause';
   setStatus('Running', 'running');
   animationHandle = requestAnimationFrame(animationLoop);
+}
+
+function linkSocketOpen() {
+  return linkSocket?.readyState === WebSocket.OPEN;
+}
+
+function sendLinkMessage(message) {
+  if (!linkSocketOpen()) return false;
+  linkSocket.send(JSON.stringify(message));
+  return true;
+}
+
+function syncLinkTransfer() {
+  if (!core || linkRoom?.status !== 'active') return;
+  sendLinkMessage({ type: 'sync', sequence: Number(core._vba_link_request_sequence()) });
+}
+
+function maybeSendLinkOffer() {
+  const participant = currentLinkParticipant();
+  if (participant?.slot !== 0 || linkRoom?.status !== 'active' || linkRoom.paused ||
+      !core._vba_link_request_pending()) return;
+  const sequence = Number(core._vba_link_request_sequence());
+  if (sequence === linkLastOfferSequence) return;
+  if (sendLinkMessage({
+    type: 'link-offer',
+    sequence,
+    speed: Number(core._vba_link_request_speed()),
+    data: Number(core._vba_link_request_data()),
+  })) {
+    linkLastOfferSequence = sequence;
+    renderLinkRoom();
+  }
+}
+
+function attachLinkCore() {
+  const participant = currentLinkParticipant();
+  if (!core || !participant || activeRom?.platform !== 'gba' || linkRoom?.status !== 'active') return;
+  if (linkCorePlayer === participant.slot) return;
+  if (!cableIdle() || !core._vba_link_set_player(participant.slot)) {
+    logEvent('Link core is not ready', true);
+    return;
+  }
+  linkCorePlayer = participant.slot;
+  linkDetachPending = false;
+  logEvent(`Link player ${participant.slot + 1} ready`);
+}
+
+function detachLinkCore() {
+  if (!core || linkCorePlayer < 0) return;
+  if (core._vba_link_transfer_active()) {
+    linkDetachPending = true;
+    return;
+  }
+  core._vba_link_cancel_wait();
+  if (core._vba_link_set_player(-1)) {
+    linkCorePlayer = -1;
+    linkDetachPending = false;
+  } else {
+    linkDetachPending = true;
+  }
+}
+
+function renderLinkRoom() {
+  const room = linkRoom;
+  elements['link-lobby'].hidden = Boolean(room);
+  elements['link-room'].hidden = !room;
+  const socketState = linkSocketOpen() ? 'Online' : linkSocket ? 'Connecting' : 'Offline';
+  elements['link-socket-status'].textContent = socketState;
+  elements['link-socket-status'].className = `link-socket-status ${
+    socketState === 'Online' ? 'online' : socketState === 'Connecting' ? 'waiting' : ''}`;
+  if (!room) {
+    applyControlState();
+    return;
+  }
+
+  const participant = currentLinkParticipant(room);
+  const terminal = ['completed', 'aborted'].includes(room.status);
+  const host = room.createdBy === currentSession?.account?.id || participant?.slot === 0;
+  elements['link-room-id'].textContent = room.id;
+  elements['link-invite-row'].hidden = !linkInviteCode;
+  elements['link-invite-code'].textContent = linkInviteCode;
+  elements['link-room-status'].textContent = room.paused && !terminal ? 'paused' : room.status;
+  elements['link-participants'].replaceChildren(...[0, 1].map((slot) => {
+    const item = room.participants?.[slot];
+    const row = document.createElement('li');
+    const role = document.createElement('span');
+    role.textContent = slot === 0 ? 'P1 host' : 'P2 guest';
+    const name = document.createElement('span');
+    name.className = 'participant-name';
+    name.textContent = item ? `${item.accountId}${item.accountId === currentSession?.account?.id ? ' (you)' : ''}` : 'Empty';
+    name.title = name.textContent;
+    const state = document.createElement('span');
+    state.className = 'participant-state';
+    if (!item) state.textContent = 'Waiting';
+    else if (!item.connected) { state.textContent = 'Offline'; state.classList.add('offline'); }
+    else if (['active', 'finishing', 'completed'].includes(room.status)) {
+      state.textContent = 'Online'; state.classList.add('ready');
+    } else if (item.ready) { state.textContent = 'Ready'; state.classList.add('ready'); }
+    else state.textContent = 'Waiting';
+    row.append(role, name, state);
+    return row;
+  }));
+
+  const canReady = ['waiting', 'ready'].includes(room.status);
+  elements['link-ready'].hidden = !canReady;
+  elements['link-ready'].textContent = participant?.ready ? 'Not ready' : 'Ready';
+  elements['link-ready'].disabled = !participant || room.paused || !linkSocketOpen();
+  elements['link-start'].hidden = !canReady || !host;
+  elements['link-start'].disabled = room.status !== 'ready' || room.paused || !linkSocketOpen();
+  elements['link-finish'].hidden = !['active', 'finishing'].includes(room.status);
+  elements['link-finish'].disabled = !['active', 'finishing'].includes(room.status) || room.paused || linkFinishSubmitted ||
+    linkCheckpointPendingSequence !== null || !linkSocketOpen() || !cableIdle();
+  elements['link-finish'].textContent = linkFinishSubmitted ? 'Saving...' : 'Finish + save';
+  elements['link-abort'].hidden = terminal;
+  elements['link-close'].hidden = !terminal;
+  applyControlState();
+}
+
+function updateLinkRoom(room) {
+  if (!room || (linkRoom && room.id !== linkRoom.id)) return;
+  const previous = linkRoom;
+  linkRoom = { ...previous, ...room };
+  if (linkCheckpointPendingSequence !== null &&
+      Number(linkRoom.nextCheckpointSequence || 0) > linkCheckpointPendingSequence) {
+    linkCheckpointPendingSequence = null;
+    linkCheckpointPendingState = '';
+  }
+  if (linkRoom.status === 'active') {
+    speedMode = false;
+    elements['speed-toggle'].setAttribute('aria-pressed', 'false');
+    elements['speed-toggle'].textContent = 'Speed off';
+    clearInterval(batteryTimer);
+    attachLinkCore();
+  } else if (['completed', 'aborted'].includes(linkRoom.status)) {
+    detachLinkCore();
+    clearLinkTimers();
+  }
+  if (linkRoom.paused && running) setStatus('Link paused', 'loading');
+  else if (previous?.paused && running && !paused) setStatus('Running', 'running');
+  renderLinkRoom();
+}
+
+function clearLinkTimers() {
+  clearTimeout(linkReconnectTimer);
+  clearInterval(linkRoomTimer);
+  clearInterval(linkCheckpointTimer);
+  linkReconnectTimer = undefined;
+  linkRoomTimer = undefined;
+  linkCheckpointTimer = undefined;
+}
+
+function startLinkTimers() {
+  clearInterval(linkRoomTimer);
+  clearInterval(linkCheckpointTimer);
+  linkRoomTimer = setInterval(() => refreshLinkRoom().catch((error) => logEvent(error.message, true)),
+    LINK_ROOM_POLL_INTERVAL);
+  linkCheckpointTimer = setInterval(() => submitLinkCheckpoint().catch((error) => {
+    linkCheckpointPendingSequence = null;
+    logEvent(error.message, true);
+  }), LINK_CHECKPOINT_INTERVAL);
+}
+
+function closeLinkSocket() {
+  ++linkSocketGeneration;
+  const socket = linkSocket;
+  linkSocket = undefined;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+  renderLinkRoom();
+}
+
+function openLinkSocket() {
+  if (!isLinkRoomOpen() || linkSocket?.readyState === WebSocket.OPEN ||
+      linkSocket?.readyState === WebSocket.CONNECTING) return;
+  const generation = ++linkSocketGeneration;
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${protocol}//${location.host}/api/link/rooms/${encodeURIComponent(linkRoom.id)}/socket`);
+  linkSocket = socket;
+  renderLinkRoom();
+  socket.addEventListener('open', () => {
+    if (generation !== linkSocketGeneration) return;
+    linkLastOfferSequence = -1;
+    if (linkCheckpointPendingSequence !== null && linkCheckpointPendingState) {
+      sendLinkMessage({
+        type: 'checkpoint', sequence: linkCheckpointPendingSequence, state: linkCheckpointPendingState,
+      });
+    }
+    renderLinkRoom();
+  });
+  socket.addEventListener('message', (event) => {
+    if (generation !== linkSocketGeneration) return;
+    runAction(() => handleLinkMessage(JSON.parse(event.data)));
+  });
+  socket.addEventListener('close', () => {
+    if (generation !== linkSocketGeneration) return;
+    linkSocket = undefined;
+    linkLastOfferSequence = -1;
+    if (isLinkRoomOpen()) {
+      linkRoom = { ...linkRoom, paused: true };
+      if (running) setStatus('Link paused', 'loading');
+      renderLinkRoom();
+      linkReconnectTimer = setTimeout(openLinkSocket, 1500);
+    }
+  });
+  socket.addEventListener('error', () => {
+    if (generation === linkSocketGeneration) renderLinkRoom();
+  });
+}
+
+async function handleLinkMessage(message) {
+  if (!message || typeof message.type !== 'string') return;
+  if (message.type === 'connected') {
+    updateLinkRoom(message.room);
+    syncLinkTransfer();
+    return;
+  }
+  if (message.type === 'room') {
+    updateLinkRoom(message.room);
+    return;
+  }
+  if (message.type === 'paused') {
+    linkLastOfferSequence = -1;
+    const participants = linkRoom.participants?.map((participant) => participant?.accountId === message.accountId
+      ? { ...participant, connected: false } : participant);
+    updateLinkRoom({ ...linkRoom, paused: true, participants });
+    return;
+  }
+  if (message.type === 'link-offer') {
+    if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' || linkRoom.paused) return;
+    const slaveData = core._vba_link_prepare_remote(message.sequence, message.speed, message.data);
+    if (slaveData < 0) throw new Error(`Cable offer ${message.sequence} was rejected by the core`);
+    if (!sendLinkMessage({
+      type: 'link-response', sequence: message.sequence, speed: message.speed, data: slaveData,
+    })) throw new Error('Cable socket is offline');
+    renderLinkRoom();
+    return;
+  }
+  if (message.type === 'link-pair') {
+    const applied = core._vba_link_apply_pair(
+      message.sequence, message.speed, message.masterData, message.slaveData,
+    );
+    if (!applied) {
+      const currentSequence = Number(core._vba_link_request_sequence());
+      if (message.sequence < currentSequence || core._vba_link_transfer_active()) return;
+      throw new Error(`Cable pair ${message.sequence} was rejected by the core`);
+    }
+    linkLastOfferSequence = -1;
+    linkRoom = {
+      ...linkRoom,
+      nextTransferSequence: Math.max(linkRoom.nextTransferSequence || 0, message.sequence + 1),
+    };
+    renderLinkRoom();
+    return;
+  }
+  if (message.type === 'checkpoint-saved') {
+    if (linkCheckpointPendingSequence === message.sequence) {
+      linkCheckpointPendingSequence = null;
+      linkCheckpointPendingState = '';
+    }
+    linkRoom = {
+      ...linkRoom,
+      nextCheckpointSequence: Math.max(linkRoom.nextCheckpointSequence || 0, message.sequence + 1),
+    };
+    renderLinkRoom();
+    return;
+  }
+  if (message.type === 'finishing') {
+    updateLinkRoom({ ...linkRoom, status: 'finishing' });
+    return;
+  }
+  if (message.type === 'completed') {
+    linkFinishSubmitted = true;
+    updateLinkRoom({ ...linkRoom, status: 'completed', paused: false });
+    closeLinkSocket();
+    await updateStoredStateControls();
+    logEvent('Link battery saves completed');
+    return;
+  }
+  if (message.type === 'aborted') {
+    updateLinkRoom({ ...linkRoom, status: 'aborted', paused: false, abortReason: message.reason });
+    closeLinkSocket();
+    logEvent(`Link room aborted${message.reason ? ` / ${message.reason}` : ''}`);
+    return;
+  }
+  if (message.type === 'error') {
+    linkCheckpointPendingSequence = null;
+    linkCheckpointPendingState = '';
+    throw new Error(message.message || message.code || 'Link error');
+  }
+}
+
+async function linkJsonRequest(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('Content-Type', 'application/json');
+  const response = await apiFetch(url, { ...options, headers });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || result.message || `Link request failed (${response.status})`);
+  return result;
+}
+
+async function createLinkRoom() {
+  if (!activeGbaSelected()) throw new Error('Load the selected GBA ROM first');
+  const result = await linkJsonRequest('/api/link/rooms', {
+    method: 'POST', body: JSON.stringify({ romId: activeRom.id }),
+  });
+  enterLinkRoom(result.room, result.inviteCode);
+  logEvent('Link room created');
+}
+
+async function joinLinkRoom() {
+  if (!activeGbaSelected()) throw new Error('Load the selected GBA ROM first');
+  const roomId = elements['link-room-input'].value.trim();
+  const inviteCode = elements['link-invite-input'].value.trim();
+  const result = await linkJsonRequest(`/api/link/rooms/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST', body: JSON.stringify({ inviteCode, romId: activeRom.id }),
+  });
+  enterLinkRoom(result.room, '');
+  logEvent('Link room joined');
+}
+
+function enterLinkRoom(room, inviteCode) {
+  closeLinkSocket();
+  clearLinkTimers();
+  linkRoom = room;
+  linkInviteCode = inviteCode;
+  linkCheckpointPendingSequence = null;
+  linkCheckpointPendingState = '';
+  linkFinishSubmitted = false;
+  linkLastOfferSequence = -1;
+  speedMode = false;
+  elements['speed-toggle'].setAttribute('aria-pressed', 'false');
+  elements['speed-toggle'].textContent = 'Speed off';
+  clearInterval(batteryTimer);
+  updateLinkRoom(room);
+  startLinkTimers();
+  openLinkSocket();
+}
+
+async function refreshLinkRoom() {
+  if (!isLinkRoomOpen() || linkRoomRefreshing) return;
+  linkRoomRefreshing = true;
+  try {
+    const response = await apiFetch(`/api/link/rooms/${encodeURIComponent(linkRoom.id)}`,
+      { cache: 'no-store' });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || 'Room refresh failed');
+    updateLinkRoom(result.room);
+  } finally {
+    linkRoomRefreshing = false;
+  }
+}
+
+async function setLinkReady() {
+  const participant = currentLinkParticipant();
+  const result = await linkJsonRequest(`/api/link/rooms/${encodeURIComponent(linkRoom.id)}/ready`, {
+    method: 'POST', body: JSON.stringify({ ready: !participant?.ready }),
+  });
+  updateLinkRoom(result.room);
+}
+
+async function startLinkRoom() {
+  const result = await linkJsonRequest(`/api/link/rooms/${encodeURIComponent(linkRoom.id)}/start`, {
+    method: 'POST', body: '{}',
+  });
+  updateLinkRoom(result.room);
+  logEvent('Link room started');
+}
+
+async function abortLinkRoom() {
+  const result = await linkJsonRequest(`/api/link/rooms/${encodeURIComponent(linkRoom.id)}/abort`, {
+    method: 'POST', body: JSON.stringify({ reason: 'cancelled by participant' }),
+  });
+  updateLinkRoom({ ...linkRoom, ...result.room });
+  closeLinkSocket();
+}
+
+function checkpointBase64(bytes) {
+  let binary = '';
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function submitLinkCheckpoint() {
+  if (linkRoom?.status !== 'active' || linkRoom.paused || paused || !linkSocketOpen() ||
+      linkCheckpointing || linkCheckpointPendingSequence !== null || !cableIdle()) return;
+  const sequence = Number(linkRoom.nextCheckpointSequence || 0);
+  linkCheckpointing = true;
+  renderLinkRoom();
+  try {
+    if (!core._vba_export_state()) throw new Error(coreError('Checkpoint export failed'));
+    const bytes = getExportBytes();
+    if (!cableIdle()) return;
+    const state = checkpointBase64(bytes);
+    if (!sendLinkMessage({ type: 'checkpoint', sequence, state })) return;
+    linkCheckpointPendingSequence = sequence;
+    linkCheckpointPendingState = state;
+  } finally {
+    linkCheckpointing = false;
+    renderLinkRoom();
+  }
+}
+
+async function finishLinkRoom() {
+  if (!cableIdle()) throw new Error('Wait for the cable transfer to finish');
+  if (linkCheckpointPendingSequence !== null) throw new Error('Wait for the checkpoint to finish');
+  if (!core._vba_export_battery()) throw new Error(coreError('Battery export failed'));
+  const bytes = getExportBytes();
+  validateBattery(bytes);
+  linkFinishSubmitted = true;
+  renderLinkRoom();
+  try {
+    const response = await apiFetch(`/api/link/rooms/${encodeURIComponent(linkRoom.id)}/battery`, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: bytes,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || result.message || 'Battery submission failed');
+    if (result.status === 'completed') {
+      updateLinkRoom({ ...linkRoom, status: 'completed', paused: false });
+      closeLinkSocket();
+      await updateStoredStateControls();
+      logEvent('Link battery saves completed');
+    } else {
+      updateLinkRoom({ ...linkRoom, status: 'finishing' });
+    }
+  } catch (error) {
+    linkFinishSubmitted = false;
+    renderLinkRoom();
+    throw error;
+  }
+}
+
+function restartBatteryTimer() {
+  clearInterval(batteryTimer);
+  if (activeRom && !isLinkRoomOpen()) {
+    batteryTimer = setInterval(() => saveBattery(false).catch((error) => logEvent(error.message, true)), 10000);
+  }
+}
+
+function clearLinkRoom() {
+  if (isLinkRoomOpen()) return;
+  closeLinkSocket();
+  clearLinkTimers();
+  linkRoom = undefined;
+  linkInviteCode = '';
+  linkFinishSubmitted = false;
+  linkCheckpointPendingSequence = null;
+  linkCheckpointPendingState = '';
+  detachLinkCore();
+  renderLinkRoom();
+  restartBatteryTimer();
 }
 
 async function exportStateBytes() {
@@ -382,6 +913,7 @@ function exportName(extension) {
 }
 
 async function loadSelectedRom() {
+  if (isLinkRoomOpen()) throw new Error('Close the link room before loading another ROM');
   const selected = roms.find((rom) => rom.id === elements['rom-select'].value);
   if (!selected) return;
   setStatus('Loading ROM', 'loading');
@@ -396,6 +928,9 @@ async function loadSelectedRom() {
   const result = withCoreBytes(bytes, (pointer, size) =>
     core._vba_load_rom(pointer, size, isGba ? 0 : 1));
   if (!result) throw new Error(coreError('ROM load failed'));
+  linkCorePlayer = -1;
+  linkDetachPending = false;
+  linkTransferActive = false;
   frameWidth = core._vba_frame_width();
   frameHeight = core._vba_frame_height();
   elements.screen.width = frameWidth;
@@ -422,8 +957,7 @@ async function loadSelectedRom() {
   renderFixtures();
   await updateStoredStateControls();
   startLoop();
-  clearInterval(batteryTimer);
-  batteryTimer = setInterval(() => saveBattery(false).catch((error) => logEvent(error.message, true)), 10000);
+  restartBatteryTimer();
   logEvent(`ROM loaded / ${selected.gameCode}`);
 }
 
@@ -447,7 +981,7 @@ async function refreshCatalog() {
     return option;
   }));
   if (roms.some((rom) => rom.id === selectedId)) elements['rom-select'].value = selectedId;
-  elements['load-rom'].disabled = roms.length === 0;
+  applyControlState();
   renderFixtures();
 }
 
@@ -461,7 +995,7 @@ function renderFixtures() {
     const button = document.createElement('button');
     button.type = 'button';
     button.textContent = fixture.type === 'state' ? 'Load' : 'Import';
-    button.disabled = !activeRom;
+    button.disabled = !activeRom || isLinkRoomOpen();
     button.addEventListener('click', () => runAction(async () => {
       const response = await apiFetch(`/api/fixtures/${fixture.id}/file`);
       if (!response.ok) throw new Error('Fixture download failed');
@@ -572,6 +1106,7 @@ async function logout() {
 
 elements['load-rom'].addEventListener('click', () => runAction(loadSelectedRom));
 elements['refresh-roms'].addEventListener('click', () => runAction(refreshCatalog));
+elements['rom-select'].addEventListener('change', applyControlState);
 elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   const file = elements['rom-upload'].files[0];
   if (!file) return;
@@ -588,7 +1123,9 @@ elements['rom-upload'].addEventListener('change', () => runAction(async () => {
 elements.pause.addEventListener('click', () => {
   paused = !paused;
   elements.pause.textContent = paused ? 'Resume' : 'Pause';
-  setStatus(paused ? 'Paused' : 'Running', paused ? 'idle' : 'running');
+  const linkPaused = isLinkRoomOpen() && (linkRoom.paused || linkRoom.status === 'finishing');
+  setStatus(paused ? 'Paused' : linkPaused ? 'Link paused' : 'Running',
+    paused ? 'idle' : linkPaused ? 'loading' : 'running');
 });
 elements.mute.addEventListener('click', () => {
   muted = !muted;
@@ -628,6 +1165,19 @@ elements['import-battery'].addEventListener('change', () => runAction(async () =
   await loadBatteryBytes(new Uint8Array(await file.arrayBuffer()), file.name, true);
   elements['import-battery'].value = '';
 }));
+elements['link-create'].addEventListener('click', () => runAction(createLinkRoom));
+elements['link-join'].addEventListener('click', () => runAction(joinLinkRoom));
+elements['link-ready'].addEventListener('click', () => runAction(setLinkReady));
+elements['link-start'].addEventListener('click', () => runAction(startLinkRoom));
+elements['link-finish'].addEventListener('click', () => runAction(finishLinkRoom));
+elements['link-abort'].addEventListener('click', () => runAction(abortLinkRoom));
+elements['link-close'].addEventListener('click', clearLinkRoom);
+for (const id of ['link-room-input', 'link-invite-input']) {
+  elements[id].addEventListener('input', applyControlState);
+  elements[id].addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !elements['link-join'].disabled) runAction(joinLinkRoom);
+  });
+}
 elements.logout.addEventListener('click', () => runAction(logout));
 elements['visitor-logout'].addEventListener('click', () => runAction(logout));
 elements['request-access'].addEventListener('click', () => runAction(async () => {
@@ -660,7 +1210,7 @@ for (const button of document.querySelectorAll('[data-button]')) {
 }
 
 window.addEventListener('pagehide', () => {
-  if (activeRom) saveBattery(false).catch(() => {});
+  if (activeRom && !isLinkRoomOpen()) saveBattery(false).catch(() => {});
 });
 
 window.__gbaPoc = {
@@ -684,6 +1234,14 @@ window.__gbaPoc = {
       audioState: audioContext?.state || 'uninitialized',
       inputMask: keyMask | touchMask,
       speedMode,
+      linkRoom: linkRoom ? {
+        id: linkRoom.id,
+        status: linkRoom.status,
+        paused: linkRoom.paused,
+        slot: currentLinkParticipant()?.slot ?? null,
+        socketOpen: linkSocketOpen(),
+        checkpointPending: linkCheckpointPendingSequence,
+      } : null,
       emulationSteps: core ? Number(core._vba_emulation_steps()) : 0,
       frameWidth,
       frameHeight,

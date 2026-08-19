@@ -1,4 +1,5 @@
 import createVbaModule from '/core/vba172.js';
+import { LinkMessageQueue } from '/link-message-queue.js';
 
 const FRAME_RATE = 59.7275;
 const CORE_SAMPLE_RATE = 44100;
@@ -66,6 +67,7 @@ let linkCorePlayer = -1;
 let linkDetachPending = false;
 let linkLastOfferSequence = -1;
 let linkTransferActive = false;
+const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
 async function apiFetch(url, options = {}) {
@@ -90,6 +92,7 @@ function stopEmulation() {
   clearLinkTimers();
   if (core) core._vba_shutdown();
   linkCorePlayer = -1;
+  linkMessageQueue.clear();
 }
 
 function setStatus(text, kind = 'idle') {
@@ -384,6 +387,7 @@ function gamepadMask() {
 function animationLoop(timestamp) {
   if (!running) return;
   if (linkDetachPending && !core._vba_link_transfer_active()) detachLinkCore();
+  drainLinkMessages();
   const elapsed = lastFrameTime ? Math.min(timestamp - lastFrameTime, 100) : 0;
   lastFrameTime = timestamp;
   frameDebt += elapsed * (speedMode ? 4 : 1);
@@ -413,6 +417,7 @@ function animationLoop(timestamp) {
     linkTransferActive = transferActive;
     if (linkRoom) renderLinkRoom();
   }
+  drainLinkMessages();
   animationHandle = requestAnimationFrame(animationLoop);
 }
 
@@ -457,6 +462,29 @@ function maybeSendLinkOffer() {
     linkLastOfferSequence = sequence;
     renderLinkRoom();
   }
+}
+
+function drainLinkMessages() {
+  const participant = currentLinkParticipant();
+  if (!core || !participant || linkRoom?.status !== 'active' || linkRoom.paused) return;
+  linkMessageQueue.drain({
+    slot: participant.slot,
+    currentSequence: () => Number(core._vba_link_request_sequence()),
+    transferActive: () => Boolean(core._vba_link_transfer_active()),
+    prepareRemote: (sequence, speed, masterData) =>
+      core._vba_link_prepare_remote(sequence, speed, masterData),
+    sendResponse: (message) => sendLinkMessage(message),
+    applyPair: (sequence, speed, masterData, slaveData) =>
+      core._vba_link_apply_pair(sequence, speed, masterData, slaveData),
+    onPairApplied: (pair) => {
+      linkLastOfferSequence = -1;
+      linkRoom = {
+        ...linkRoom,
+        nextTransferSequence: Math.max(linkRoom.nextTransferSequence || 0, pair.sequence + 1),
+      };
+      renderLinkRoom();
+    },
+  });
 }
 
 function attachLinkCore() {
@@ -653,29 +681,14 @@ async function handleLinkMessage(message) {
   }
   if (message.type === 'link-offer') {
     if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' || linkRoom.paused) return;
-    const slaveData = core._vba_link_prepare_remote(message.sequence, message.speed, message.data);
-    if (slaveData < 0) throw new Error(`Cable offer ${message.sequence} was rejected by the core`);
-    if (!sendLinkMessage({
-      type: 'link-response', sequence: message.sequence, speed: message.speed, data: slaveData,
-    })) throw new Error('Cable socket is offline');
+    linkMessageQueue.enqueueOffer(message);
+    drainLinkMessages();
     renderLinkRoom();
     return;
   }
   if (message.type === 'link-pair') {
-    const applied = core._vba_link_apply_pair(
-      message.sequence, message.speed, message.masterData, message.slaveData,
-    );
-    if (!applied) {
-      const currentSequence = Number(core._vba_link_request_sequence());
-      if (message.sequence < currentSequence || core._vba_link_transfer_active()) return;
-      throw new Error(`Cable pair ${message.sequence} was rejected by the core`);
-    }
-    linkLastOfferSequence = -1;
-    linkRoom = {
-      ...linkRoom,
-      nextTransferSequence: Math.max(linkRoom.nextTransferSequence || 0, message.sequence + 1),
-    };
-    renderLinkRoom();
+    linkMessageQueue.enqueuePair(message);
+    drainLinkMessages();
     return;
   }
   if (message.type === 'checkpoint-saved') {
@@ -753,6 +766,7 @@ function enterLinkRoom(room, inviteCode) {
   linkCheckpointPendingState = '';
   linkFinishSubmitted = false;
   linkLastOfferSequence = -1;
+  linkMessageQueue.clear();
   speedMode = false;
   elements['speed-toggle'].setAttribute('aria-pressed', 'false');
   elements['speed-toggle'].textContent = 'Speed off';
@@ -873,6 +887,7 @@ function clearLinkRoom() {
   linkFinishSubmitted = false;
   linkCheckpointPendingSequence = null;
   linkCheckpointPendingState = '';
+  linkMessageQueue.clear();
   elements['link-room-copy-feedback'].textContent = '';
   elements['link-pw-copy-feedback'].textContent = '';
   detachLinkCore();
@@ -975,6 +990,7 @@ async function loadSelectedRom() {
   linkCorePlayer = -1;
   linkDetachPending = false;
   linkTransferActive = false;
+  linkMessageQueue.clear();
   frameWidth = core._vba_frame_width();
   frameHeight = core._vba_frame_height();
   elements.screen.width = frameWidth;

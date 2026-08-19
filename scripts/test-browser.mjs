@@ -205,6 +205,20 @@ async function main() {
     await evaluate(`fetch('/__test/session', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({accountId: 'browser-save-admin', permission: 'admin', name: 'Save Admin'})
+    }).then(response => response.ok)`, true);
+    loaded = cdp.waitEvent('Page.loadEventFired');
+    await cdp.send('Page.navigate', { url: origin });
+    await loaded;
+    await waitExpression('document.getElementById("event-log").innerText.includes("Catalog ready")', 'admin catalog');
+    assert.equal(await evaluate('document.querySelector("label[for=rom-upload]").hidden'), true);
+    assert.equal(await evaluate('document.getElementById("export-state").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("import-state-label").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("fixture-list").closest("section").hidden'), true);
+
+    await evaluate(`fetch('/__test/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({accountId: 'browser-admin', permission: 'superadmin', name: 'Browser Admin'})
     }).then(response => response.ok)`, true);
     loaded = cdp.waitEvent('Page.loadEventFired');
@@ -257,6 +271,9 @@ async function main() {
       hashes.push((await evaluate('window.__gbaPoc.diagnostics()')).pixelHash);
     }
     assert.equal(new Set(hashes).size, 3, `State canvas hashes: ${hashes.join(', ')}`);
+    const externalStateAudio = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(externalStateAudio.stateAudioQuality, 2);
+    assert.equal(externalStateAudio.audioQuality, 1);
 
     await click('quick-save');
     await waitExpression('document.getElementById("quick-state-meta").innerText.includes("Account state")', 'account state');

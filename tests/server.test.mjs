@@ -122,6 +122,18 @@ test('visitor sees only access request APIs and CSRF is enforced', () => withSer
   assert.equal(new URL(nextLogin.headers.get('location')).searchParams.get('prompt'), 'login');
 }));
 
+test('logout is idempotent and clears local cookies without refreshing a stale session', () => withServer(async ({ origin }) => {
+  const response = await fetch(`${origin}/auth/logout`, {
+    method: 'POST',
+    headers: { Cookie: 'gbc_porting_session=stale-session' },
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).ok, true);
+  assert.match(response.headers.get('set-cookie'), /gbc_porting_session=.*Max-Age=0/);
+  assert.match(response.headers.get('set-cookie'), /gbc_porting_oidc_state=.*Max-Age=0/);
+  assert.match(response.headers.get('set-cookie'), /gbc_porting_force_login=1/);
+}));
+
 test('user can play and save but cannot upload ROMs or read reference save files', () => withServer(async ({ origin }) => {
   const user = await login(origin, 'user-account', 'user');
   const romsResponse = await fetch(`${origin}/api/roms`, { headers: user.headers });
@@ -143,6 +155,27 @@ test('user can play and save but cannot upload ROMs or read reference save files
   })).status, 200);
   assert.deepEqual(
     Buffer.from(await fetch(`${origin}/api/saves/${rom.id}/state`, { headers: user.headers }).then((response) => response.arrayBuffer())),
+    state,
+  );
+}));
+
+test('admin can play and manage save files but cannot upload ROMs or use reference fixtures', () => withServer(async ({ origin }) => {
+  const admin = await login(origin, 'save-admin-account', 'admin');
+  const romsResponse = await fetch(`${origin}/api/roms`, { headers: admin.headers });
+  assert.equal(romsResponse.status, 200);
+  const [rom] = await romsResponse.json();
+  assert.equal((await fetch(`${origin}/api/fixtures`, { headers: admin.headers })).status, 403);
+  assert.equal((await fetch(`${origin}/api/roms`, {
+    method: 'POST', headers: { ...admin.headers, 'X-Filename': 'admin.gba' }, body: await fixture('.gba'),
+  })).status, 403);
+  const state = await fixture('.sg1', '1.sg1');
+  assert.equal((await fetch(`${origin}/api/saves/${rom.id}/state`, {
+    method: 'PUT', headers: admin.headers, body: state,
+  })).status, 200);
+  assert.deepEqual(
+    Buffer.from(await fetch(`${origin}/api/saves/${rom.id}/state`, {
+      headers: admin.headers,
+    }).then((response) => response.arrayBuffer())),
     state,
   );
 }));

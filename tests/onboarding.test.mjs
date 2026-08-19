@@ -8,7 +8,7 @@ const root = path.resolve(import.meta.dirname, '..');
 test('service onboarding matches the runtime OIDC and managed-permission contract', async () => {
   const onboarding = JSON.parse(await readFile(path.join(root, 'auth', 'service-onboarding.json'), 'utf8'));
   assert.equal(onboarding.serviceKey, 'gbc-porting');
-  assert.deepEqual(onboarding.permissions.map((permission) => permission.key), ['user']);
+  assert.deepEqual(onboarding.permissions.map((permission) => permission.key), ['user', 'admin']);
   assert.ok(!onboarding.permissions.some((permission) => ['visitor', 'superadmin'].includes(permission.key)));
   assert.deepEqual(onboarding.oidcClients, [{
     clientId: 'gbc-porting-web',
@@ -21,6 +21,14 @@ test('service onboarding matches the runtime OIDC and managed-permission contrac
     requirePkce: true,
   }]);
   assert.deepEqual(onboarding.serviceCredentials, []);
+});
+
+test('permission-only onboarding update adds admin without rotating the OIDC client', async () => {
+  const update = JSON.parse(await readFile(path.join(root, 'auth', 'permission-update.json'), 'utf8'));
+  assert.equal(update.serviceKey, 'gbc-porting');
+  assert.deepEqual(update.permissions.map((permission) => permission.key), ['user', 'admin']);
+  assert.equal(Object.hasOwn(update, 'oidcClients'), false);
+  assert.equal(Object.hasOwn(update, 'serviceCredentials'), false);
 });
 
 test('.env.example contains the MariaDB, OIDC and session secret inputs', async () => {

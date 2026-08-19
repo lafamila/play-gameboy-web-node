@@ -24,9 +24,10 @@ VisualBoyAdvance 1.7.2 GB/GBC/GBA emulation in the browser with VBA Link 1.72-de
 | --- | --- |
 | `visitor` | Access request page only |
 | `user` | ROM play and account-scoped save/load |
-| `superadmin` | User features plus ROM upload, save-file import/export and reference fixtures |
+| `admin` | User features plus save-state and battery import/export controls |
+| `superadmin` | Admin features plus ROM upload and reference fixtures |
 
-`visitor` and `superadmin` are managed by auth-api-nest. The onboarding request defines only `user`.
+`visitor` and `superadmin` are managed by auth-api-nest. The onboarding request defines requestable `user` and `admin` permissions. Visitor access requests explicitly target `user`.
 
 ## Run
 
@@ -51,6 +52,8 @@ Import [auth/service-onboarding.json](./auth/service-onboarding.json) in auth-ap
 4. Production uses `https://play.lafamila.xyz/auth/callback`; set `PUBLIC_BASE_URL` and `GBC_PORTING_OIDC_REDIRECT_URI` accordingly.
 
 No auth service credential is needed for the current scope.
+
+To add `admin` to an already approved service without rotating the existing OIDC client secret, submit [auth/permission-update.json](./auth/permission-update.json) through the onboarding update endpoint and approve it in the auth admin console. The update payload intentionally omits `oidcClients`.
 
 Rebuild the pinned VBA 1.7.2 WebAssembly core:
 
@@ -106,13 +109,15 @@ This is `STANDALONE_DEPLOY`: the repo owns its image and deployment settings and
 
 Direction controls use triangle symbols on touch screens. `Speed off/on` above A/B toggles accelerated emulation; accelerated audio is muted to avoid buffering normal-speed sound while the game runs faster.
 
+VBA save states persist the emulator's sound quality. External VBA Link states commonly contain quality `2`, while this web player consumes 44.1kHz PCM at quality `1`. State load therefore records the source value for diagnostics, resets buffered PCM, and normalizes the running core to quality `1` to prevent accelerated or corrupted playback.
+
 ## Data
 
 `data/` and root ROM files are local fixtures and are ignored by Git. `Red_K.gb` is the GB MBC5 regression fixture. Do not deploy or redistribute ROM files without the necessary rights. Uploaded ROMs are written to `ROM_STORAGE_DIR`; account saves are stored as MariaDB `MEDIUMBLOB` values.
 
 OIDC and app sessions are server-side. The cookie contains only an opaque session ID; access and refresh tokens are encrypted at rest with `GBC_PORTING_SESSION_ENCRYPTION_KEY`. State-changing APIs also require the session CSRF token.
 
-The `superadmin` file-transfer restriction is an application permission boundary, not DRM: a `user` browser must receive its own save bytes to load them into WebAssembly, so a determined user can inspect their own network payload.
+The explicit save import/export controls granted to `admin` and `superadmin` are an application UX boundary, not DRM: a `user` browser must receive its own save bytes to load them into WebAssembly, so a determined user can inspect their own network payload.
 
 ## Status
 

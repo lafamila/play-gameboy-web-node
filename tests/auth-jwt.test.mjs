@@ -21,7 +21,7 @@ function jwt(privateKey, kid, payload) {
   return `${header}.${body}.${signature}`;
 }
 
-test('OIDC access-token verification accepts only this service and its three permissions', async () => {
+test('OIDC access-token verification accepts only this service and its four permissions', async () => {
   const key = makeKey();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ keys: [key.publicJwk] }), {
@@ -50,7 +50,7 @@ test('OIDC access-token verification accepts only this service and its three per
     ...overrides,
   });
   try {
-    for (const permission of ['visitor', 'user', 'superadmin']) {
+    for (const permission of ['visitor', 'user', 'admin', 'superadmin']) {
       const account = await auth.verifyAccessToken(makeToken(permission));
       assert.equal(account.permission, permission);
       assert.equal(account.accountId, 'account-1');
@@ -66,6 +66,32 @@ test('OIDC access-token verification accepts only this service and its three per
       })),
       /service claim/i,
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('visitor access requests explicitly target the user permission', async () => {
+  const database = new MemoryDatabase();
+  const auth = new AuthClient({
+    authTestMode: false,
+    authApiBaseUrl: 'https://auth.example.test',
+    authServiceKey: 'gbc-porting',
+    sessionEncryptionKey: 'access-request-test-key',
+  }, database);
+  const originalFetch = globalThis.fetch;
+  let submitted;
+  globalThis.fetch = async (_url, options) => {
+    submitted = JSON.parse(options.body);
+    return new Response('{}', { status: 201, headers: { 'Content-Type': 'application/json' } });
+  };
+  try {
+    const result = await auth.requestAccess({
+      accountId: 'visitor-account', permission: 'visitor', accessToken: 'visitor-token',
+    });
+    assert.equal(result.status, 'pending');
+    assert.equal(submitted.serviceKey, 'gbc-porting');
+    assert.equal(submitted.requestedPermissionKey, 'user');
   } finally {
     globalThis.fetch = originalFetch;
   }

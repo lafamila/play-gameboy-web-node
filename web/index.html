@@ -123,8 +123,8 @@
             <div class="action-grid">
               <button id="quick-save" type="button" disabled>Save</button>
               <button id="quick-load" type="button" disabled>Load</button>
-              <button id="export-state" class="superadmin-only" type="button" disabled>Export .sg1</button>
-              <label class="file-button disabled superadmin-only" id="import-state-label" for="import-state">Import .sg1</label>
+              <button id="export-state" class="save-admin-only" type="button" disabled>Export .sg1</button>
+              <label class="file-button disabled save-admin-only" id="import-state-label" for="import-state">Import .sg1</label>
               <input id="import-state" type="file" accept=".sg1,.sgm,application/gzip" hidden disabled />
             </div>
             <div id="quick-state-meta" class="meta block">No account state</div>
@@ -133,8 +133,8 @@
           <section class="save-section">
             <h2>Battery Save</h2>
             <div class="action-grid">
-              <button id="export-battery" class="superadmin-only" type="button" disabled>Export .sa1</button>
-              <label class="file-button disabled superadmin-only" id="import-battery-label" for="import-battery">Import .sa1</label>
+              <button id="export-battery" class="save-admin-only" type="button" disabled>Export .sa1</button>
+              <label class="file-button disabled save-admin-only" id="import-battery-label" for="import-battery">Import .sa1</label>
               <input id="import-battery" type="file" accept=".sa1,.sav" hidden disabled />
             </div>
             <div id="battery-meta" class="meta block">No account battery save</div>

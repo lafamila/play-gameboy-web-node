@@ -136,11 +136,12 @@ function applyControlState() {
   elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen;
   elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || !hasStoredQuickState;
 
-  const superadminEnabled = emulatorControlsEnabled && currentSession?.permission === 'superadmin';
-  elements['export-state'].disabled = !superadminEnabled || roomOpen;
-  elements['import-state'].disabled = !superadminEnabled || roomOpen;
-  elements['import-battery'].disabled = !superadminEnabled || roomOpen;
-  elements['export-battery'].disabled = !superadminEnabled;
+  const saveAdminEnabled = emulatorControlsEnabled &&
+    ['admin', 'superadmin'].includes(currentSession?.permission);
+  elements['export-state'].disabled = !saveAdminEnabled || roomOpen;
+  elements['import-state'].disabled = !saveAdminEnabled || roomOpen;
+  elements['import-battery'].disabled = !saveAdminEnabled || roomOpen;
+  elements['export-battery'].disabled = !saveAdminEnabled;
   elements['import-state-label'].classList.toggle('disabled', elements['import-state'].disabled);
   elements['import-battery-label'].classList.toggle('disabled', elements['import-battery'].disabled);
   elements['rom-select'].disabled = roomOpen;
@@ -858,6 +859,8 @@ async function loadStateBytes(bytes, source) {
   const info = await validateState(bytes);
   const result = withCoreBytes(bytes, (pointer, size) => core._vba_load_state(pointer, size));
   if (!result) throw new Error(coreError('State load failed'));
+  audioQueue = [];
+  audioPosition = 0;
   renderFrame();
   logEvent(`${source} loaded / v${info.version}`);
 }
@@ -1047,13 +1050,10 @@ async function bootstrap() {
   const result = await response.json();
   if (!result.authenticated) {
     currentSession = null;
-    elements['login-link'].href = sessionStorage.getItem('gbc-force-login') === '1'
-      ? '/auth/login?prompt=login'
-      : '/auth/login';
+    elements['login-link'].href = '/auth/login';
     showAuthView('login');
     return;
   }
-  sessionStorage.removeItem('gbc-force-login');
   currentSession = result;
   if (result.permission === 'visitor') {
     elements['visitor-account'].textContent = result.account.name || result.account.email || result.account.id;
@@ -1068,6 +1068,9 @@ async function bootstrap() {
   elements['account-permission'].textContent = result.permission;
   for (const element of document.querySelectorAll('.superadmin-only')) {
     element.hidden = result.permission !== 'superadmin';
+  }
+  for (const element of document.querySelectorAll('.save-admin-only')) {
+    element.hidden = !['admin', 'superadmin'].includes(result.permission);
   }
   showAuthView('app');
   setControls(false);
@@ -1092,6 +1095,9 @@ async function checkSession() {
   for (const element of document.querySelectorAll('.superadmin-only')) {
     element.hidden = result.permission !== 'superadmin';
   }
+  for (const element of document.querySelectorAll('.save-admin-only')) {
+    element.hidden = !['admin', 'superadmin'].includes(result.permission);
+  }
 }
 
 async function logout() {
@@ -1099,7 +1105,6 @@ async function logout() {
   clearInterval(sessionTimer);
   await apiFetch('/auth/logout', { method: 'POST' });
   currentSession = null;
-  sessionStorage.setItem('gbc-force-login', '1');
   elements['login-link'].href = '/auth/login?prompt=login';
   showAuthView('login');
 }
@@ -1231,6 +1236,8 @@ window.__gbaPoc = {
       stateVersion: core?._vba_state_version() || null,
       frameCount: core ? Number(core._vba_frame_counter()) : 0,
       audioSamples: core ? Number(core._vba_audio_total_samples()) : 0,
+      audioQuality: core ? Number(core._vba_audio_quality()) : null,
+      stateAudioQuality: core ? Number(core._vba_state_audio_quality()) : null,
       audioState: audioContext?.state || 'uninitialized',
       inputMask: keyMask | touchMask,
       speedMode,

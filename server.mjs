@@ -17,6 +17,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
 const CORE_ROOT = path.join(ROOT, 'core', 'dist');
 const FORCE_LOGIN_COOKIE = 'gbc_porting_force_login';
+const PLAY_PERMISSIONS = ['user', 'admin', 'superadmin'];
 
 const MIME_TYPES = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -119,24 +120,26 @@ async function handleRequest(context) {
     return json(response, 201, publicSession(result.session));
   }
 
-  const session = await auth.getSession(cookies(request)[config.sessionCookieName]);
-
-  if (request.method === 'GET' && url.pathname === '/api/session') {
-    return json(response, 200, session
-      ? { authenticated: true, ...publicSession(session) }
-      : { authenticated: false });
-  }
+  const requestCookies = cookies(request);
 
   if (request.method === 'POST' && url.pathname === '/auth/logout') {
-    requireSession(session);
-    requireCsrf(request, session, config);
-    await auth.logout(session.rawSessionId);
+    const rawSessionId = requestCookies[config.sessionCookieName];
+    await auth.logout(rawSessionId).catch((error) => console.error('Logout cleanup failed', error));
     clearCookie(response, config.sessionCookieName, config.secureCookies);
+    clearCookie(response, 'gbc_porting_oidc_state', config.secureCookies);
     setCookie(response, FORCE_LOGIN_COOKIE, '1', {
       maxAgeSeconds: 10 * 60,
       secure: config.secureCookies,
     });
     return json(response, 200, { ok: true });
+  }
+
+  const session = await auth.getSession(requestCookies[config.sessionCookieName]);
+
+  if (request.method === 'GET' && url.pathname === '/api/session') {
+    return json(response, 200, session
+      ? { authenticated: true, ...publicSession(session) }
+      : { authenticated: false });
   }
 
   if (url.pathname === '/api/access-request') {
@@ -153,7 +156,7 @@ async function handleRequest(context) {
   }
 
   if (request.method === 'GET' && url.pathname === '/api/roms') {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     return json(response, 200, await database.listRoms());
   }
 
@@ -173,7 +176,7 @@ async function handleRequest(context) {
   }
 
   if (request.method === 'POST' && url.pathname === '/api/link/rooms') {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     requireCsrf(request, session, config);
     const body = await readJsonRequest(request, 32 * 1024);
     const result = await linkService.createRoom({ accountId: session.accountId, romId: body.romId });
@@ -182,7 +185,7 @@ async function handleRequest(context) {
 
   const linkRoomMatch = url.pathname.match(/^\/api\/link\/rooms\/([0-9a-f-]+)(?:\/(join|ready|start|abort|battery))?$/i);
   if (linkRoomMatch) {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     const [, roomId, action] = linkRoomMatch;
     if (request.method === 'GET' && !action) {
       return json(response, 200, { room: await linkService.getRoom({ roomId, accountId: session.accountId }) });
@@ -230,7 +233,7 @@ async function handleRequest(context) {
 
   const romMatch = url.pathname.match(/^\/api\/roms\/([a-f0-9]{64})\/file$/);
   if (request.method === 'GET' && romMatch) {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     const rom = await database.getRom(romMatch[1]);
     if (!rom) throw new AuthError(404, 'ROM not found');
     return sendFile(response, rom.path, 'private, no-store');
@@ -252,7 +255,7 @@ async function handleRequest(context) {
 
   const saveMetaMatch = url.pathname.match(/^\/api\/saves\/([a-f0-9]{64})\/meta$/);
   if (request.method === 'GET' && saveMetaMatch) {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     const rom = await database.getRom(saveMetaMatch[1]);
     if (!rom) throw new AuthError(404, 'ROM not found');
     return json(response, 200, { saves: await database.getSaveMetadata(session.accountId, rom.id) });
@@ -260,7 +263,7 @@ async function handleRequest(context) {
 
   const saveMatch = url.pathname.match(/^\/api\/saves\/([a-f0-9]{64})\/(state|battery)$/);
   if (saveMatch) {
-    requirePermission(session, ['user', 'superadmin']);
+    requirePermission(session, PLAY_PERMISSIONS);
     const [, romId, kind] = saveMatch;
     const rom = await database.getRom(romId);
     if (!rom) throw new AuthError(404, 'ROM not found');
@@ -461,7 +464,7 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
         return;
       }
       const session = await auth.getSession(cookies(request)[config.sessionCookieName]);
-      requirePermission(session, ['user', 'superadmin']);
+      requirePermission(session, PLAY_PERMISSIONS);
       const roomId = match[1];
       const room = await linkService.connect({ roomId, accountId: session.accountId });
       webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {

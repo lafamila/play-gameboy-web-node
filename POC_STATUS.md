@@ -32,7 +32,11 @@ Target fixture:
 | Desktop and mobile layouts are coherent | PASS | Screenshot QA score 97/100 |
 | Unauthenticated access is denied | PASS | ROM and save APIs return 401 without an app session |
 | Visitor is restricted to access request | PASS | Browser and API tests hide the emulator and accept only the request flow |
-| User and superadmin boundaries are enforced | PASS | User management calls return 403; superadmin upload and file controls pass |
+| User and superadmin boundaries are enforced | PASS | User management calls return 403; superadmin ROM upload and reference controls pass |
+| Admin save management boundary | PASS | Admin receives save import/export controls but ROM upload and reference fixtures remain forbidden |
+| External state audio quality | PASS | Supplied VBA state reports source quality 2 and is normalized to web quality 1 with both PCM queues reset |
+| Visitor request target | PASS | Service application payload explicitly requests `user`, never `superadmin` |
+| Idempotent logout | PASS | Stale sessions skip refresh, delete local server tokens, clear cookies and request an account-selecting login |
 | Saves are isolated by account | PASS | Two accounts retain distinct states for the same ROM composite key |
 | Link source provenance is pinned | PASS | `V172lsrc.zip` SHA-256 is verified before every core build and served beside WASM |
 | GBA serial register/timing transport | PASS | Native probe verifies multiplayer request, paired word registers, IRQ completion and idle reset |

@@ -9,6 +9,11 @@
       "key": "user",
       "label": "User",
       "description": "Play ROMs, use account-scoped saves, and create or join two-user GBA cable rooms"
+    },
+    {
+      "key": "admin",
+      "label": "Admin",
+      "description": "User access plus save-state and battery import/export controls"
     }
   ],
   "oidcClients": [

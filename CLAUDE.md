@@ -14,8 +14,8 @@ Browser GB/GBC/GBA emulator with account-scoped saves and authenticated two-user
 이 레포는 `../CLAUDE.md` 의 **DEVELOPMENT PRINCIPLES**를 따른다.
 
 1. 로그인과 서비스 권한은 `auth-api-nest`만 사용한다. 로컬 비밀번호 계정을 만들지 않는다.
-2. `visitor`는 access request만 가능하고, `user`와 `superadmin`은 플레이와 링크방을 사용할 수 있다.
-3. `superadmin`만 ROM 업로드와 레퍼런스 세이브 import/export를 사용할 수 있다.
+2. `visitor`는 access request만 가능하고, `user`·`admin`·`superadmin`은 플레이와 링크방을 사용할 수 있다.
+3. `admin`은 save-state/battery import/export UI를 사용할 수 있다. ROM 업로드와 reference fixture는 `superadmin`만 사용한다.
 4. 다른 레포나 auth 계약에 영향을 주는 변경은 orchestrator에 보고한다. 보고할 수 없으면 `../.idea/`에 handoff 문서를 남긴다.
 5. 사용자 결정이 필요한 주요 사안은 임의로 확정하지 않고 orchestrator에 전달한다.
 6. agent/tool `Co-authored-by` trailer는 사용자가 명시적으로 요청하지 않는 한 추가하지 않는다.
@@ -31,11 +31,13 @@ Browser GB/GBC/GBA emulator with account-scoped saves and authenticated two-user
 | session | app-owned HttpOnly cookie, server stores OIDC tokens encrypted |
 | visitor | access request UI only |
 | user | play, account saves, cable room create/join |
-| superadmin | user 기능 + ROM/fixture 관리 |
+| admin | user 기능 + save-state/battery import/export UI |
+| superadmin | admin 기능 + ROM/reference fixture 관리 |
 | access denied | service-owned visitor/request-access view |
 | service credential | 현재 불필요 |
 
 구체적인 온보딩 입력은 `auth/service-onboarding.json`이 canonical이다. OIDC client secret과 session encryption key는 브라우저 코드에 전달하지 않는다.
+기존 서비스에 `admin`만 추가할 때는 `auth/permission-update.json`을 onboarding update API로 제출한다. 이 파일은 OIDC client를 생략하므로 승인 시 기존 client secret을 회전시키지 않는다.
 
 ## Architecture
 
@@ -53,6 +55,7 @@ Browser B (VBA WASM, slot 1) ─┘                              ├─ auth-api
 - 링크 종료 시 두 battery save를 한 DB transaction으로 함께 반영한다.
 - 활성 링크방에서는 가속과 개별 quick load/import를 금지한다.
 - GB/GBC 링크는 VBA Link 1.72 자체가 지원하지 않으므로 현재 대상이 아니다.
+- 외부 GBA state의 저장된 `soundQuality` 값은 진단용으로 기록하되, Web Audio 출력은 항상 quality `1`(44.1kHz)로 정규화한다.
 
 ## Commands
 

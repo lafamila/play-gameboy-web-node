@@ -54,6 +54,7 @@ int g_audio_read = 0;
 int g_audio_write = 0;
 int g_audio_count = 0;
 uint64_t g_audio_total = 0;
+int g_state_audio_quality = 1;
 bool g_loaded = false;
 int g_system = -1;
 EmulatedSystem* g_emulator = nullptr;
@@ -270,6 +271,7 @@ VBA_EXPORT int vba_load_rom(const uint8_t* data, int size, int system) {
   g_frame_counter = 0;
   g_emulation_steps = 0;
   g_audio_total = 0;
+  g_state_audio_quality = 1;
   g_joypad = 0;
   g_loaded = true;
   g_system = system;
@@ -317,6 +319,11 @@ VBA_EXPORT int vba_load_state(const uint8_t* data, int size) {
   }
   const int result = g_emulator->emuReadState(kStatePath) ? 1 : 0;
   if (!result && g_last_error.empty()) g_last_error = "State load failed";
+  if (result && g_system == 0) {
+    g_state_audio_quality = soundQuality;
+    soundSetQuality(1);
+    soundTicks = SOUND_CLOCK_TICKS;
+  }
   ResetAudio();
   return result;
 }
@@ -364,6 +371,8 @@ VBA_EXPORT int vba_export_size() {
 
 VBA_EXPORT int vba_audio_available() { return g_audio_count; }
 VBA_EXPORT uint64_t vba_audio_total_samples() { return g_audio_total; }
+VBA_EXPORT int vba_audio_quality() { return g_system == 0 ? soundQuality : 1; }
+VBA_EXPORT int vba_state_audio_quality() { return g_state_audio_quality; }
 
 VBA_EXPORT int vba_audio_read(int16_t* output, int max_samples) {
   if (!output || max_samples <= 0) return 0;
@@ -476,6 +485,10 @@ int main(int argc, char** argv) {
     fclose(state_file);
     if (!vba_load_state(state_data.data(), static_cast<int>(state_data.size()))) {
       fprintf(stderr, "STATE: %s\n", vba_last_error());
+      return 1;
+    }
+    if (system == 0 && vba_audio_quality() != 1) {
+      fprintf(stderr, "AUDIO: state quality was not normalized\n");
       return 1;
     }
   }

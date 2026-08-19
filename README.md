@@ -86,8 +86,8 @@ npm run test:browser
 ## Docker
 
 ```bash
-docker build -t teddy-gbc-porting:local .
-docker run --rm -p 4173:4173 --env-file .env teddy-gbc-porting:local
+docker build -t play-gameboy-web-node:local .
+docker run --rm -p 4173:4173 --env-file .env play-gameboy-web-node:local
 ```
 
 This is `STANDALONE_DEPLOY`: the repo owns its image and deployment settings and is not registered as an app container in the root compose files.

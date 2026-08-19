@@ -13,8 +13,8 @@ const cdpPort = 9334;
 const origin = `http://127.0.0.1:${serverPort}`;
 const buildDirectory = path.join(root, '.build');
 const downloadDirectory = path.join(buildDirectory, 'browser-downloads');
-const profileDirectory = path.join(os.tmpdir(), `gbc-porting-chrome-${process.pid}`);
-const uploadDirectory = path.join(os.tmpdir(), `gbc-porting-roms-${process.pid}`);
+const profileDirectory = path.join(os.tmpdir(), `play-gameboy-web-node-chrome-${process.pid}`);
+const uploadDirectory = path.join(os.tmpdir(), `play-gameboy-web-node-roms-${process.pid}`);
 
 async function findChrome(directory, depth = 0) {
   if (depth > 8) return null;

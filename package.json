@@ -1,5 +1,5 @@
 {
-  "name": "gbc-porting-poc",
+  "name": "play-gameboy-web-node",
   "private": true,
   "type": "module",
   "scripts": {

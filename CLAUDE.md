@@ -1,4 +1,4 @@
-# gbc-porting
+# play-gameboy-web-node
 
 Browser GB/GBC/GBA emulator with account-scoped saves and authenticated two-user GBA cable rooms.
 
@@ -66,8 +66,8 @@ npm run test:core
 npm run test:browser
 npm run verify
 
-docker build -t teddy-gbc-porting:local .
-docker run --rm -p 4173:4173 --env-file .env teddy-gbc-porting:local
+docker build -t play-gameboy-web-node:local .
+docker run --rm -p 4173:4173 --env-file .env play-gameboy-web-node:local
 ```
 
 웹/API 서버는 반복 수정 중에는 Docker 대신 `npm run dev`로 검증한다. Docker build는 구현 완료 후 최종 독립 배포 검증에 사용한다.
@@ -84,6 +84,5 @@ docker run --rm -p 4173:4173 --env-file .env teddy-gbc-porting:local
 - 두 계정 HTTP/WebSocket link integration test
 - native GBA register/timing probe
 - web-exported battery를 싱글 플레이로 다시 열어 거래 결과 유지 확인
-- `docker build -t teddy-gbc-porting:local .`
+- `docker build -t play-gameboy-web-node:local .`
 - Windows VBA Link 1.72 import는 Windows 환경이 생길 때까지 별도 deferred 항목으로 유지
-

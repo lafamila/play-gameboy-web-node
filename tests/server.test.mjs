@@ -12,7 +12,7 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'data');
 
 async function withServer(callback) {
-  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'gbc-porting-test-'));
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'play-gameboy-web-node-test-'));
   const config = createConfig({
     root: ROOT,
     nodeEnv: 'test',

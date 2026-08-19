@@ -653,6 +653,6 @@ function validateBattery(payload) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const app = await createApp();
   app.server.listen(app.config.port, app.config.host, () => {
-    console.log(`gbc-porting: ${app.config.publicBaseUrl}`);
+    console.log(`play-gameboy-web-node: ${app.config.publicBaseUrl}`);
   });
 }

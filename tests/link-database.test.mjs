@@ -231,6 +231,34 @@ test('a terminal room releases locks for a later room', async () => {
   assert.equal(replacement.createdBy, 'host');
 });
 
+test('recoverable room lookup and abort release both participant locks', async () => {
+  const database = await databaseWithRom();
+  await database.createLinkRoom({
+    id: 'stale-room', romId: FIRE_RED_ROM_ID, accountId: 'host', now: 10,
+  });
+  await database.joinLinkRoom('stale-room', {
+    accountId: 'guest', romId: LEAF_GREEN_ROM_ID,
+  }, 11);
+
+  assert.deepEqual(
+    (await database.getRecoverableLinkRooms('host', FIRE_RED_ROM_ID)).map((room) => room.id),
+    ['stale-room'],
+  );
+  assert.deepEqual(
+    (await database.getRecoverableLinkRooms('guest', LEAF_GREEN_ROM_ID)).map((room) => room.id),
+    ['stale-room'],
+  );
+
+  const aborted = await database.abortLinkRoom('stale-room', 20);
+  assert.equal(aborted.status, 'aborted');
+  assert.equal(aborted.updatedAt, 20);
+  assert.deepEqual(await database.getRecoverableLinkRooms('host', FIRE_RED_ROM_ID), []);
+  assert.deepEqual(await database.getRecoverableLinkRooms('guest', LEAF_GREEN_ROM_ID), []);
+
+  await database.putSave('host', FIRE_RED_ROM_ID, 'battery', Buffer.from('host-unlocked'));
+  await database.putSave('guest', LEAF_GREEN_ROM_ID, 'battery', Buffer.from('guest-unlocked'));
+});
+
 test('schema probes emit MySQL 8 compatible conditional ALTER statements', async () => {
   const database = new MariaDbDatabase({ name: 'migration_test' });
   const queries = [];

@@ -16,7 +16,6 @@ import { LinkService } from './lib/link-service.mjs';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
 const CORE_ROOT = path.join(ROOT, 'core', 'dist');
-const FORCE_LOGIN_COOKIE = 'gbc_porting_force_login';
 const PLAY_PERMISSIONS = ['user', 'admin', 'superadmin'];
 
 const MIME_TYPES = new Map([
@@ -75,10 +74,7 @@ async function handleRequest(context) {
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/login') {
-    const login = await auth.startLogin(
-      url.searchParams.get('return_to') ?? '/',
-      url.searchParams.get('prompt') === 'login' || cookies(request)[FORCE_LOGIN_COOKIE] === '1',
-    );
+    const login = await auth.startLogin(url.searchParams.get('return_to') ?? '/');
     setCookie(response, 'gbc_porting_oidc_state', login.state, {
       maxAgeSeconds: config.oidcTransactionTtlSeconds,
       secure: config.secureCookies,
@@ -96,7 +92,6 @@ async function handleRequest(context) {
       stateCookie: cookies(request).gbc_porting_oidc_state,
     });
     clearCookie(response, 'gbc_porting_oidc_state', config.secureCookies);
-    clearCookie(response, FORCE_LOGIN_COOKIE, config.secureCookies);
     setCookie(response, config.sessionCookieName, result.rawSessionId, {
       maxAgeSeconds: config.sessionMaxAgeSeconds,
       secure: config.secureCookies,
@@ -127,11 +122,8 @@ async function handleRequest(context) {
     await auth.logout(rawSessionId).catch((error) => console.error('Logout cleanup failed', error));
     clearCookie(response, config.sessionCookieName, config.secureCookies);
     clearCookie(response, 'gbc_porting_oidc_state', config.secureCookies);
-    setCookie(response, FORCE_LOGIN_COOKIE, '1', {
-      maxAgeSeconds: 10 * 60,
-      secure: config.secureCookies,
-    });
-    return json(response, 200, { ok: true });
+    const authLogoutUrl = config.authTestMode ? '/' : buildAuthLogoutUrl(config);
+    return json(response, 200, { ok: true, authLogoutUrl });
   }
 
   const session = await auth.getSession(requestCookies[config.sessionCookieName]);
@@ -545,6 +537,12 @@ function linkErrorStatus(error) {
   if (typeof error?.code === 'string' &&
       (error.code.startsWith('LINK_') || error.code.startsWith('SAVE_'))) return 409;
   return 0;
+}
+
+export function buildAuthLogoutUrl(config) {
+  const logoutUrl = new URL('/logout', config.authPublicBaseUrl);
+  logoutUrl.searchParams.set('return_to', new URL('/', config.publicBaseUrl).toString());
+  return logoutUrl.toString();
 }
 
 async function sendFile(response, filename, cacheControl = 'no-cache') {

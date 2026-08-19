@@ -165,6 +165,10 @@ async function main() {
       cdp.send('Runtime.enable'),
       cdp.send('DOM.enable'),
       cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDirectory }),
+      cdp.send('Browser.grantPermissions', {
+        origin,
+        permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+      }),
     ]);
 
     const evaluate = async (expression, userGesture = false) => {
@@ -211,10 +215,20 @@ async function main() {
     await cdp.send('Page.navigate', { url: origin });
     await loaded;
     await waitExpression('document.getElementById("event-log").innerText.includes("Catalog ready")', 'admin catalog');
+    assert.equal(await evaluate('document.querySelector(".topbar")'), null);
+    assert.equal(await evaluate('document.getElementById("account-permission")'), null);
+    assert.equal(await evaluate('document.getElementById("app-menu-panel").hidden'), true);
+    assert.equal(await evaluate('document.querySelectorAll(".rom-toolbar > *").length'), 3);
+    await click('menu-toggle');
+    assert.equal(await evaluate('document.getElementById("app-menu-panel").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("menu-toggle").getAttribute("aria-expanded")'), 'true');
+    assert.equal(await evaluate('document.getElementById("account-name").innerText'), 'Save Admin');
     assert.equal(await evaluate('document.querySelector("label[for=rom-upload]").hidden'), true);
-    assert.equal(await evaluate('document.getElementById("export-state").hidden'), false);
-    assert.equal(await evaluate('document.getElementById("import-state-label").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("export-state").closest(".save-admin-only").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("import-state-label").closest(".save-admin-only").hidden'), false);
     assert.equal(await evaluate('document.getElementById("fixture-list").closest("section").hidden'), true);
+    await evaluate('document.body.dispatchEvent(new PointerEvent("pointerdown", {bubbles: true}))', true);
+    assert.equal(await evaluate('document.getElementById("app-menu-panel").hidden'), true);
 
     await evaluate(`fetch('/__test/session', {
       method: 'POST',
@@ -225,6 +239,11 @@ async function main() {
     await cdp.send('Page.navigate', { url: origin });
     await loaded;
     await waitExpression('document.getElementById("event-log").innerText.includes("Catalog ready")', 'catalog');
+    await click('menu-toggle');
+    assert.equal(await evaluate('document.getElementById("account-name").innerText'), 'Browser Admin');
+    assert.equal(await evaluate('document.querySelector("label[for=rom-upload]").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("export-state").closest(".save-admin-only").hidden'), false);
+    assert.equal(await evaluate('document.getElementById("fixture-list").closest("section").hidden'), false);
     const fixtureRom = path.join(root, 'data', (await readdir(path.join(root, 'data'))).find((name) => name.endsWith('.gba')));
     await setFile('#rom-upload', fixtureRom);
     await waitExpression('document.getElementById("event-log").innerText.includes("ROM uploaded / BPRE")', 'ROM upload');
@@ -245,6 +264,20 @@ async function main() {
       'link room socket',
     );
     assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("link-abort").innerText'), 'Leave room');
+    assert.equal(await evaluate('document.querySelector("#link-invite-row dt").innerText'), 'PW');
+    const roomId = await evaluate('document.getElementById("link-room-id").innerText');
+    const roomPw = await evaluate('document.getElementById("link-invite-code").innerText');
+    await click('link-room-id');
+    await waitExpression('document.getElementById("link-room-copy-feedback").innerText === "Copied"', 'room ID copy feedback');
+    assert.equal(await evaluate('navigator.clipboard.readText()'), roomId);
+    assert.equal(await evaluate('document.getElementById("link-room-id").innerText'), roomId);
+    assert.equal(await evaluate('document.getElementById("link-invite-code").innerText'), roomPw);
+    await click('link-invite-code');
+    await waitExpression('document.getElementById("link-pw-copy-feedback").innerText === "Copied"', 'room PW copy feedback');
+    assert.equal(await evaluate('navigator.clipboard.readText()'), roomPw);
+    assert.equal(await evaluate('document.getElementById("link-room-id").innerText'), roomId);
+    assert.equal(await evaluate('document.getElementById("link-invite-code").innerText'), roomPw);
     await click('link-abort');
     await waitExpression(
       'window.__gbaPoc.diagnostics().linkRoom?.status === "aborted"',
@@ -376,16 +409,56 @@ async function main() {
       await writeFile(path.join(buildDirectory, filename), Buffer.from(screenshot.data, 'base64'));
     };
     await capture(1440, 900, 'poc-desktop.png');
+    const desktopLayout = await evaluate(`(() => {
+      const touch = document.querySelector('.touch-controls').getBoundingClientRect();
+      const action = document.querySelector('.action-controls').getBoundingClientRect();
+      const face = document.querySelector('.face-buttons').getBoundingClientRect();
+      const shoulder = document.querySelector('.shoulder-buttons').getBoundingClientRect();
+      return {scrollWidth: document.documentElement.scrollWidth, innerWidth, actionRight: action.right,
+        touchRight: touch.right, rowGap: shoulder.top - face.bottom};
+    })()`);
+    assert.ok(desktopLayout.scrollWidth <= desktopLayout.innerWidth, JSON.stringify(desktopLayout));
+    assert.ok(desktopLayout.touchRight - desktopLayout.actionRight < 2, JSON.stringify(desktopLayout));
+    assert.ok(desktopLayout.rowGap >= 18, JSON.stringify(desktopLayout));
     await capture(390, 844, 'poc-mobile.png');
+    const mobileLayout = await evaluate(`(() => {
+      const dpad = document.querySelector('.dpad').getBoundingClientRect();
+      const action = document.querySelector('.action-controls').getBoundingClientRect();
+      const system = document.querySelector('.system-controls').getBoundingClientRect();
+      const quick = document.querySelector('.quick-controls').getBoundingClientRect();
+      return {scrollWidth: document.documentElement.scrollWidth, innerWidth, dpadRight: dpad.right,
+        actionLeft: action.left, quickTop: quick.top, systemBottom: system.bottom};
+    })()`);
+    assert.ok(mobileLayout.scrollWidth <= mobileLayout.innerWidth, JSON.stringify(mobileLayout));
+    assert.ok(mobileLayout.actionLeft >= mobileLayout.dpadRight, JSON.stringify(mobileLayout));
+    assert.ok(mobileLayout.quickTop > mobileLayout.systemBottom, JSON.stringify(mobileLayout));
+    await click('menu-toggle');
+    const mobileMenu = await evaluate(`(() => {
+      const panel = document.getElementById('app-menu-panel').getBoundingClientRect();
+      return {left: panel.left, right: panel.right, innerWidth, account: document.getElementById('account-name').innerText};
+    })()`);
+    assert.ok(mobileMenu.left >= 0 && mobileMenu.right <= mobileMenu.innerWidth, JSON.stringify(mobileMenu));
+    assert.equal(mobileMenu.account, 'Browser Admin');
+    await capture(390, 844, 'poc-mobile-menu.png');
 
     const finalState = await evaluate('window.__gbaPoc.diagnostics()');
     assert.ok(finalState.activeRom);
     assert.equal(finalState.status, 'Running');
+    loaded = cdp.waitEvent('Page.loadEventFired');
     await click('logout');
+    await loaded;
     await waitExpression('!document.getElementById("login-view").hidden', 'explicit logout login view');
     assert.equal(
+      await evaluate('location.pathname'),
+      '/',
+    );
+    assert.equal(
+      await evaluate('location.search'),
+      '',
+    );
+    assert.equal(
       await evaluate('new URL(document.getElementById("login-link").href).searchParams.get("prompt")'),
-      'login',
+      null,
     );
     assert.equal(
       await evaluate('fetch("/api/session").then(response => response.json()).then(body => body.authenticated)'),
@@ -401,7 +474,8 @@ async function main() {
       exportedStateSha256: createHash('sha256').update(await readFile(exported)).digest('hex'),
       accountPersistence: 'passed',
       visitorGate: 'passed',
-      explicitLogoutForcesLogin: 'passed',
+      roomAndPwClipboard: 'passed',
+      logoutUrlRedirect: 'passed',
       wrongRomRejection: 'passed',
     }));
   } finally {

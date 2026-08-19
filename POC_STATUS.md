@@ -36,7 +36,9 @@ Target fixture:
 | Admin save management boundary | PASS | Admin receives save import/export controls but ROM upload and reference fixtures remain forbidden |
 | External state audio quality | PASS | Supplied VBA state reports source quality 2 and is normalized to web quality 1 with both PCM queues reset |
 | Visitor request target | PASS | Service application payload explicitly requests `user`, never `superadmin` |
-| Idempotent logout | PASS | Stale sessions skip refresh, delete local server tokens, clear cookies and request an account-selecting login |
+| Idempotent logout | PASS | Stale sessions skip refresh, delete local server tokens and clear service/OIDC transaction cookies |
+| Full Auth logout | PASS | Browser is redirected through Auth `/logout`, clearing the Auth SSO cookie without `prompt=login` |
+| Room lock recovery | PASS | Leave releases both locks, disconnect auto-aborts after grace, and new-room creation clears matching stale rooms |
 | Saves are isolated by account | PASS | Two accounts retain distinct states for the same ROM composite key |
 | Link source provenance is pinned | PASS | `V172lsrc.zip` SHA-256 is verified before every core build and served beside WASM |
 | GBA serial register/timing transport | PASS | Native probe verifies multiplayer request, paired word registers, IRQ completion and idle reset |

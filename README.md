@@ -74,6 +74,8 @@ The build downloads the pinned VisualBoyAdvance 1.7.2 source, the VBA Link 1.72 
 
 While a room is active, speed mode and individual quick-state load/import are disabled. Periodic resume checkpoints are accepted only as a synchronized pair. Battery saves are written only when both participants submit successfully; disconnecting or aborting cannot commit one side alone.
 
+`Leave room` aborts the whole two-player room and immediately releases both save locks. A network disconnect keeps the room resumable for 60 seconds, then automatically aborts it. Creating a new room for the same account and ROM also cleans up an unrecoverable stale room before acquiring a new lock.
+
 GB/GBC link cable is not supported because the VBA Link 1.72 source itself does not implement it.
 
 ## Verify
@@ -109,6 +111,8 @@ This is `STANDALONE_DEPLOY`: the repo owns its image and deployment settings and
 
 Direction controls use triangle symbols on touch screens. `Speed off/on` above A/B toggles accelerated emulation; accelerated audio is muted to avoid buffering normal-speed sound while the game runs faster.
 
+Quick Save/Load sits directly below Select/Start. Account identity, source/download management, ROM upload/refresh, save import/export, and full logout are grouped under the hamburger menu beside Load. Room ID and PW copy only their own raw values when clicked or touched.
+
 VBA save states persist the emulator's sound quality. External VBA Link states commonly contain quality `2`, while this web player consumes 44.1kHz PCM at quality `1`. State load therefore records the source value for diagnostics, resets buffered PCM, and normalizes the running core to quality `1` to prevent accelerated or corrupted playback.
 
 ## Data
@@ -116,6 +120,8 @@ VBA save states persist the emulator's sound quality. External VBA Link states c
 `data/` and root ROM files are local fixtures and are ignored by Git. `Red_K.gb` is the GB MBC5 regression fixture. Do not deploy or redistribute ROM files without the necessary rights. Uploaded ROMs are written to `ROM_STORAGE_DIR`; account saves are stored as MariaDB `MEDIUMBLOB` values.
 
 OIDC and app sessions are server-side. The cookie contains only an opaque session ID; access and refresh tokens are encrypted at rest with `GBC_PORTING_SESSION_ENCRYPTION_KEY`. State-changing APIs also require the session CSRF token.
+
+Logout is a full Auth logout: the service deletes its local session, revokes its refresh token, clears app/OIDC cookies, then navigates the browser through Auth `/logout` so the Auth `tas_session` SSO cookie is cleared before returning to the app. It does not depend on `prompt=login`.
 
 The explicit save import/export controls granted to `admin` and `superadmin` are an application UX boundary, not DRM: a `user` browser must receive its own save bytes to load them into WebAssembly, so a determined user can inspect their own network payload.
 

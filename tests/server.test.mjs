@@ -6,7 +6,7 @@ import test from 'node:test';
 import { WebSocket } from 'ws';
 
 import { createConfig } from '../lib/config.mjs';
-import { createApp } from '../server.mjs';
+import { buildAuthLogoutUrl, createApp } from '../server.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'data');
@@ -85,6 +85,14 @@ async function openLinkSocket(origin, roomId, cookie) {
   return socket;
 }
 
+test('full logout URL clears the auth SSO session and returns to the public app', () => {
+  const url = new URL(buildAuthLogoutUrl({
+    authPublicBaseUrl: 'https://auth.lafamila.xyz',
+    publicBaseUrl: 'https://play.lafamila.xyz',
+  }));
+  assert.equal(url.toString(), 'https://auth.lafamila.xyz/logout?return_to=https%3A%2F%2Fplay.lafamila.xyz%2F');
+});
+
 test('unauthenticated clients can render login shell but cannot read ROM data', () => withServer(async ({ origin }) => {
   const page = await fetch(origin);
   assert.equal(page.status, 200);
@@ -95,9 +103,6 @@ test('unauthenticated clients can render login shell but cannot read ROM data', 
   assert.equal(login.status, 302);
   assert.match(login.headers.get('location'), /^http:\/\/localhost:3032\/oauth\/authorize\?/);
   assert.match(login.headers.get('set-cookie'), /gbc_porting_oidc_state=.*HttpOnly.*SameSite=Lax/);
-  const forcedLogin = await fetch(`${origin}/auth/login?prompt=login`, { redirect: 'manual' });
-  assert.equal(forcedLogin.status, 302);
-  assert.equal(new URL(forcedLogin.headers.get('location')).searchParams.get('prompt'), 'login');
 }));
 
 test('visitor sees only access request APIs and CSRF is enforced', () => withServer(async ({ origin }) => {
@@ -114,12 +119,7 @@ test('visitor sees only access request APIs and CSRF is enforced', () => withSer
   assert.equal((await requested.json()).application.status, 'pending');
   const logout = await fetch(`${origin}/auth/logout`, { method: 'POST', headers: visitor.headers });
   assert.equal(logout.status, 200);
-  assert.match(logout.headers.get('set-cookie'), /gbc_porting_force_login=1/);
-  const nextLogin = await fetch(`${origin}/auth/login`, {
-    redirect: 'manual',
-    headers: { Cookie: 'gbc_porting_force_login=1' },
-  });
-  assert.equal(new URL(nextLogin.headers.get('location')).searchParams.get('prompt'), 'login');
+  assert.equal((await logout.json()).authLogoutUrl, '/');
 }));
 
 test('logout is idempotent and clears local cookies without refreshing a stale session', () => withServer(async ({ origin }) => {
@@ -128,10 +128,11 @@ test('logout is idempotent and clears local cookies without refreshing a stale s
     headers: { Cookie: 'gbc_porting_session=stale-session' },
   });
   assert.equal(response.status, 200);
-  assert.equal((await response.json()).ok, true);
+  const result = await response.json();
+  assert.equal(result.ok, true);
   assert.match(response.headers.get('set-cookie'), /gbc_porting_session=.*Max-Age=0/);
   assert.match(response.headers.get('set-cookie'), /gbc_porting_oidc_state=.*Max-Age=0/);
-  assert.match(response.headers.get('set-cookie'), /gbc_porting_force_login=1/);
+  assert.equal(result.authLogoutUrl, '/');
 }));
 
 test('user can play and save but cannot upload ROMs or read reference save files', () => withServer(async ({ origin }) => {

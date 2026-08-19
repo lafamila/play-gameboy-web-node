@@ -8,7 +8,7 @@ const LINK_ROOM_POLL_INTERVAL = 3_000;
 const elements = Object.fromEntries([
   'auth-loading', 'login-view', 'login-link', 'visitor-view', 'app-view', 'visitor-account',
   'request-access', 'access-request-status', 'visitor-logout', 'account-name',
-  'account-permission', 'logout',
+  'menu-toggle', 'app-menu-panel', 'logout',
   'rom-upload', 'refresh-roms', 'rom-select', 'load-rom', 'rom-meta', 'screen',
   'screen-shell', 'screen-empty', 'pause', 'mute', 'fullscreen', 'runtime-status',
   'speed-toggle',
@@ -17,6 +17,7 @@ const elements = Object.fromEntries([
   'battery-meta', 'fixture-list', 'event-log', 'link-socket-status', 'link-lobby',
   'link-create', 'link-room-input', 'link-invite-input', 'link-join', 'link-room',
   'link-room-id', 'link-invite-row', 'link-invite-code', 'link-room-status',
+  'link-room-copy-feedback', 'link-pw-copy-feedback',
   'link-participants', 'link-ready', 'link-start', 'link-finish', 'link-abort', 'link-close',
 ].map((id) => [id, document.getElementById(id)]));
 
@@ -65,6 +66,7 @@ let linkCorePlayer = -1;
 let linkDetachPending = false;
 let linkLastOfferSequence = -1;
 let linkTransferActive = false;
+const copyFeedbackTimers = new Map();
 
 async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -102,6 +104,43 @@ function logEvent(message, error = false) {
   elements['event-log'].prepend(item);
   while (elements['event-log'].children.length > 30) {
     elements['event-log'].lastElementChild.remove();
+  }
+}
+
+function setMenuOpen(open, focusToggle = false) {
+  elements['app-menu-panel'].hidden = !open;
+  elements['menu-toggle'].setAttribute('aria-expanded', String(open));
+  if (!open && focusToggle) elements['menu-toggle'].focus();
+}
+
+function applyPermissionVisibility() {
+  const permission = currentSession?.permission;
+  for (const element of document.querySelectorAll('.superadmin-only')) {
+    element.hidden = permission !== 'superadmin';
+  }
+  for (const element of document.querySelectorAll('.save-admin-only')) {
+    element.hidden = !['admin', 'superadmin'].includes(permission);
+  }
+}
+
+function showCopyFeedback(element, message) {
+  clearTimeout(copyFeedbackTimers.get(element));
+  element.textContent = message;
+  copyFeedbackTimers.set(element, setTimeout(() => {
+    element.textContent = '';
+    copyFeedbackTimers.delete(element);
+  }, 1800));
+}
+
+async function copyLinkValue(valueElement, feedbackElement, label) {
+  const value = valueElement.textContent.trim();
+  if (!value) return;
+  try {
+    await navigator.clipboard.writeText(value);
+    showCopyFeedback(feedbackElement, 'Copied');
+  } catch (error) {
+    showCopyFeedback(feedbackElement, 'Failed');
+    throw new Error(`${label} copy failed: ${error.message}`);
   }
 }
 
@@ -834,6 +873,8 @@ function clearLinkRoom() {
   linkFinishSubmitted = false;
   linkCheckpointPendingSequence = null;
   linkCheckpointPendingState = '';
+  elements['link-room-copy-feedback'].textContent = '';
+  elements['link-pw-copy-feedback'].textContent = '';
   detachLinkCore();
   renderLinkRoom();
   restartBatteryTimer();
@@ -1037,6 +1078,7 @@ function handleKey(event, pressed) {
 }
 
 function showAuthView(view) {
+  setMenuOpen(false);
   elements['auth-loading'].hidden = view !== 'loading';
   elements['login-view'].hidden = view !== 'login';
   elements['visitor-view'].hidden = view !== 'visitor';
@@ -1065,13 +1107,7 @@ async function bootstrap() {
     return;
   }
   elements['account-name'].textContent = result.account.name || result.account.email || result.account.id;
-  elements['account-permission'].textContent = result.permission;
-  for (const element of document.querySelectorAll('.superadmin-only')) {
-    element.hidden = result.permission !== 'superadmin';
-  }
-  for (const element of document.querySelectorAll('.save-admin-only')) {
-    element.hidden = !['admin', 'superadmin'].includes(result.permission);
-  }
+  applyPermissionVisibility();
   showAuthView('app');
   setControls(false);
   await refreshCatalog();
@@ -1091,26 +1127,35 @@ async function checkSession() {
   }
   currentSession = result;
   elements['account-name'].textContent = result.account.name || result.account.email || result.account.id;
-  elements['account-permission'].textContent = result.permission;
-  for (const element of document.querySelectorAll('.superadmin-only')) {
-    element.hidden = result.permission !== 'superadmin';
-  }
-  for (const element of document.querySelectorAll('.save-admin-only')) {
-    element.hidden = !['admin', 'superadmin'].includes(result.permission);
-  }
+  applyPermissionVisibility();
 }
 
 async function logout() {
+  if (isLinkRoomOpen()) {
+    try {
+      await abortLinkRoom();
+    } catch (error) {
+      logEvent(`Room cleanup failed / ${error.message}`, true);
+    }
+  }
   stopEmulation();
   clearInterval(sessionTimer);
-  await apiFetch('/auth/logout', { method: 'POST' });
-  currentSession = null;
-  elements['login-link'].href = '/auth/login?prompt=login';
-  showAuthView('login');
+  const response = await apiFetch('/auth/logout', { method: 'POST' });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || typeof result.authLogoutUrl !== 'string' || !result.authLogoutUrl) {
+    throw new Error(result.error || 'Logout failed');
+  }
+  window.location.assign(result.authLogoutUrl);
 }
 
 elements['load-rom'].addEventListener('click', () => runAction(loadSelectedRom));
-elements['refresh-roms'].addEventListener('click', () => runAction(refreshCatalog));
+elements['menu-toggle'].addEventListener('click', () => {
+  setMenuOpen(elements['menu-toggle'].getAttribute('aria-expanded') !== 'true');
+});
+elements['refresh-roms'].addEventListener('click', () => runAction(async () => {
+  await refreshCatalog();
+  setMenuOpen(false);
+}));
 elements['rom-select'].addEventListener('change', applyControlState);
 elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   const file = elements['rom-upload'].files[0];
@@ -1122,6 +1167,7 @@ elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   if (!response.ok) throw new Error(result.error || 'ROM upload failed');
   await refreshCatalog();
   elements['rom-select'].value = result.id;
+  setMenuOpen(false);
   logEvent(`ROM uploaded / ${result.gameCode}`);
 }));
 
@@ -1177,6 +1223,18 @@ elements['link-start'].addEventListener('click', () => runAction(startLinkRoom))
 elements['link-finish'].addEventListener('click', () => runAction(finishLinkRoom));
 elements['link-abort'].addEventListener('click', () => runAction(abortLinkRoom));
 elements['link-close'].addEventListener('click', clearLinkRoom);
+for (const [valueId, feedbackId, label] of [
+  ['link-room-id', 'link-room-copy-feedback', 'Room ID'],
+  ['link-invite-code', 'link-pw-copy-feedback', 'Room PW'],
+]) {
+  const copyValue = () => runAction(() => copyLinkValue(elements[valueId], elements[feedbackId], label));
+  elements[valueId].addEventListener('click', copyValue);
+  elements[valueId].addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    copyValue();
+  });
+}
 for (const id of ['link-room-input', 'link-invite-input']) {
   elements[id].addEventListener('input', applyControlState);
   elements[id].addEventListener('keydown', (event) => {
@@ -1197,7 +1255,18 @@ elements['request-access'].addEventListener('click', () => runAction(async () =>
   elements['access-request-status'].textContent = 'Request pending';
 }));
 
-document.addEventListener('keydown', (event) => handleKey(event, true));
+document.addEventListener('pointerdown', (event) => {
+  if (!elements['app-menu-panel'].hidden && !event.target.closest('.app-menu')) setMenuOpen(false);
+});
+document.addEventListener('dragstart', (event) => event.preventDefault());
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !elements['app-menu-panel'].hidden) {
+    event.preventDefault();
+    setMenuOpen(false, true);
+    return;
+  }
+  handleKey(event, true);
+});
 document.addEventListener('keyup', (event) => handleKey(event, false));
 window.addEventListener('blur', () => { keyMask = 0; touchMask = 0; });
 

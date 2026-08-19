@@ -25,28 +25,51 @@
     </section>
 
     <div id="app-view" hidden>
-    <header class="topbar">
-      <div>
-        <h1>GBC Porting</h1>
-        <span class="build-tag">VBA 1.7.2 / state v8</span>
-      </div>
-      <div class="top-actions">
-        <span id="account-name" class="account-name"></span>
-        <span id="account-permission" class="permission-badge"></span>
-        <a class="source-link" href="/core/VisualBoyAdvance-src-1.7.2.zip">Core source</a>
-        <label class="file-button superadmin-only" for="rom-upload">Upload ROM</label>
-        <input id="rom-upload" type="file" accept=".gba,.gb,.gbc" hidden />
-        <button id="refresh-roms" type="button">Refresh</button>
-        <button id="logout" type="button">Logout</button>
-      </div>
-    </header>
-
     <main>
       <section class="rom-toolbar" aria-label="ROM selection">
-        <label for="rom-select">ROM</label>
-        <select id="rom-select"></select>
+        <select id="rom-select" aria-label="ROM"></select>
         <button id="load-rom" class="primary" type="button">Load</button>
-        <span id="rom-meta" class="meta"></span>
+        <div class="app-menu">
+          <button
+            id="menu-toggle"
+            class="menu-toggle"
+            type="button"
+            aria-label="Account menu"
+            aria-controls="app-menu-panel"
+            aria-expanded="false"
+            title="Account menu"
+          >&#9776;</button>
+          <div id="app-menu-panel" class="menu-panel" aria-label="Account and save actions" hidden>
+            <div id="account-name" class="account-name"></div>
+            <div id="rom-meta" class="meta menu-meta"></div>
+            <a class="source-link menu-command" href="/core/VisualBoyAdvance-src-1.7.2.zip">Core source</a>
+            <label class="file-button menu-command superadmin-only" for="rom-upload">Upload ROM</label>
+            <input id="rom-upload" type="file" accept=".gba,.gb,.gbc" hidden />
+            <button id="refresh-roms" class="menu-command" type="button">Refresh</button>
+
+            <div class="menu-section">
+              <span class="menu-label">Quick state</span>
+              <div id="quick-state-meta" class="meta block">No account state</div>
+              <div class="action-grid menu-save-actions save-admin-only">
+                <button id="export-state" type="button" disabled>Export .sg1</button>
+                <label class="file-button disabled" id="import-state-label" for="import-state">Import .sg1</label>
+                <input id="import-state" type="file" accept=".sg1,.sgm,application/gzip" hidden disabled />
+              </div>
+            </div>
+
+            <div class="menu-section">
+              <span class="menu-label">Battery save</span>
+              <div id="battery-meta" class="meta block">No account battery save</div>
+              <div class="action-grid menu-save-actions save-admin-only">
+                <button id="export-battery" type="button" disabled>Export .sa1</button>
+                <label class="file-button disabled" id="import-battery-label" for="import-battery">Import .sa1</label>
+                <input id="import-battery" type="file" accept=".sa1,.sav" hidden disabled />
+              </div>
+            </div>
+
+            <button id="logout" class="menu-command" type="button">Logout</button>
+          </div>
+        </div>
       </section>
 
       <section class="workspace">
@@ -71,15 +94,25 @@
               <button data-button="128" class="down direction" aria-label="Down">▼</button>
             </div>
             <div class="center-controls">
-              <button data-button="4">Select</button>
-              <button data-button="8">Start</button>
+              <div class="system-controls">
+                <button data-button="4">Select</button>
+                <button data-button="8">Start</button>
+              </div>
+              <div class="quick-controls">
+                <button id="quick-save" type="button" disabled>Quick Save</button>
+                <button id="quick-load" type="button" disabled>Quick Load</button>
+              </div>
             </div>
             <div class="action-controls">
               <button id="speed-toggle" class="speed-toggle" type="button" aria-pressed="false">Speed off</button>
-              <button data-button="2" class="round">B</button>
-              <button data-button="1" class="round accent">A</button>
-              <button data-button="512">L</button>
-              <button data-button="256">R</button>
+              <div class="face-buttons">
+                <button data-button="2" class="round">B</button>
+                <button data-button="1" class="round accent">A</button>
+              </div>
+              <div class="shoulder-buttons">
+                <button data-button="512">L</button>
+                <button data-button="256">R</button>
+              </div>
             </div>
           </div>
 
@@ -98,13 +131,21 @@
             <div id="link-lobby" class="link-lobby">
               <button id="link-create" class="primary" type="button" disabled>Create room</button>
               <input id="link-room-input" type="text" inputmode="text" autocomplete="off" placeholder="Room ID" aria-label="Room ID" />
-              <input id="link-invite-input" type="text" inputmode="text" autocomplete="off" placeholder="Invite code" aria-label="Invite code" />
+              <input id="link-invite-input" type="text" inputmode="text" autocomplete="off" placeholder="PW" aria-label="Room PW" />
               <button id="link-join" type="button" disabled>Join</button>
             </div>
             <div id="link-room" class="link-room" hidden>
               <dl class="link-details">
-                <div><dt>Room</dt><dd id="link-room-id"></dd></div>
-                <div id="link-invite-row" hidden><dt>Invite</dt><dd id="link-invite-code"></dd></div>
+                <div class="copy-detail">
+                  <dt>Room</dt>
+                  <dd id="link-room-id" class="copy-value" role="button" tabindex="0" aria-label="Copy room ID"></dd>
+                  <span id="link-room-copy-feedback" class="copy-feedback" aria-live="polite"></span>
+                </div>
+                <div id="link-invite-row" class="copy-detail" hidden>
+                  <dt>PW</dt>
+                  <dd id="link-invite-code" class="copy-value" role="button" tabindex="0" aria-label="Copy room PW"></dd>
+                  <span id="link-pw-copy-feedback" class="copy-feedback" aria-live="polite"></span>
+                </div>
                 <div><dt>Status</dt><dd id="link-room-status"></dd></div>
               </dl>
               <ol id="link-participants" class="link-participants"></ol>
@@ -112,32 +153,10 @@
                 <button id="link-ready" type="button">Ready</button>
                 <button id="link-start" class="primary" type="button">Start</button>
                 <button id="link-finish" class="primary" type="button">Finish + save</button>
-                <button id="link-abort" class="danger" type="button">Abort</button>
+                <button id="link-abort" class="danger" type="button">Leave room</button>
                 <button id="link-close" type="button" hidden>Close</button>
               </div>
             </div>
-          </section>
-
-          <section class="save-section">
-            <h2>Quick State</h2>
-            <div class="action-grid">
-              <button id="quick-save" type="button" disabled>Save</button>
-              <button id="quick-load" type="button" disabled>Load</button>
-              <button id="export-state" class="save-admin-only" type="button" disabled>Export .sg1</button>
-              <label class="file-button disabled save-admin-only" id="import-state-label" for="import-state">Import .sg1</label>
-              <input id="import-state" type="file" accept=".sg1,.sgm,application/gzip" hidden disabled />
-            </div>
-            <div id="quick-state-meta" class="meta block">No account state</div>
-          </section>
-
-          <section class="save-section">
-            <h2>Battery Save</h2>
-            <div class="action-grid">
-              <button id="export-battery" class="save-admin-only" type="button" disabled>Export .sa1</button>
-              <label class="file-button disabled save-admin-only" id="import-battery-label" for="import-battery">Import .sa1</label>
-              <input id="import-battery" type="file" accept=".sa1,.sav" hidden disabled />
-            </div>
-            <div id="battery-meta" class="meta block">No account battery save</div>
           </section>
 
           <section class="save-section superadmin-only">

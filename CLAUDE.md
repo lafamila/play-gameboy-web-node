@@ -29,6 +29,7 @@ Browser GB/GBC/GBA emulator with account-scoped saves and authenticated two-user
 | local callback | `http://localhost:4173/auth/callback` |
 | production callback | `https://play.lafamila.xyz/auth/callback` |
 | session | app-owned HttpOnly cookie, server stores OIDC tokens encrypted |
+| logout | local session/token revoke, then browser redirect through Auth `/logout` to clear `tas_session` |
 | visitor | access request UI only |
 | user | play, account saves, cable room create/join |
 | admin | user 기능 + save-state/battery import/export UI |
@@ -53,9 +54,12 @@ Browser B (VBA WASM, slot 1) ─┘                              ├─ auth-api
 - 서버는 영상/프레임을 중계하지 않고 serial transfer sequence만 동기화한다.
 - 각 참가자는 자신의 ROM과 account-scoped battery save를 사용한다.
 - 링크 종료 시 두 battery save를 한 DB transaction으로 함께 반영한다.
+- 명시적 Leave/Abort는 방 전체를 종료하고 양쪽 save lock을 즉시 해제한다.
+- 비정상 disconnect는 60초 동안 재접속을 허용한 뒤 자동 abort하며, 같은 계정/ROM으로 새 방을 만들면 stale room을 먼저 정리한다.
 - 활성 링크방에서는 가속과 개별 quick load/import를 금지한다.
 - GB/GBC 링크는 VBA Link 1.72 자체가 지원하지 않으므로 현재 대상이 아니다.
 - 외부 GBA state의 저장된 `soundQuality` 값은 진단용으로 기록하되, Web Audio 출력은 항상 quality `1`(44.1kHz)로 정규화한다.
+- 앱 화면은 ROM select/Load/menu만 상단에 두고, 계정·관리·import/export 명령은 hamburger menu가 소유한다.
 
 ## Commands
 

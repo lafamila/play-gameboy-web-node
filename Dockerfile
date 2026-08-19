@@ -20,7 +20,9 @@ COPY lib ./lib
 COPY roms ./roms
 COPY web ./web
 COPY server.mjs README.md LICENSE THIRD_PARTY_NOTICES.md ./
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /app/data /app/roms \
+    && chown -R node:node /app \
+    && chmod -R u=rwX,go=rX /app
 
 USER node
 EXPOSE 4173

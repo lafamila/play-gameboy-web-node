@@ -285,3 +285,31 @@ test('schema probes emit MySQL 8 compatible conditional ALTER statements', async
   ]);
   assert.equal(queries.some((sql) => /ALTER TABLE[\s\S]*IF NOT EXISTS/i.test(sql)), false);
 });
+
+test('fixture rescans refresh moved paths while uploaded duplicates cannot replace them', async () => {
+  const database = new MemoryDatabase();
+  const fixture = {
+    id: ROM_ID,
+    platform: 'gba',
+    filename: 'fixture.gba',
+    title: 'FIRE RED',
+    gameCode: 'BPRE',
+    romIdentity: 'POKEMON FIREBPRE',
+    revision: 0,
+    size: 1024,
+    path: '/old/repo/data/fixture.gba',
+    source: 'fixture',
+  };
+  await database.upsertRom(fixture);
+  await database.upsertRom({ ...fixture, path: '/new/repo/data/fixture.gba' });
+  await database.upsertRom({
+    ...fixture,
+    filename: 'uploaded-copy.gba',
+    path: '/new/repo/roms/uploaded-copy.gba',
+    source: 'uploaded',
+  });
+  assert.deepEqual(await database.getRom(ROM_ID), {
+    ...fixture,
+    path: '/new/repo/data/fixture.gba',
+  });
+});

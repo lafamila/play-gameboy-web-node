@@ -1,0 +1,27 @@
+{
+  "serviceKey": "gbc-porting",
+  "name": "GBA Porting",
+  "description": "Account-scoped browser GB/GBC/GBA player with VBA Link 1.7.2 save compatibility",
+  "requesterName": "Imported value is ignored by /service",
+  "requesterEmail": "imported-value-is-ignored@example.com",
+  "permissions": [
+    {
+      "key": "user",
+      "label": "User",
+      "description": "Play ROMs and use account-scoped quick state and battery saves"
+    }
+  ],
+  "oidcClients": [
+    {
+      "clientId": "gbc-porting-web",
+      "clientType": "confidential",
+      "redirectUris": [
+        "http://localhost:4173/auth/callback",
+        "https://play.lafamila.xyz/auth/callback"
+      ],
+      "allowedScopes": ["openid", "profile", "email", "service.permission"],
+      "requirePkce": true
+    }
+  ],
+  "serviceCredentials": []
+}

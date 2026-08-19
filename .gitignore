@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.omc/
+.build/
+node_modules/
+core/dist/
+data/
+*.gb
+roms/*
+!roms/.gitkeep

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { MemoryDatabase } from '../lib/database.mjs';
+import { MariaDbDatabase, MemoryDatabase } from '../lib/database.mjs';
 
 const FIRE_RED_ROM_ID = 'a'.repeat(64);
 const LEAF_GREEN_ROM_ID = 'b'.repeat(64);
@@ -229,4 +229,31 @@ test('a terminal room releases locks for a later room', async () => {
     id: 'room-2', romId: ROM_ID, accountId: 'host', now: 50,
   });
   assert.equal(replacement.createdBy, 'host');
+});
+
+test('schema probes emit MySQL 8 compatible conditional ALTER statements', async () => {
+  const database = new MariaDbDatabase({ name: 'migration_test' });
+  const queries = [];
+  database.pool = {
+    execute: async () => [[], []],
+    query: async (sql) => {
+      queries.push(sql);
+      return [[], []];
+    },
+  };
+
+  await database.ensureColumn('roms', 'platform', "ENUM('gba') NOT NULL");
+  await database.ensureIndex('roms', 'roms_platform_idx', '(`platform`)');
+  await database.ensureForeignKey(
+    'link_room_participants',
+    'participants_rom_fk',
+    'FOREIGN KEY (`rom_id`) REFERENCES `roms` (`id`)',
+  );
+
+  assert.deepEqual(queries, [
+    "ALTER TABLE `roms` ADD COLUMN `platform` ENUM('gba') NOT NULL",
+    'ALTER TABLE `roms` ADD INDEX `roms_platform_idx` (`platform`)',
+    'ALTER TABLE `link_room_participants` ADD CONSTRAINT `participants_rom_fk` FOREIGN KEY (`rom_id`) REFERENCES `roms` (`id`)',
+  ]);
+  assert.equal(queries.some((sql) => /ALTER TABLE[\s\S]*IF NOT EXISTS/i.test(sql)), false);
 });

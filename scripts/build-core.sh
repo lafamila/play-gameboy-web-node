@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/.build"
 SOURCE_ARCHIVE="${BUILD_DIR}/VisualBoyAdvance-src-1.7.2.zip"
 SOURCE_DIR="${BUILD_DIR}/VisualBoyAdvance-1.7.2"
-OUTPUT_DIR="${ROOT_DIR}/core/dist"
+OUTPUT_DIR="${VBA_CORE_OUTPUT_DIR:-${ROOT_DIR}/core/dist}"
 EMSDK_DIR="${EMSDK_DIR:-${BUILD_DIR}/emsdk}"
 SOURCE_URL="https://downloads.sourceforge.net/project/vba/VisualBoyAdvance/1.7.2/VisualBoyAdvance-src-1.7.2.zip"
 SOURCE_SHA256="83e1b72433cb14e3a468575a13d5165a271dd24599ac30755fb5bc6d5727129a"
@@ -87,6 +87,11 @@ SOURCES=(
 )
 
 EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_quality","_vba_state_audio_quality","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_link_set_player","_vba_link_player","_vba_link_waiting","_vba_link_transfer_active","_vba_link_request_pending","_vba_link_request_sequence","_vba_link_request_speed","_vba_link_request_data","_vba_link_request_ticks","_vba_link_guest_held","_vba_link_time","_vba_link_siocnt","_vba_link_siodata8","_vba_link_prepare_remote","_vba_link_apply_pair","_vba_link_cancel_wait","_vba_shutdown"]'
+PROBE_DEFINE=""
+if [[ "${VBA_LINK_TEST_PROBE:-0}" == "1" ]]; then
+  EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_quality","_vba_state_audio_quality","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_link_set_player","_vba_link_player","_vba_link_waiting","_vba_link_transfer_active","_vba_link_request_pending","_vba_link_request_sequence","_vba_link_request_speed","_vba_link_request_data","_vba_link_request_ticks","_vba_link_guest_held","_vba_link_time","_vba_link_siocnt","_vba_link_siodata8","_vba_link_prepare_remote","_vba_link_apply_pair","_vba_link_cancel_wait","_vba_link_test_set_data","_vba_link_test_begin_request","_vba_link_test_finish_and_peer_data","_vba_shutdown"]'
+  PROBE_DEFINE="-DVBA_LINK_TEST_PROBE"
+fi
 
 em++ \
   -std=gnu++14 \
@@ -97,6 +102,7 @@ em++ \
   -Wno-deprecated-declarations \
   -DFINAL_VERSION \
   -DC_CORE \
+  ${PROBE_DEFINE} \
   -I"${SOURCE_DIR}/src" \
   "${SOURCES[@]}" \
   --no-entry \

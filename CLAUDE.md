@@ -47,6 +47,12 @@ Browser A (VBA WASM, slot 0) ─┐
                               ├─ WSS virtual cable barrier ─ Node server ─ MariaDB
 Browser B (VBA WASM, slot 1) ─┘                              ├─ auth-api-nest
                                                              └─ ROM storage
+
+Single Play page
+├─ PlayerRuntime P1 ─ gbc_porting_session ─ primary save profile
+├─ PlayerRuntime P2 ─ gbc_porting_player2_session ─ primary profile
+│                  └ Guest P2 ─ P1 authorization ─ guest-p2 profile
+└─ LocalTwoPlayerController ─ direct in-page serial pair, no Room/WebSocket
 ```
 
 - 싱글 플레이는 브라우저의 기존 VBA 1.7.2 WASM 코어를 사용한다.
@@ -60,6 +66,16 @@ Browser B (VBA WASM, slot 1) ─┘                              ├─ auth-api
 - GB/GBC 링크는 VBA Link 1.72 자체가 지원하지 않으므로 현재 대상이 아니다.
 - 외부 GBA state의 저장된 `soundQuality` 값은 진단용으로 기록하되, Web Audio 출력은 항상 quality `1`(44.1kHz)로 정규화한다.
 - 앱 화면은 ROM select/Load/menu만 상단에 두고, 계정·관리·import/export 명령은 hamburger menu가 소유한다.
+- OIDC transaction은 `primary|player2` purpose를 서버에 저장하며 P2만 `prompt=select_account`를 사용한다. state cookie와 app HttpOnly cookie도 player slot별로 분리한다.
+- P2 callback은 같은 `/auth/callback`을 쓰되 P1 cookie를 수정하지 않고 same-origin 완료 신호만 popup opener에 보낸다. P2 종료는 중앙 Auth logout을 호출하지 않는다.
+- save와 lock key는 `(account_id, profile_key, rom_id[, kind])`다. 기존 row와 remote Room은 항상 `primary`, P1-owned Guest P2만 `guest-p2`다.
+- local 2P internal session은 두 revision/lock을 한 transaction에서 획득하고 checkpoint/final battery를 pair 단위로만 저장한다. lease expiry/abort는 두 lock을 함께 해제한다.
+- remote/local 진입은 공통 `play_admission_locks` account row를 room/session transaction 안에서 정렬 획득한다. migration은 MySQL advisory lock 안에서 version 기록과 함께 수행한다.
+- local mutation은 expected status와 유효 lease를 row lock에서 재검증한다. checkpoint sequence는 정확히 `N+1`만 허용하고 한 pair와 cable metadata만 유지한다.
+- remote Ready/Start도 persisted expected status를 row lock에서 검증하며 abort 이후 terminal room을 되살릴 수 없다. 동일 checkpoint retry는 저장된 pair/metadata와 완전히 같을 때만 idempotent하다.
+- real-core cable probe export는 `VBA_LINK_TEST_PROBE` browser test build에만 포함하고 `.build/core-probe`에서 실행 후 삭제한다. production `core/dist`에는 probe surface가 없다.
+- local 2P와 remote Room은 server/UI 양쪽에서 상호 배타다. direct local cable은 두 독립 WASM memory 사이에서만 교환하며 WebSocket을 만들지 않는다.
+- local active 중 speed와 개별 quick load/import/export를 막고, P2 audio는 기본 mute다. P1/P2 gamepad는 index 0/1로 고정한다.
 
 ## Commands
 

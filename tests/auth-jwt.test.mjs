@@ -3,6 +3,7 @@ import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import test from 'node:test';
 
 import { AuthClient } from '../lib/auth.mjs';
+import { createConfig } from '../lib/config.mjs';
 import { MemoryDatabase } from '../lib/database.mjs';
 
 function makeKey() {
@@ -95,4 +96,40 @@ test('visitor access requests explicitly target the user permission', async () =
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('primary and Player 2 OIDC transactions retain purpose and only P2 selects an account', async () => {
+  const database = new MemoryDatabase();
+  const auth = new AuthClient({
+    authTestMode: true,
+    authPublicBaseUrl: 'https://auth.example.test',
+    oidcClientId: 'gbc-porting-web',
+    oidcRedirectUri: 'https://play.example.test/auth/callback',
+    oidcTransactionTtlSeconds: 300,
+    sessionEncryptionKey: 'transaction-purpose-test-key',
+  }, database);
+  const primary = await auth.startLogin('/games', 'primary');
+  const player2 = await auth.startLogin('/', 'player2');
+  assert.notEqual(primary.state, player2.state);
+  assert.equal(new URL(primary.authorizeUrl).searchParams.get('prompt'), null);
+  assert.equal(new URL(player2.authorizeUrl).searchParams.get('prompt'), 'select_account');
+  assert.equal(database.transactions.get(primary.state).purpose, 'primary');
+  assert.equal(database.transactions.get(player2.state).purpose, 'player2');
+});
+
+test('P1/P2 session and OIDC state cookie names must all be distinct', () => {
+  const base = {
+    nodeEnv: 'test', authTestMode: true, database: { driver: 'memory' },
+    sessionEncryptionKey: 'cookie-name-test',
+  };
+  assert.throws(() => createConfig({
+    ...base,
+    sessionCookieName: 'same_cookie',
+    player2SessionCookieName: 'same_cookie',
+  }), /cookie names must be valid and distinct/i);
+  assert.throws(() => createConfig({
+    ...base,
+    oidcStateCookieName: 'state_cookie',
+    player2OidcStateCookieName: 'state_cookie',
+  }), /cookie names must be valid and distinct/i);
 });

@@ -12,10 +12,10 @@ import { createConfig } from './lib/config.mjs';
 import { createDatabase } from './lib/database.mjs';
 import { LinkRoomError } from './lib/link-room.mjs';
 import { LinkService } from './lib/link-service.mjs';
+import { LocalLinkService } from './lib/local-link-service.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
-const CORE_ROOT = path.join(ROOT, 'core', 'dist');
 const PLAY_PERMISSIONS = ['user', 'admin', 'superadmin'];
 
 const MIME_TYPES = new Map([
@@ -35,12 +35,17 @@ export async function createApp(options = {}) {
   const database = options.database ?? await createDatabase(config.database, { allowMemory: config.authTestMode });
   const auth = options.auth ?? new AuthClient(config, database);
   const linkService = options.linkService ?? new LinkService({ database });
+  const localLinkService = options.localLinkService ?? new LocalLinkService({
+    database,
+    leaseMs: config.localSessionLeaseSeconds * 1000,
+  });
   await linkService.initialize?.();
+  await localLinkService.initialize?.();
   await mkdir(config.romStorageDir, { recursive: true });
   await syncRomCatalog(config, database);
 
   const server = createServer((request, response) => {
-    void handleRequest({ request, response, config, database, auth, linkService }).catch((error) => {
+    void handleRequest({ request, response, config, database, auth, linkService, localLinkService }).catch((error) => {
       if (response.headersSent) {
         response.destroy(error);
         return;
@@ -50,14 +55,16 @@ export async function createApp(options = {}) {
       if (statusCode === 500) console.error(error);
     });
   });
-  const linkSockets = attachLinkWebSockets({ server, config, auth, linkService });
+  const linkSockets = attachLinkWebSockets({ server, config, database, auth, linkService });
   return {
     server,
     config,
     database,
     auth,
     linkService,
+    localLinkService,
     close: async () => {
+      localLinkService.close?.();
       await linkSockets.close();
       if (server.listening) await new Promise((resolve) => server.close(resolve));
       await database.close();
@@ -66,7 +73,7 @@ export async function createApp(options = {}) {
 }
 
 async function handleRequest(context) {
-  const { request, response, config, database, auth, linkService } = context;
+  const { request, response, config, database, auth, linkService, localLinkService } = context;
   const url = new URL(request.url, config.publicBaseUrl);
 
   if (request.method === 'GET' && url.pathname === '/api/health') {
@@ -74,8 +81,17 @@ async function handleRequest(context) {
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/login') {
-    const login = await auth.startLogin(url.searchParams.get('return_to') ?? '/');
-    setCookie(response, 'gbc_porting_oidc_state', login.state, {
+    const login = await auth.startLogin(url.searchParams.get('return_to') ?? '/', 'primary');
+    setCookie(response, config.oidcStateCookieName, login.state, {
+      maxAgeSeconds: config.oidcTransactionTtlSeconds,
+      secure: config.secureCookies,
+    });
+    return redirect(response, login.authorizeUrl);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/auth/player2/login') {
+    const login = await auth.startLogin('/', 'player2');
+    setCookie(response, config.player2OidcStateCookieName, login.state, {
       maxAgeSeconds: config.oidcTransactionTtlSeconds,
       secure: config.secureCookies,
     });
@@ -83,15 +99,48 @@ async function handleRequest(context) {
   }
 
   if (request.method === 'GET' && url.pathname === '/auth/callback') {
+    const requestCookies = cookies(request);
+    const callbackState = url.searchParams.get('state');
+    const player2Callback = Boolean(callbackState &&
+      callbackState === requestCookies[config.player2OidcStateCookieName]);
     if (url.searchParams.get('error')) {
-      throw new AuthError(401, url.searchParams.get('error_description') ?? url.searchParams.get('error'));
+      const message = url.searchParams.get('error_description') ?? url.searchParams.get('error');
+      if (player2Callback) {
+        clearCookie(response, config.player2OidcStateCookieName, config.secureCookies);
+        return popupCallback(response, config, false, message);
+      }
+      throw new AuthError(401, message);
     }
     const result = await auth.completeLogin({
       code: url.searchParams.get('code'),
-      state: url.searchParams.get('state'),
-      stateCookie: cookies(request).gbc_porting_oidc_state,
+      state: callbackState,
+      stateCookie: player2Callback
+        ? requestCookies[config.player2OidcStateCookieName]
+        : requestCookies[config.oidcStateCookieName],
     });
-    clearCookie(response, 'gbc_porting_oidc_state', config.secureCookies);
+    if ((result.purpose === 'player2') !== player2Callback) {
+      await auth.logout(result.rawSessionId);
+      throw new AuthError(400, 'OIDC login purpose mismatch');
+    }
+    if (player2Callback) {
+      clearCookie(response, config.player2OidcStateCookieName, config.secureCookies);
+      const previousPlayer2Session = requestCookies[config.player2SessionCookieName];
+      if (previousPlayer2Session && previousPlayer2Session !== result.rawSessionId) {
+        await auth.logout(previousPlayer2Session);
+      }
+      const primary = await auth.getSession(requestCookies[config.sessionCookieName]);
+      if (primary?.subject === result.session.subject) {
+        await auth.logout(result.rawSessionId);
+        clearCookie(response, config.player2SessionCookieName, config.secureCookies);
+        return popupCallback(response, config, false, 'Player 2 must use a different account');
+      }
+      setCookie(response, config.player2SessionCookieName, result.rawSessionId, {
+        maxAgeSeconds: config.sessionMaxAgeSeconds,
+        secure: config.secureCookies,
+      });
+      return popupCallback(response, config, true);
+    }
+    clearCookie(response, config.oidcStateCookieName, config.secureCookies);
     setCookie(response, config.sessionCookieName, result.rawSessionId, {
       maxAgeSeconds: config.sessionMaxAgeSeconds,
       secure: config.secureCookies,
@@ -115,22 +164,76 @@ async function handleRequest(context) {
     return json(response, 201, publicSession(result.session));
   }
 
+  if (request.method === 'POST' && url.pathname === '/__test/player2/session') {
+    if (!config.authTestMode) throw new AuthError(404, 'Not found');
+    const body = JSON.parse((await readRequest(request, 32 * 1024)).toString('utf8'));
+    const previousPlayer2Session = cookies(request)[config.player2SessionCookieName];
+    if (previousPlayer2Session) await auth.logout(previousPlayer2Session);
+    const result = await auth.createTestSession({
+      accountId: String(body.accountId || 'test-player2'),
+      permission: body.permission,
+      name: body.name,
+      email: body.email,
+    });
+    setCookie(response, config.player2SessionCookieName, result.rawSessionId, {
+      maxAgeSeconds: config.sessionMaxAgeSeconds,
+      secure: false,
+    });
+    return json(response, 201, publicSession(result.session));
+  }
+
   const requestCookies = cookies(request);
 
   if (request.method === 'POST' && url.pathname === '/auth/logout') {
     const rawSessionId = requestCookies[config.sessionCookieName];
+    const player2RawSessionId = requestCookies[config.player2SessionCookieName];
+    const primary = await auth.getSession(rawSessionId).catch(() => null);
+    requireSession(primary);
+    requireCsrf(request, primary, config);
+    await localLinkService.abortForAccount(primary?.accountId).catch((error) =>
+      console.error('Local 2P cleanup failed', error));
     await auth.logout(rawSessionId).catch((error) => console.error('Logout cleanup failed', error));
+    await auth.logout(player2RawSessionId).catch((error) => console.error('Player 2 cleanup failed', error));
     clearCookie(response, config.sessionCookieName, config.secureCookies);
-    clearCookie(response, 'gbc_porting_oidc_state', config.secureCookies);
+    clearCookie(response, config.player2SessionCookieName, config.secureCookies);
+    clearCookie(response, config.oidcStateCookieName, config.secureCookies);
+    clearCookie(response, config.player2OidcStateCookieName, config.secureCookies);
     const authLogoutUrl = config.authTestMode ? '/' : buildAuthLogoutUrl(config);
     return json(response, 200, { ok: true, authLogoutUrl });
   }
 
+  if (request.method === 'POST' && url.pathname === '/auth/player2/logout') {
+    const primary = await auth.getSession(requestCookies[config.sessionCookieName]);
+    const player2RawSessionId = requestCookies[config.player2SessionCookieName];
+    const player2 = await auth.getSession(player2RawSessionId);
+    requireSession(primary);
+    requireSession(player2);
+    requireCsrf(request, primary, config);
+    requireSlotCsrf(request, player2, config, 'x-player2-csrf-token');
+    await localLinkService.abortForPair(primary, player2);
+    await auth.logout(player2RawSessionId).catch((error) => console.error('Player 2 cleanup failed', error));
+    clearCookie(response, config.player2SessionCookieName, config.secureCookies);
+    clearCookie(response, config.player2OidcStateCookieName, config.secureCookies);
+    return json(response, 200, { ok: true });
+  }
+
   const session = await auth.getSession(requestCookies[config.sessionCookieName]);
+  let player2Session = await auth.getSession(requestCookies[config.player2SessionCookieName]);
+  if (session && player2Session?.subject === session.subject) {
+    await auth.logout(player2Session.rawSessionId);
+    clearCookie(response, config.player2SessionCookieName, config.secureCookies);
+    player2Session = null;
+  }
 
   if (request.method === 'GET' && url.pathname === '/api/session') {
     return json(response, 200, session
       ? { authenticated: true, ...publicSession(session) }
+      : { authenticated: false });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/player2/session') {
+    return json(response, 200, player2Session
+      ? { authenticated: true, ...publicSession(player2Session) }
       : { authenticated: false });
   }
 
@@ -147,8 +250,26 @@ async function handleRequest(context) {
     }
   }
 
+  if (url.pathname === '/api/player2/access-request') {
+    requirePermission(player2Session, ['visitor']);
+    if (request.method === 'GET') {
+      const application = await database.getAccessRequest(player2Session.accountId);
+      return json(response, 200, { application });
+    }
+    if (request.method === 'POST') {
+      requireSlotCsrf(request, player2Session, config, 'x-player2-csrf-token');
+      const application = await auth.requestAccess(player2Session);
+      return json(response, 201, { application });
+    }
+  }
+
   if (request.method === 'GET' && url.pathname === '/api/roms') {
     requirePermission(session, PLAY_PERMISSIONS);
+    return json(response, 200, await database.listRoms());
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/player2/roms') {
+    requirePermission(player2Session, PLAY_PERMISSIONS);
     return json(response, 200, await database.listRoms());
   }
 
@@ -170,6 +291,9 @@ async function handleRequest(context) {
   if (request.method === 'POST' && url.pathname === '/api/link/rooms') {
     requirePermission(session, PLAY_PERMISSIONS);
     requireCsrf(request, session, config);
+    if (await database.hasOpenLocalSessionForAccount(session.accountId)) {
+      throw localModeConflict();
+    }
     const body = await readJsonRequest(request, 32 * 1024);
     const result = await linkService.createRoom({ accountId: session.accountId, romId: body.romId });
     return json(response, 201, result);
@@ -185,6 +309,9 @@ async function handleRequest(context) {
     if (request.method === 'POST' && action) {
       requireCsrf(request, session, config);
       if (action === 'join') {
+        if (await database.hasOpenLocalSessionForAccount(session.accountId)) {
+          throw localModeConflict();
+        }
         const body = await readJsonRequest(request, 32 * 1024);
         const room = await linkService.joinRoom({
           roomId,
@@ -276,12 +403,145 @@ async function handleRequest(context) {
     }
   }
 
+  const player2SaveMetaMatch = url.pathname.match(
+    /^\/api\/player2\/(account|guest)\/saves\/([a-f0-9]{64})\/meta$/,
+  );
+  if (request.method === 'GET' && player2SaveMetaMatch) {
+    const [, mode, romId] = player2SaveMetaMatch;
+    const owner = player2SaveOwner(mode, session, player2Session);
+    requirePermission(owner.session, PLAY_PERMISSIONS);
+    const rom = await database.getRom(romId);
+    if (!rom) throw new AuthError(404, 'ROM not found');
+    return json(response, 200, {
+      saves: await database.getSaveMetadata(owner.accountId, romId, owner.profileKey),
+    });
+  }
+
+  const player2SaveMatch = url.pathname.match(
+    /^\/api\/player2\/(account|guest)\/saves\/([a-f0-9]{64})\/(state|battery)$/,
+  );
+  if (player2SaveMatch) {
+    const [, mode, romId, kind] = player2SaveMatch;
+    const owner = player2SaveOwner(mode, session, player2Session);
+    requirePermission(owner.session, PLAY_PERMISSIONS);
+    const rom = await database.getRom(romId);
+    if (!rom) throw new AuthError(404, 'ROM not found');
+    if (request.method === 'GET') {
+      const save = await database.getSave(owner.accountId, romId, kind, owner.profileKey);
+      if (!save) throw new AuthError(404, 'Save not found');
+      return binary(response, 200, Buffer.from(save.payload),
+        kind === 'state' ? 'application/gzip' : 'application/octet-stream');
+    }
+    if (request.method === 'PUT') {
+      requireSlotCsrf(request, owner.session, config,
+        mode === 'account' ? 'x-player2-csrf-token' : 'x-csrf-token');
+      const payload = await readRequest(request, config.maxSaveBytes);
+      if (kind === 'state') validateState(payload, rom);
+      else validateBattery(payload);
+      await database.putSave(owner.accountId, romId, kind, payload, Date.now(), owner.profileKey);
+      return json(response, 200, { ok: true, size: payload.length, updatedAt: Date.now() });
+    }
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/local-2p/recover') {
+    requirePermission(session, PLAY_PERMISSIONS);
+    requireCsrf(request, session, config);
+    const recovered = await localLinkService.recover(session, player2Session);
+    return json(response, 200, recovered ? publicLocalRecovery(recovered) : { session: null });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/local-2p') {
+    requirePermission(session, PLAY_PERMISSIONS);
+    requireCsrf(request, session, config);
+    const body = await readJsonRequest(request, 32 * 1024);
+    const player2Mode = body.player2Mode === 'guest' ? 'guest' : 'account';
+    if (player2Mode === 'account') requirePermission(player2Session, PLAY_PERMISSIONS);
+    const localSession = await localLinkService.create({
+      player1: session,
+      player2: player2Session,
+      player2Mode,
+      player1RomId: body.player1RomId,
+      player2RomId: body.player2RomId,
+    });
+    return json(response, 201, { session: publicLocalSession(localSession) });
+  }
+
+  const localMatch = url.pathname.match(
+    /^\/api\/local-2p\/([0-9a-f-]+)(?:\/(player1-ready|player2-ready|start|heartbeat|checkpoint|finish|abort))?$/i,
+  );
+  if (localMatch) {
+    requirePermission(session, PLAY_PERMISSIONS);
+    const [, localSessionId, action] = localMatch;
+    if (request.method === 'GET' && !action) {
+      const localSession = await localLinkService.get({
+        id: localSessionId, player1: session, player2: player2Session,
+      });
+      return json(response, 200, { session: publicLocalSession(localSession) });
+    }
+    if (request.method === 'POST' && action) {
+      if (action === 'player2-ready') {
+        const localSession = await localLinkService.get({
+          id: localSessionId, player1: session, player2: player2Session,
+        });
+        const slotSession = localSession.player2Mode === 'account' ? player2Session : session;
+        requireSlotCsrf(request, slotSession, config,
+          localSession.player2Mode === 'account' ? 'x-player2-csrf-token' : 'x-csrf-token');
+        const body = await readJsonRequest(request, 8 * 1024);
+        return json(response, 200, { session: publicLocalSession(await localLinkService.setReady({
+          id: localSessionId, slot: 1, ready: body.ready !== false,
+          player1: session, player2: player2Session,
+        })) });
+      }
+      requireCsrf(request, session, config);
+      if (action === 'player1-ready') {
+        const body = await readJsonRequest(request, 8 * 1024);
+        return json(response, 200, { session: publicLocalSession(await localLinkService.setReady({
+          id: localSessionId, slot: 0, ready: body.ready !== false,
+          player1: session, player2: player2Session,
+        })) });
+      }
+      if (action === 'start') {
+        return json(response, 200, { session: publicLocalSession(await localLinkService.start({
+          id: localSessionId, player1: session, player2: player2Session,
+        })) });
+      }
+      if (action === 'heartbeat') {
+        return json(response, 200, { session: publicLocalSession(await localLinkService.heartbeat({
+          id: localSessionId, player1: session, player2: player2Session,
+        })) });
+      }
+      if (action === 'checkpoint') {
+        const body = await readJsonRequest(request, config.maxSaveBytes * 3);
+        const checkpoint = await localLinkService.checkpoint({
+          id: localSessionId, sequence: body.sequence, states: body.states,
+          metadata: body.metadata,
+          player1: session, player2: player2Session,
+        });
+        return json(response, 200, { checkpoint: publicLocalCheckpoint(checkpoint) });
+      }
+      if (action === 'finish') {
+        const body = await readJsonRequest(request, config.maxSaveBytes);
+        const result = await localLinkService.finish({
+          id: localSessionId, batteries: body.batteries,
+          player1: session, player2: player2Session,
+        });
+        return json(response, 200, { result });
+      }
+      if (action === 'abort') {
+        const localSession = await localLinkService.abort({
+          id: localSessionId, player1: session, player2: player2Session,
+        });
+        return json(response, 200, { session: publicLocalSession(localSession) });
+      }
+    }
+  }
+
   if (request.method !== 'GET' && request.method !== 'HEAD') {
     throw new AuthError(405, 'Method not allowed');
   }
 
   if (url.pathname.startsWith('/core/')) {
-    const filename = safeStaticPath(CORE_ROOT, url.pathname.slice('/core/'.length));
+    const filename = safeStaticPath(config.coreStorageDir, url.pathname.slice('/core/'.length));
     if (!filename) throw new AuthError(400, 'Invalid path');
     return sendFile(response, filename, 'no-cache');
   }
@@ -302,9 +562,13 @@ function requirePermission(session, permissions) {
 }
 
 function requireCsrf(request, session, config) {
+  requireSlotCsrf(request, session, config, 'x-csrf-token');
+}
+
+function requireSlotCsrf(request, session, config, headerName) {
   const origin = request.headers.origin;
   if (origin && origin !== new URL(config.publicBaseUrl).origin) throw new AuthError(403, 'Origin rejected');
-  const supplied = request.headers['x-csrf-token'];
+  const supplied = request.headers[headerName];
   if (typeof supplied !== 'string' || !safeEqual(supplied, session.csrfToken)) throw new AuthError(403, 'CSRF token rejected');
 }
 
@@ -325,6 +589,57 @@ function publicSession(session) {
     csrfToken: session.csrfToken,
     expiresAt: new Date(session.expiresAt).toISOString(),
   };
+}
+
+function player2SaveOwner(mode, primary, player2) {
+  if (mode === 'account') {
+    return { session: player2, accountId: player2?.accountId, profileKey: 'primary' };
+  }
+  return { session: primary, accountId: primary?.accountId, profileKey: 'guest-p2' };
+}
+
+function publicLocalSession(session) {
+  if (!session) return null;
+  return {
+    id: session.id,
+    player2Mode: session.player2Mode,
+    status: session.status,
+    leaseExpiresAt: Number(session.leaseExpiresAt),
+    lastCheckpointSequence: Number(session.lastCheckpointSequence),
+    guestHandshakePending: Boolean(session.guestHandshakePending),
+    lastPairSequence: Number(session.lastPairSequence),
+    lastReleaseSequence: Number(session.lastReleaseSequence),
+    participants: session.participants.map((participant) => ({
+      slot: participant.slot,
+      romId: participant.romId,
+      profileKey: participant.profileKey,
+      ready: Boolean(participant.ready),
+    })),
+  };
+}
+
+function publicLocalCheckpoint(checkpoint) {
+  if (!checkpoint) return null;
+  return {
+    sequence: Number(checkpoint.sequence),
+    states: checkpoint.checkpoints.map((item) => ({
+      slot: item.slot,
+      data: Buffer.from(item.payload).toString('base64'),
+    })),
+  };
+}
+
+function publicLocalRecovery(recovered) {
+  return {
+    session: publicLocalSession(recovered.session),
+    checkpoint: publicLocalCheckpoint(recovered.checkpoint),
+  };
+}
+
+function localModeConflict() {
+  const error = new AuthError(409, 'Local 2P is active');
+  error.code = 'LOCAL_2P_ACTIVE';
+  return error;
 }
 
 function commonHeaders() {
@@ -360,6 +675,22 @@ function binary(response, statusCode, body, contentType, extraHeaders = {}) {
 function redirect(response, location) {
   response.writeHead(302, { ...commonHeaders(), Location: location, 'Cache-Control': 'no-store' });
   response.end();
+}
+
+function popupCallback(response, config, ok, error = '') {
+  const payload = JSON.stringify({ type: 'gbc-player2-auth-complete', ok })
+    .replaceAll('<', '\\u003c');
+  const title = error ? 'Player 2 login failed' : 'Player 2 login';
+  const body = `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
+    `<script>const channel=new BroadcastChannel('gbc-player2-auth');` +
+    `channel.postMessage(${payload});channel.close();window.close()</script>`;
+  response.writeHead(ok ? 200 : 401, {
+    ...commonHeaders(),
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'",
+  });
+  response.end(body);
 }
 
 function cookies(request) {
@@ -414,7 +745,7 @@ async function readJsonRequest(request, limit) {
   }
 }
 
-function attachLinkWebSockets({ server, config, auth, linkService }) {
+function attachLinkWebSockets({ server, config, database, auth, linkService }) {
   const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
   const sockets = new Map();
 
@@ -505,6 +836,7 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
       }
       const session = await auth.getSession(cookies(request)[config.sessionCookieName]);
       requirePermission(session, PLAY_PERMISSIONS);
+      if (await database.hasOpenLocalSessionForAccount(session.accountId)) throw localModeConflict();
       const roomId = match[1];
       const room = await linkService.connect({ roomId, accountId: session.accountId });
       webSocketServer.handleUpgrade(request, socket, head, (webSocket) => {

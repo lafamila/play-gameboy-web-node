@@ -46,6 +46,7 @@
             <label class="file-button menu-command superadmin-only" for="rom-upload">Upload ROM</label>
             <input id="rom-upload" type="file" accept=".gba,.gb,.gbc" hidden />
             <button id="refresh-roms" class="menu-command" type="button">Refresh</button>
+            <button id="local-2p-toggle" class="menu-command" type="button">2P</button>
 
             <div class="menu-section">
               <span class="menu-label">Quick state</span>
@@ -72,8 +73,15 @@
         </div>
       </section>
 
-      <section class="workspace">
-        <div class="player-column">
+      <section id="local-2p-bar" class="local-2p-bar" hidden aria-label="Local two player controls">
+        <span id="local-2p-status" class="status idle">Player 2 setup</span>
+        <button id="local-p1-ready" type="button" disabled>P1 Ready</button>
+        <button id="local-start" class="primary" type="button" disabled>Start</button>
+        <button id="local-exit" class="danger" type="button">Exit 2P</button>
+      </section>
+
+      <section id="workspace" class="workspace">
+        <div id="player-one-panel" class="player-column player-panel" data-player="1">
           <div class="screen-shell" id="screen-shell">
             <canvas id="screen" width="240" height="160" aria-label="Game screen"></canvas>
             <div id="screen-empty" class="screen-empty">Select ROM</div>
@@ -122,7 +130,72 @@
           </div>
         </div>
 
-        <aside class="save-column">
+        <div id="player-two-panel" class="player-column player-panel player-two-panel" data-player="2" hidden>
+          <div class="player-heading">
+            <strong>Player 2</strong>
+            <span id="player2-account" class="meta">Choose player</span>
+            <button id="player2-logout" type="button" hidden>Logout P2</button>
+          </div>
+
+          <div id="player2-choice" class="player2-choice">
+            <button id="player2-login" class="primary" type="button">Login</button>
+            <button id="player2-guest" type="button">Continue as guest</button>
+            <button id="player2-close" type="button">Close</button>
+            <span id="player2-auth-status" class="meta" aria-live="polite"></span>
+          </div>
+
+          <div id="player2-visitor" class="player2-choice" hidden>
+            <span id="player2-visitor-status" class="meta">Player 2 needs user access</span>
+            <button id="player2-request-access" class="primary" type="button">Request user access</button>
+            <button id="player2-visitor-back" type="button">Use another account</button>
+          </div>
+
+          <div id="player2-runtime" hidden>
+            <div class="player-rom-toolbar">
+              <select id="player2-rom-select" aria-label="Player 2 ROM"></select>
+              <button id="player2-load" class="primary" type="button">Load</button>
+              <button id="local-p2-ready" type="button" disabled>P2 Ready</button>
+            </div>
+            <div class="screen-shell" id="player2-screen-shell">
+              <canvas id="player2-screen" width="240" height="160" aria-label="Player 2 game screen"></canvas>
+              <div id="player2-screen-empty" class="screen-empty">Select ROM</div>
+            </div>
+            <div class="playback-bar">
+              <button id="player2-mute" type="button" disabled>Unmute</button>
+              <span id="player2-runtime-status" class="status idle">Idle</span>
+            </div>
+            <div class="touch-controls compact-touch" aria-label="Player 2 game controls">
+              <div class="dpad">
+                <button data-player="2" data-button="64" class="up direction" aria-label="Player 2 up">▲</button>
+                <button data-player="2" data-button="32" class="left direction" aria-label="Player 2 left">◀</button>
+                <button data-player="2" data-button="16" class="right direction" aria-label="Player 2 right">▶</button>
+                <button data-player="2" data-button="128" class="down direction" aria-label="Player 2 down">▼</button>
+              </div>
+              <div class="center-controls">
+                <div class="system-controls">
+                  <button data-player="2" data-button="4">Select</button>
+                  <button data-player="2" data-button="8">Start</button>
+                </div>
+              </div>
+              <div class="action-controls">
+                <div class="face-buttons">
+                  <button data-player="2" data-button="2" class="round">B</button>
+                  <button data-player="2" data-button="1" class="round accent">A</button>
+                </div>
+                <div class="shoulder-buttons">
+                  <button data-player="2" data-button="512">L</button>
+                  <button data-player="2" data-button="256">R</button>
+                </div>
+              </div>
+            </div>
+            <div class="keymap">
+              <span>Move: I/J/K/L</span><span>A: M</span><span>B: N</span>
+              <span>L: U</span><span>R: O</span><span>Start: P</span><span>Select: H</span>
+            </div>
+          </div>
+        </div>
+
+        <aside id="save-column" class="save-column">
           <section class="save-section link-section">
             <div class="section-heading">
               <h2>Link Cable</h2>

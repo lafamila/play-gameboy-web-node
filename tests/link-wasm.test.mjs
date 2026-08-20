@@ -31,6 +31,9 @@ test('WebAssembly exposes the two-slot VBA Link transport contract', async () =>
   assert.equal(core._vba_link_set_player(1), 1);
   assert.equal(core._vba_link_player(), 1);
   assert.equal(core._vba_link_set_player(-1), 1);
+  assert.equal(core._vba_link_test_set_data, undefined);
+  assert.equal(core._vba_link_test_begin_request, undefined);
+  assert.equal(core._vba_link_test_finish_and_peer_data, undefined);
   core._vba_shutdown();
 });
 

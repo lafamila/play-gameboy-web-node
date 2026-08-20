@@ -87,7 +87,7 @@ test('two-player link rooms track participant state and lock battery saves', asy
   await database.putSave('host', FIRE_RED_ROM_ID, 'state', Buffer.from('quick-state'), 22);
 
   await database.setLinkParticipantState('room-1', 'host', { ready: true, connected: true }, 23);
-  const active = await database.updateLinkRoomStatus('room-1', 'active', 24);
+  const active = await database.updateLinkRoomStatus('room-1', 'active', 24, ['ready']);
   assert.equal(active.status, 'active');
   assert.deepEqual(active.participants[0], {
     accountId: 'host',
@@ -220,15 +220,44 @@ test('a terminal room releases locks for a later room', async () => {
   await database.createLinkRoom({ id: 'room-1', romId: ROM_ID, accountId: 'host' });
   await assert.rejects(
     database.createLinkRoom({ id: 'room-2', romId: ROM_ID, accountId: 'host' }),
-    { code: 'SAVE_LOCKED' },
+    { code: 'PLAY_ADMISSION_LOCKED' },
   );
   assert.equal(await database.getLinkRoom('room-2'), null);
 
-  await database.updateLinkRoomStatus('room-1', 'aborted');
+  await database.updateLinkRoomStatus('room-1', 'aborted', Date.now(), ['waiting']);
   const replacement = await database.createLinkRoom({
     id: 'room-2', romId: ROM_ID, accountId: 'host', now: 50,
   });
   assert.equal(replacement.createdBy, 'host');
+});
+
+test('ready and start transitions cannot revive a concurrently aborted room', async () => {
+  const readyDatabase = await databaseWithRom();
+  await readyDatabase.createLinkRoom({ id: 'ready-race', romId: ROM_ID, accountId: 'host' });
+  await Promise.allSettled([
+    readyDatabase.setLinkReadyState(
+      'ready-race', 'host', true, 'waiting', ['waiting', 'ready'], 10,
+    ),
+    readyDatabase.abortLinkRoom('ready-race', 10),
+  ]);
+  assert.equal((await readyDatabase.getLinkRoom('ready-race')).status, 'aborted');
+  assert.equal(readyDatabase.playAdmissionLocks.size, 0);
+  await assert.rejects(() => readyDatabase.setLinkReadyState(
+    'ready-race', 'host', true, 'ready', ['waiting', 'ready'], 11,
+  ), { code: 'LINK_ROOM_STATE_CONFLICT' });
+
+  const startDatabase = await databaseWithRom();
+  await startDatabase.createLinkRoom({ id: 'start-race', romId: ROM_ID, accountId: 'host' });
+  await startDatabase.joinLinkRoom('start-race', { accountId: 'guest', romId: ROM_ID });
+  await Promise.allSettled([
+    startDatabase.updateLinkRoomStatus('start-race', 'active', 20, ['ready']),
+    startDatabase.abortLinkRoom('start-race', 20),
+  ]);
+  assert.equal((await startDatabase.getLinkRoom('start-race')).status, 'aborted');
+  assert.equal(startDatabase.playAdmissionLocks.size, 0);
+  await assert.rejects(() => startDatabase.updateLinkRoomStatus(
+    'start-race', 'active', 21, ['ready'],
+  ), { code: 'LINK_ROOM_STATE_CONFLICT' });
 });
 
 test('recoverable room lookup and abort release both participant locks', async () => {
@@ -284,6 +313,25 @@ test('schema probes emit MySQL 8 compatible conditional ALTER statements', async
     'ALTER TABLE `link_room_participants` ADD CONSTRAINT `participants_rom_fk` FOREIGN KEY (`rom_id`) REFERENCES `roms` (`id`)',
   ]);
   assert.equal(queries.some((sql) => /ALTER TABLE[\s\S]*IF NOT EXISTS/i.test(sql)), false);
+});
+
+test('legacy save calls remain primary while guest-p2 keeps payload and revisions isolated', async () => {
+  const database = await databaseWithRom();
+  const legacy = Buffer.from('legacy-primary');
+  const guest = Buffer.from('guest-profile');
+  await database.putSave('account', ROM_ID, 'state', legacy, 100);
+  await database.putSave('account', ROM_ID, 'state', guest, 200, 'guest-p2');
+  assert.deepEqual((await database.getSave('account', ROM_ID, 'state')).payload, legacy);
+  assert.deepEqual((await database.getSave('account', ROM_ID, 'state', 'guest-p2')).payload, guest);
+  assert.equal(database.saves.get(database.saveKey('account', ROM_ID, 'state')).revision, 1);
+  assert.equal(database.saves.get(
+    database.saveKey('account', ROM_ID, 'state', 'guest-p2'),
+  ).revision, 1);
+  await database.putSave('account', ROM_ID, 'state', Buffer.from('updated'), 300);
+  assert.equal(database.saves.get(database.saveKey('account', ROM_ID, 'state')).revision, 2);
+  assert.equal(database.saves.get(
+    database.saveKey('account', ROM_ID, 'state', 'guest-p2'),
+  ).revision, 1);
 });
 
 test('fixture rescans refresh moved paths while uploaded duplicates cannot replace them', async () => {

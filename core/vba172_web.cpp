@@ -419,6 +419,32 @@ VBA_EXPORT int vba_link_apply_pair(int sequence, int speed, int master_data,
 }
 VBA_EXPORT void vba_link_cancel_wait() { vbaLinkCancelWait(); }
 
+#ifdef VBA_LINK_TEST_PROBE
+// Deterministic integration probe for validating two independent WASM instances.
+VBA_EXPORT int vba_link_test_set_data(int data) {
+  if (!ioMem || data < 0 || data > 0xffff) return 0;
+  WRITE16LE(&ioMem[0x12a], data);
+  return 1;
+}
+
+VBA_EXPORT int vba_link_test_begin_request(int data, int speed) {
+  if (!ioMem || vbaLinkPlayer() != 0 || data < 0 || data > 0xffff || speed < 0 || speed > 3) {
+    return 0;
+  }
+  WRITE16LE(&ioMem[0x134], 0);
+  WRITE16LE(&ioMem[0x12a], data);
+  StartLink(0x6080 | speed);
+  return vbaLinkRequestPending() ? 1 : 0;
+}
+
+VBA_EXPORT int vba_link_test_finish_and_peer_data() {
+  if (!ioMem) return -1;
+  linktime = 100000;
+  LinkUpdate();
+  return READ16LE(&ioMem[0x122]);
+}
+#endif
+
 VBA_EXPORT void vba_shutdown() {
   ShutdownLoaded();
 }

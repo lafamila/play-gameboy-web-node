@@ -296,6 +296,39 @@ async function main() {
     });
     await waitExpression('window.__gbaPoc.diagnostics().inputMask === 0', 'A button keyup');
 
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().inputMask === 2', 'B button keydown');
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'z', code: 'KeyZ', windowsVirtualKeyCode: 90, nativeVirtualKeyCode: 90,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().inputMask === 0', 'B button keyup');
+
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().inputMask === 8', 'Start button keydown');
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().inputMask === 0', 'Start button keyup');
+
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().speedMode === true', 'Space enables speed mode');
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().speedMode === false', 'Space disables speed mode');
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, nativeVirtualKeyCode: 32,
+    });
+
     await click('pause');
     const hashes = [];
     for (let index = 1; index <= 3; ++index) {
@@ -308,8 +341,302 @@ async function main() {
     assert.equal(externalStateAudio.stateAudioQuality, 2);
     assert.equal(externalStateAudio.audioQuality, 1);
 
-    await click('quick-save');
-    await waitExpression('document.getElementById("quick-state-meta").innerText.includes("Account state")', 'account state');
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'F1', code: 'F1', modifiers: 8,
+      windowsVirtualKeyCode: 112, nativeVirtualKeyCode: 112,
+    });
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'F1', code: 'F1', modifiers: 8,
+      windowsVirtualKeyCode: 112, nativeVirtualKeyCode: 112,
+    });
+    await waitExpression(
+      'document.querySelector("#event-log li")?.innerText.includes("Quick state saved")',
+      'Shift+F1 quick save',
+    );
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'F1', code: 'F1', windowsVirtualKeyCode: 112, nativeVirtualKeyCode: 112,
+    });
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'F1', code: 'F1', windowsVirtualKeyCode: 112, nativeVirtualKeyCode: 112,
+    });
+    await waitExpression(
+      'document.querySelector("#event-log li")?.innerText.includes("Account state loaded")',
+      'F1 quick load',
+    );
+    assert.ok(await evaluate('document.getElementById("quick-state-meta").innerText.includes("Account state")'));
+
+    const localRomId = await evaluate('window.__gbaPoc.diagnostics().activeRom');
+    assert.equal(await evaluate(`fetch('/__test/player2/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({accountId: 'browser-player-two-visitor', permission: 'visitor', name: 'P2 Visitor'})
+    }).then(response => response.ok)`), true);
+    await click('local-2p-toggle');
+    await waitExpression('!document.getElementById("player2-visitor").hidden', 'Player 2 visitor panel');
+    await click('player2-request-access');
+    await waitExpression(
+      'document.getElementById("player2-visitor-status").innerText.includes("pending")',
+      'Player 2 visitor request',
+    );
+    await click('player2-visitor-back');
+    await waitExpression('!document.getElementById("player2-choice").hidden', 'Player 2 visitor logout');
+    await click('local-exit');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null', 'close visitor setup');
+    await click('local-2p-toggle');
+    await waitExpression('!document.getElementById("player2-choice").hidden', 'Player 2 BroadcastChannel setup');
+    assert.equal(await evaluate(`fetch('/__test/player2/session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({accountId: 'browser-player-two', permission: 'user', name: 'Browser Player Two'})
+    }).then(response => response.ok)`), true);
+    assert.equal(await evaluate(`Promise.all([
+      fetch('/api/player2/session').then(response => response.json()),
+      fetch('/api/saves/${localRomId}/state').then(response => response.arrayBuffer())
+    ]).then(([session, state]) => fetch('/api/player2/account/saves/${localRomId}/state', {
+      method: 'PUT',
+      headers: {'X-Player2-CSRF-Token': session.csrfToken, 'Content-Type': 'application/gzip'},
+      body: state
+    })).then(response => response.ok)`), true);
+    await evaluate(`(() => {
+      const NativeWebSocket = window.WebSocket;
+      window.__localWebSocketCount = 0;
+      window.WebSocket = new Proxy(NativeWebSocket, {
+        construct(Target, args) {
+          window.__localWebSocketCount += 1;
+          return Reflect.construct(Target, args);
+        }
+      });
+    })()`);
+    await evaluate(`(() => {
+      const channel = new BroadcastChannel('gbc-player2-auth');
+      channel.postMessage({type: 'gbc-player2-auth-complete', ok: true});
+      channel.close();
+    })()`);
+    await waitExpression('!document.getElementById("player2-runtime").hidden', 'Player 2 account panel');
+    await evaluate(`document.getElementById('player2-rom-select').value = ${JSON.stringify(localRomId)}`);
+    await click('player2-load');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.status === "preparing" && window.__gbaPoc.diagnostics().coresDistinct',
+      'two independent VBA modules',
+      30000,
+    );
+    const dualLoaded = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(dualLoaded.players[0].activeRom, localRomId);
+    assert.equal(dualLoaded.players[1].activeRom, localRomId);
+    assert.equal(dualLoaded.players[1].muted, true);
+    assert.ok(dualLoaded.player2VisiblePixels > 1000, JSON.stringify(dualLoaded));
+    assert.equal(await evaluate('window.__localWebSocketCount'), 0);
+    assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("quick-load").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("import-state").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("rom-select").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("load-rom").disabled'), true);
+    const realCoreCableProbe = await evaluate('window.__gbaPoc.runDirectCableProbe()');
+    assert.deepEqual(realCoreCableProbe, {
+      applied: true,
+      sequence: 0,
+      masterData: 0x1234,
+      slaveData: 0xabcd,
+      hostPeerData: 0xabcd,
+      guestPeerData: 0xabcd,
+      independentMemories: true,
+    });
+
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyDown', key: 'm', code: 'KeyM', windowsVirtualKeyCode: 77, nativeVirtualKeyCode: 77,
+    });
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().players[1].inputMask === 1 && window.__gbaPoc.diagnostics().players[0].inputMask === 0',
+      'Player 2 keyboard isolation',
+    );
+    await cdp.send('Input.dispatchKeyEvent', {
+      type: 'keyUp', key: 'm', code: 'KeyM', windowsVirtualKeyCode: 77, nativeVirtualKeyCode: 77,
+    });
+    const player2TouchPoint = await evaluate(`(() => {
+      const button = document.querySelector('[data-player="2"][data-button="1"]');
+      button.scrollIntoView({block: 'center'});
+      const rect = button.getBoundingClientRect();
+      return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+    })()`);
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed', x: player2TouchPoint.x, y: player2TouchPoint.y,
+      button: 'left', buttons: 1, clickCount: 1,
+    });
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().players[1].inputMask === 1 && window.__gbaPoc.diagnostics().players[0].inputMask === 0',
+      'Player 2 touch isolation',
+    );
+    await cdp.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x: player2TouchPoint.x, y: player2TouchPoint.y,
+      button: 'left', buttons: 0, clickCount: 1,
+    });
+    await waitExpression('window.__gbaPoc.diagnostics().players[1].inputMask === 0', 'Player 2 touch release');
+    await click('local-p1-ready');
+    await click('local-p2-ready');
+    await waitExpression('!document.getElementById("local-start").disabled', 'both local players ready');
+    await click('local-start');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.active && window.__gbaPoc.diagnostics().players[0].linkPlayer === 0 && window.__gbaPoc.diagnostics().players[1].linkPlayer === 1',
+      'direct local cable start',
+    );
+    const dualStart = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(dualStart.localTwoPlayer.hasPairedCheckpoint, true);
+    assert.equal(dualStart.localTwoPlayer.checkpointSequence, 1);
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    const dualRunning = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(dualRunning.players[0].emulationSteps > dualStart.players[0].emulationSteps,
+      JSON.stringify({ dualStart, dualRunning }));
+    assert.ok(dualRunning.players[1].emulationSteps > dualStart.players[1].emulationSteps,
+      JSON.stringify({ dualStart, dualRunning }));
+    assert.equal(await evaluate('window.__localWebSocketCount'), 0);
+    await evaluate(`(() => {
+      const nativeFetch = window.fetch;
+      let lost = false;
+      window.fetch = async (...args) => {
+        const response = await nativeFetch(...args);
+        if (!lost && String(args[0]).endsWith('/checkpoint')) {
+          lost = true;
+          throw new Error('simulated committed response loss');
+        }
+        return response;
+      };
+      window.__restoreCheckpointFetch = () => { window.fetch = nativeFetch; };
+    })()`);
+    assert.match(await evaluate(
+      'window.__gbaPoc.checkpointLocal().then(() => "unexpected").catch(error => error.message)',
+    ), /simulated committed response loss/);
+    const lostCheckpoint = await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer');
+    assert.equal(lostCheckpoint.checkpointSequence, 1);
+    assert.equal(lostCheckpoint.checkpointPending, true);
+    assert.equal(await evaluate('window.__gbaPoc.checkpointLocal()'), true);
+    await evaluate('window.__restoreCheckpointFetch()');
+    const retriedCheckpoint = await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer');
+    assert.equal(retriedCheckpoint.checkpointSequence, 2);
+    assert.equal(retriedCheckpoint.checkpointPending, false);
+    const recoverableLocalSessionId = dualRunning.localTwoPlayer.sessionId;
+    loaded = cdp.waitEvent('Page.loadEventFired');
+    await cdp.send('Page.navigate', { url: origin });
+    await loaded;
+    await waitExpression(
+      `window.__gbaPoc?.diagnostics().localTwoPlayer?.active && ` +
+      `window.__gbaPoc.diagnostics().localTwoPlayer.sessionId === ${JSON.stringify(recoverableLocalSessionId)}`,
+      'paired local checkpoint recovery',
+      30000,
+    );
+    const recoveredLocal = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(recoveredLocal.coresDistinct, true);
+    assert.equal(recoveredLocal.localTwoPlayer.hasPairedCheckpoint, true);
+    assert.equal(await evaluate('document.getElementById("local-2p-status").innerText'),
+      'Recovered paired checkpoint');
+    await evaluate(`(() => {
+      const NativeWebSocket = window.WebSocket;
+      window.__localWebSocketCount = 0;
+      window.WebSocket = new Proxy(NativeWebSocket, {
+        construct(Target, args) {
+          window.__localWebSocketCount += 1;
+          return Reflect.construct(Target, args);
+        }
+      });
+    })()`);
+
+    const captureLocal = async (width, height, filename) => {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width, height, deviceScaleFactor: 1, mobile: width < 600,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png', fromSurface: true });
+      await writeFile(path.join(buildDirectory, filename), Buffer.from(screenshot.data, 'base64'));
+    };
+    await captureLocal(1440, 900, 'local-2p-landscape.png');
+    const localLandscape = await evaluate(`(() => {
+      const first = document.getElementById('player-one-panel').getBoundingClientRect();
+      const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      return {firstLeft: first.left, firstRight: first.right, secondLeft: second.left,
+        secondRight: second.right, scrollWidth: document.documentElement.scrollWidth, innerWidth};
+    })()`);
+    assert.ok(localLandscape.firstRight <= localLandscape.secondLeft + 1, JSON.stringify(localLandscape));
+    assert.ok(localLandscape.scrollWidth <= localLandscape.innerWidth, JSON.stringify(localLandscape));
+    await captureLocal(430, 932, 'local-2p-portrait.png');
+    const localPortrait = await evaluate(`(() => {
+      const first = document.getElementById('player-one-panel').getBoundingClientRect();
+      const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      return {firstBottom: first.bottom, secondTop: second.top,
+        scrollWidth: document.documentElement.scrollWidth, innerWidth};
+    })()`);
+    assert.ok(localPortrait.firstBottom <= localPortrait.secondTop + 1, JSON.stringify(localPortrait));
+    assert.ok(localPortrait.scrollWidth <= localPortrait.innerWidth, JSON.stringify(localPortrait));
+    await captureLocal(1440, 900, 'local-2p-landscape-restored.png');
+    const localLandscapeRestored = await evaluate(`(() => {
+      const first = document.getElementById('player-one-panel').getBoundingClientRect();
+      const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      return {firstRight: first.right, secondLeft: second.left,
+        scrollWidth: document.documentElement.scrollWidth, innerWidth,
+        active: window.__gbaPoc.diagnostics().localTwoPlayer?.active};
+    })()`);
+    assert.equal(localLandscapeRestored.active, true);
+    assert.ok(localLandscapeRestored.firstRight <= localLandscapeRestored.secondLeft + 1,
+      JSON.stringify(localLandscapeRestored));
+    assert.ok(localLandscapeRestored.scrollWidth <= localLandscapeRestored.innerWidth,
+      JSON.stringify(localLandscapeRestored));
+    await evaluate(`(() => {
+      const nativeFetch = window.fetch;
+      let failed = false;
+      window.fetch = (...args) => {
+        const url = String(args[0]);
+        if (!failed && url.includes('/api/local-2p/') && url.endsWith('/finish')) {
+          failed = true;
+          return Promise.resolve(new Response(JSON.stringify({error: 'simulated finish failure'}), {
+            status: 500, headers: {'Content-Type': 'application/json'}
+          }));
+        }
+        return nativeFetch(...args);
+      };
+      window.__restoreFetchAfterLocalFailure = () => { window.fetch = nativeFetch; };
+    })()`);
+    await click('local-exit');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null', 'local 2P exit', 30000);
+    await evaluate('window.__restoreFetchAfterLocalFailure()');
+    const afterLocalExit = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(afterLocalExit.players[0].running, true);
+    assert.equal(afterLocalExit.players[1].running, false);
+    assert.equal(afterLocalExit.players[0].linkPlayer, -1);
+    assert.equal(afterLocalExit.players[1].audioPointer, 0);
+    assert.equal(afterLocalExit.players[1].audioContextState, 'closed');
+    assert.equal(await evaluate('document.getElementById("player2-mute").innerText'), 'Unmute');
+    assert.equal(afterLocalExit.lastLocalRollbackCount, 1);
+    assert.equal(await evaluate('fetch("/api/player2/session").then(response => response.json()).then(body => body.authenticated)'), false);
+    assert.equal(await evaluate('fetch("/api/session").then(response => response.json()).then(body => body.account.id)'), 'browser-admin');
+    assert.equal(await evaluate(`fetch('/api/session').then(response => response.json()).then(session =>
+      fetch('/api/local-2p/recover', {
+        method: 'POST', headers: {'X-CSRF-Token': session.csrfToken}
+      })).then(response => response.json()).then(body => body.session)`), null);
+
+    await click('local-2p-toggle');
+    await waitExpression('!document.getElementById("player2-choice").hidden', 'Guest P2 choice');
+    await click('player2-guest');
+    await evaluate(`document.getElementById('player2-rom-select').value = ${JSON.stringify(localRomId)}`);
+    await click('player2-load');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.mode === "guest" && window.__gbaPoc.diagnostics().coresDistinct',
+      'Guest P2 dual runtime',
+      30000,
+    );
+    const guestDualLoaded = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(guestDualLoaded.players[1].generation > dualLoaded.players[1].generation);
+    assert.ok(guestDualLoaded.players[1].audioPointer > 0);
+    assert.equal(guestDualLoaded.players[1].muted, true);
+    await click('local-p1-ready');
+    await click('local-p2-ready');
+    await waitExpression('!document.getElementById("local-start").disabled', 'Guest P2 ready');
+    await click('local-start');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer?.active', 'Guest P2 start');
+    const guestStart = await evaluate('window.__gbaPoc.diagnostics().players[1].emulationSteps');
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.ok(await evaluate(`window.__gbaPoc.diagnostics().players[1].emulationSteps > ${guestStart}`));
+    assert.equal(await evaluate('window.__localWebSocketCount'), 0);
+    await click('local-exit');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null', 'Guest P2 exit', 30000);
+
     await click('export-battery');
     const exportedBattery = await waitFor(async () => {
       const candidates = (await readdir(downloadDirectory)).filter((name) => name.endsWith('.sa1'));
@@ -443,6 +770,7 @@ async function main() {
     await capture(390, 844, 'poc-mobile-menu.png');
 
     const finalState = await evaluate('window.__gbaPoc.diagnostics()');
+    const localWebSocketsCreated = await evaluate('window.__localWebSocketCount');
     assert.ok(finalState.activeRom);
     assert.equal(finalState.status, 'Running');
     loaded = cdp.waitEvent('Page.loadEventFired');
@@ -476,6 +804,21 @@ async function main() {
       accountPersistence: 'passed',
       visitorGate: 'passed',
       roomAndPwClipboard: 'passed',
+      local2P: {
+        account: dualRunning.localTwoPlayer,
+        coresDistinct: dualRunning.coresDistinct,
+        realCoreCableProbe,
+        progressOver1800ms: dualRunning.players.map((player, index) => ({
+          slot: player.slot,
+          frames: player.frameCount - dualStart.players[index].frameCount,
+          emulationSteps: player.emulationSteps - dualStart.players[index].emulationSteps,
+          audioSamples: player.audioSamples - dualStart.players[index].audioSamples,
+        })),
+        webSocketsCreated: localWebSocketsCreated,
+        landscape: localLandscape,
+        portrait: localPortrait,
+        landscapeRestored: localLandscapeRestored,
+      },
       logoutUrlRedirect: 'passed',
       wrongRomRejection: 'passed',
     }));

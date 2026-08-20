@@ -1,5 +1,11 @@
 import createVbaModule from '/core/vba172.js';
 import { hostTransferData, isSlaveHandshake, LinkMessageQueue } from '/link-message-queue.js';
+import {
+  applyDirectCablePair,
+  directCableIdle,
+  releaseDirectCableGuest,
+} from '/local-link-transport.js';
+import { gamepadMaskForSlot } from '/player-input.js';
 
 const FRAME_RATE = 59.7275;
 const CORE_SAMPLE_RATE = 44100;
@@ -22,37 +28,274 @@ const elements = Object.fromEntries([
   'link-room-id', 'link-invite-row', 'link-invite-code', 'link-room-status',
   'link-room-copy-feedback', 'link-pw-copy-feedback',
   'link-participants', 'link-ready', 'link-start', 'link-finish', 'link-abort', 'link-close',
+  'workspace', 'save-column', 'local-2p-toggle', 'local-2p-bar', 'local-2p-status',
+  'local-p1-ready', 'local-p2-ready', 'local-start', 'local-exit', 'player-one-panel',
+  'player-two-panel', 'player2-account', 'player2-logout', 'player2-choice', 'player2-login',
+  'player2-guest', 'player2-close', 'player2-auth-status', 'player2-visitor',
+  'player2-visitor-status', 'player2-request-access', 'player2-visitor-back', 'player2-runtime',
+  'player2-rom-select', 'player2-load', 'player2-screen', 'player2-screen-shell',
+  'player2-screen-empty', 'player2-mute', 'player2-runtime-status',
 ].map((id) => [id, document.getElementById(id)]));
 
-const canvasContext = elements.screen.getContext('2d', { alpha: false });
-let frameWidth = 240;
-let frameHeight = 160;
-let imageData = canvasContext.createImageData(frameWidth, frameHeight);
+let wasmBinaryPromise;
 
-let core;
+function sharedWasmBinary() {
+  if (!wasmBinaryPromise) {
+    wasmBinaryPromise = fetch('/core/vba172.wasm', { cache: 'no-cache' }).then(async (response) => {
+      if (!response.ok) throw new Error(`Core download failed (${response.status})`);
+      return response.arrayBuffer();
+    });
+  }
+  return wasmBinaryPromise;
+}
+
+class PlayerRuntime {
+  constructor({ slot, canvas, shell, statusElement, defaultMuted = false }) {
+    this.slot = slot;
+    this.canvas = canvas;
+    this.shell = shell;
+    this.statusElement = statusElement;
+    this.defaultMuted = defaultMuted;
+    this.generation = 0;
+    this.shutdownPromise = Promise.resolve();
+    this.canvasContext = canvas.getContext('2d', { alpha: false });
+    this.frameWidth = 240;
+    this.frameHeight = 160;
+    this.imageData = this.canvasContext.createImageData(this.frameWidth, this.frameHeight);
+    this.core = null;
+    this.activeRom = null;
+    this.romIdentity = '';
+    this.running = false;
+    this.paused = false;
+    this.muted = defaultMuted;
+    this.speedMode = false;
+    this.animationHandle = 0;
+    this.lastFrameTime = 0;
+    this.frameDebt = 0;
+    this.keyMask = 0;
+    this.touchMask = 0;
+    this.audioContext = null;
+    this.audioNode = null;
+    this.audioPointer = 0;
+    this.audioQueue = [];
+    this.audioPosition = 0;
+    this.batteryTimer = 0;
+    this.hasStoredQuickState = false;
+  }
+
+  setStatus(text, kind = 'idle') {
+    if (!this.statusElement) return;
+    this.statusElement.textContent = text;
+    this.statusElement.className = `status ${kind}`;
+  }
+
+  async ensureCore() {
+    if (this.core) return this.core;
+    this.setStatus('Loading core', 'loading');
+    this.core = await createVbaModule({
+      wasmBinary: await sharedWasmBinary(),
+      locateFile: (filename) => `/core/${filename}`,
+      printErr: (message) => logEvent(`P${this.slot + 1} core: ${message}`, true),
+    });
+    ++this.generation;
+    if (typeof this.core._vba_link_test_begin_request === 'function' && window.__gbaPoc) {
+      window.__gbaPoc.runDirectCableProbe = () => localTwoPlayer.runDirectCableProbe();
+    }
+    if (this.core._vba_state_version() !== 8) throw new Error('Unexpected core state version');
+    return this.core;
+  }
+
+  withBytes(bytes, callback) {
+    const pointer = this.core._malloc(bytes.byteLength);
+    try {
+      this.core.HEAPU8.set(bytes, pointer);
+      return callback(pointer, bytes.byteLength);
+    } finally {
+      this.core._free(pointer);
+    }
+  }
+
+  error(fallback) {
+    const pointer = this.core?._vba_last_error();
+    return pointer ? this.core.UTF8ToString(pointer) || fallback : fallback;
+  }
+
+  exportBytes() {
+    const pointer = this.core._vba_export_data();
+    const size = this.core._vba_export_size();
+    if (!pointer || size <= 0) throw new Error('Core returned an empty export');
+    return Uint8Array.from(this.core.HEAPU8.subarray(pointer, pointer + size));
+  }
+
+  async ensureAudio() {
+    await this.shutdownPromise;
+    if (!this.audioContext) {
+      this.audioContext = new AudioContext({ sampleRate: CORE_SAMPLE_RATE, latencyHint: 'interactive' });
+      this.audioNode = this.audioContext.createScriptProcessor(2048, 0, 2);
+      this.audioPointer = this.core._malloc(16384 * Int16Array.BYTES_PER_ELEMENT);
+      this.audioNode.onaudioprocess = (event) => this.renderAudio(event);
+      this.audioNode.connect(this.audioContext.destination);
+    }
+    if (this.audioContext.state === 'suspended') await this.audioContext.resume();
+  }
+
+  renderAudio(event) {
+    const left = event.outputBuffer.getChannelData(0);
+    const right = event.outputBuffer.getChannelData(1);
+    if (!this.core || !this.running || this.paused || this.muted) {
+      left.fill(0); right.fill(0); return;
+    }
+    while (this.audioQueue.length < left.length * 4) {
+      const available = this.core._vba_audio_available();
+      if (available <= 0) break;
+      const count = Math.min(available, 16384);
+      const read = this.core._vba_audio_read(this.audioPointer, count);
+      const start = this.audioPointer >> 1;
+      for (const sample of this.core.HEAP16.subarray(start, start + read)) {
+        this.audioQueue.push(sample / 32768);
+      }
+    }
+    const ratio = CORE_SAMPLE_RATE / this.audioContext.sampleRate;
+    for (let index = 0; index < left.length; ++index) {
+      const frame = Math.floor(this.audioPosition);
+      left[index] = this.audioQueue[frame * 2] || 0;
+      right[index] = this.audioQueue[frame * 2 + 1] || 0;
+      this.audioPosition += ratio;
+    }
+    const consumed = Math.floor(this.audioPosition);
+    if (consumed > 0) {
+      this.audioQueue.splice(0, consumed * 2);
+      this.audioPosition -= consumed;
+    }
+  }
+
+  renderFrame() {
+    const pointer = this.core?._vba_framebuffer();
+    const stride = this.core?._vba_frame_stride();
+    if (!pointer || !stride) return;
+    for (let row = 0; row < this.frameHeight; ++row) {
+      const source = pointer + row * stride * 4;
+      this.imageData.data.set(
+        this.core.HEAPU8.subarray(source, source + this.frameWidth * 4),
+        row * this.frameWidth * 4,
+      );
+    }
+    this.canvasContext.putImageData(this.imageData, 0, 0);
+  }
+
+  async loadRom(rom, romBytes) {
+    await this.ensureCore();
+    await this.ensureAudio();
+    const isGba = rom.platform === 'gba';
+    this.romIdentity = ascii(romBytes.subarray(isGba ? 0xa0 : 0x134, isGba ? 0xb0 : 0x143));
+    const loaded = this.withBytes(romBytes, (pointer, size) =>
+      this.core._vba_load_rom(pointer, size, isGba ? 0 : 1));
+    if (!loaded) throw new Error(this.error('ROM load failed'));
+    this.activeRom = rom;
+    this.frameWidth = this.core._vba_frame_width();
+    this.frameHeight = this.core._vba_frame_height();
+    this.canvas.width = this.frameWidth;
+    this.canvas.height = this.frameHeight;
+    this.shell.style.aspectRatio = `${this.frameWidth} / ${this.frameHeight}`;
+    this.imageData = this.canvasContext.createImageData(this.frameWidth, this.frameHeight);
+    this.running = true;
+    this.paused = false;
+    this.lastFrameTime = 0;
+    this.frameDebt = 1000 / FRAME_RATE;
+    this.setStatus('Ready', 'running');
+  }
+
+  loadBattery(bytes) {
+    validateBattery(bytes);
+    const loaded = this.withBytes(bytes, (pointer, size) => this.core._vba_load_battery(pointer, size));
+    if (!loaded) throw new Error(this.error('Battery load failed'));
+  }
+
+  loadState(bytes) {
+    const loaded = this.withBytes(bytes, (pointer, size) => this.core._vba_load_state(pointer, size));
+    if (!loaded) throw new Error(this.error('State load failed'));
+    this.audioQueue = [];
+    this.audioPosition = 0;
+    this.renderFrame();
+  }
+
+  exportState() {
+    if (!this.core?._vba_export_state()) throw new Error(this.error('State export failed'));
+    return this.exportBytes();
+  }
+
+  exportBattery() {
+    if (!this.core?._vba_export_battery()) throw new Error(this.error('Battery export failed'));
+    return this.exportBytes();
+  }
+
+  runFrame() {
+    this.core._vba_set_joypad(this.keyMask | this.touchMask | gamepadMask(this.slot));
+    const result = this.core._vba_run_frame();
+    if (result !== 2) this.renderFrame();
+    return result;
+  }
+
+  shutdown() {
+    this.running = false;
+    this.keyMask = 0;
+    this.touchMask = 0;
+    this.audioQueue = [];
+    if (this.audioNode) {
+      this.audioNode.onaudioprocess = null;
+      this.audioNode.disconnect();
+    }
+    if (this.core && this.audioPointer) this.core._free(this.audioPointer);
+    const closingAudioContext = this.audioContext;
+    this.shutdownPromise = closingAudioContext && closingAudioContext.state !== 'closed'
+      ? closingAudioContext.close().catch(() => {})
+      : Promise.resolve();
+    if (this.core) this.core._vba_shutdown();
+    this.core = null;
+    this.activeRom = null;
+    this.audioContext = null;
+    this.audioNode = null;
+    this.audioPointer = 0;
+    this.audioPosition = 0;
+    this.muted = this.defaultMuted;
+    this.setStatus('Idle', 'idle');
+  }
+}
+
+const playerOne = new PlayerRuntime({
+  slot: 0,
+  canvas: elements.screen,
+  shell: elements['screen-shell'],
+  statusElement: elements['runtime-status'],
+});
+const playerTwo = new PlayerRuntime({
+  slot: 1,
+  canvas: elements['player2-screen'],
+  shell: elements['player2-screen-shell'],
+  statusElement: elements['player2-runtime-status'],
+  defaultMuted: true,
+});
+
+for (const property of [
+  'canvasContext', 'frameWidth', 'frameHeight', 'imageData', 'core', 'activeRom',
+  'romIdentity', 'running', 'paused', 'muted', 'speedMode', 'animationHandle',
+  'lastFrameTime', 'frameDebt', 'keyMask', 'touchMask', 'audioContext', 'audioNode',
+  'audioPointer', 'audioQueue', 'audioPosition', 'batteryTimer', 'hasStoredQuickState',
+]) {
+  Object.defineProperty(globalThis, property, {
+    configurable: true,
+    get: () => playerOne[property],
+    set: (value) => { playerOne[property] = value; },
+  });
+}
+
 let roms = [];
 let fixtures = [];
-let activeRom;
-let romIdentity;
-let running = false;
-let paused = false;
-let muted = false;
-let speedMode = false;
-let animationHandle;
-let lastFrameTime = 0;
-let frameDebt = 0;
-let keyMask = 0;
-let touchMask = 0;
-let audioContext;
-let audioNode;
-let audioPointer = 0;
-let audioQueue = [];
-let audioPosition = 0;
-let batteryTimer;
 let sessionTimer;
 let currentSession;
+let currentPlayer2Session;
+const player2AuthChannel = new BroadcastChannel('gbc-player2-auth');
 let emulatorControlsEnabled = false;
-let hasStoredQuickState = false;
 let linkRoom;
 let linkInviteCode = '';
 let linkSocket;
@@ -76,6 +319,7 @@ let linkTransferActive = false;
 let linkIdleSince = 0;
 let linkFinishIdle = false;
 let linkDebugEnabled = false;
+let localTwoPlayer;
 const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
@@ -85,7 +329,8 @@ async function apiFetch(url, options = {}) {
     if (currentSession?.csrfToken) headers.set('X-CSRF-Token', currentSession.csrfToken);
   }
   const response = await fetch(url, { ...options, headers });
-  if (response.status === 401 && currentSession) {
+  if (response.status === 401 && currentSession &&
+      !url.includes('/player2/') && !url.startsWith('/api/local-2p')) {
     stopEmulation();
     currentSession = null;
     showAuthView('login');
@@ -203,26 +448,29 @@ function setControls(enabled) {
 
 function applyControlState() {
   const roomOpen = isLinkRoomOpen();
+  const localOpen = Boolean(localTwoPlayer?.enabled);
   for (const id of ['pause', 'mute', 'fullscreen']) elements[id].disabled = !emulatorControlsEnabled;
-  elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen;
-  elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen;
-  elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || !hasStoredQuickState;
+  elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen || localOpen;
+  elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen || localOpen;
+  elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || localOpen || !hasStoredQuickState;
 
   const saveAdminEnabled = emulatorControlsEnabled &&
     ['admin', 'superadmin'].includes(currentSession?.permission);
-  elements['export-state'].disabled = !saveAdminEnabled || roomOpen;
-  elements['import-state'].disabled = !saveAdminEnabled || roomOpen;
-  elements['import-battery'].disabled = !saveAdminEnabled || roomOpen;
-  elements['export-battery'].disabled = !saveAdminEnabled;
+  elements['export-state'].disabled = !saveAdminEnabled || roomOpen || localOpen;
+  elements['import-state'].disabled = !saveAdminEnabled || roomOpen || localOpen;
+  elements['import-battery'].disabled = !saveAdminEnabled || roomOpen || localOpen;
+  elements['export-battery'].disabled = !saveAdminEnabled || localOpen;
   elements['import-state-label'].classList.toggle('disabled', elements['import-state'].disabled);
   elements['import-battery-label'].classList.toggle('disabled', elements['import-battery'].disabled);
-  elements['rom-select'].disabled = roomOpen;
-  elements['load-rom'].disabled = roomOpen || roms.length === 0;
+  const localSessionOpen = Boolean(localTwoPlayer?.session);
+  elements['rom-select'].disabled = roomOpen || localSessionOpen;
+  elements['load-rom'].disabled = roomOpen || localSessionOpen || roms.length === 0;
 
-  const canEnterRoom = activeGbaSelected() && !linkRoom;
+  const canEnterRoom = activeGbaSelected() && !linkRoom && !localOpen;
   elements['link-create'].disabled = !canEnterRoom;
   elements['link-join'].disabled = !canEnterRoom || !elements['link-room-input'].value.trim() ||
     !elements['link-invite-input'].value.trim();
+  elements['local-2p-toggle'].disabled = roomOpen;
   renderFixtures();
 }
 
@@ -319,11 +567,8 @@ function validateBattery(bytes) {
 async function ensureCore() {
   if (core) return core;
   setStatus('Loading core', 'loading');
-  const wasmResponse = await fetch('/core/vba172.wasm', { cache: 'no-cache' });
-  if (!wasmResponse.ok) throw new Error(`Core download failed (${wasmResponse.status})`);
-  const wasmBinary = await wasmResponse.arrayBuffer();
   core = await createVbaModule({
-    wasmBinary,
+    wasmBinary: await sharedWasmBinary(),
     locateFile: (filename) => `/core/${filename}`,
     printErr: (message) => logEvent(`Core: ${message}`, true),
   });
@@ -398,25 +643,578 @@ function renderFrame() {
   canvasContext.putImageData(imageData, 0, 0);
 }
 
-function gamepadMask() {
-  const gamepad = navigator.getGamepads?.().find(Boolean);
-  if (!gamepad) return 0;
-  let mask = 0;
-  if (gamepad.buttons[0]?.pressed) mask |= 1;
-  if (gamepad.buttons[1]?.pressed) mask |= 2;
-  if (gamepad.buttons[8]?.pressed) mask |= 4;
-  if (gamepad.buttons[9]?.pressed) mask |= 8;
-  if (gamepad.buttons[15]?.pressed || gamepad.axes[0] > .5) mask |= 16;
-  if (gamepad.buttons[14]?.pressed || gamepad.axes[0] < -.5) mask |= 32;
-  if (gamepad.buttons[12]?.pressed || gamepad.axes[1] < -.5) mask |= 64;
-  if (gamepad.buttons[13]?.pressed || gamepad.axes[1] > .5) mask |= 128;
-  if (gamepad.buttons[5]?.pressed) mask |= 256;
-  if (gamepad.buttons[4]?.pressed) mask |= 512;
-  return mask;
+function gamepadMask(slot = 0) {
+  return gamepadMaskForSlot(navigator.getGamepads?.(), slot);
 }
+
+class LocalTwoPlayerController {
+  constructor() {
+    this.enabled = false;
+    this.active = false;
+    this.mode = null;
+    this.session = null;
+    this.lastPairSequence = -1;
+    this.lastReleaseSequence = -1;
+    this.guestHandshakePending = false;
+    this.checkpointSequence = 0;
+    this.pendingCheckpoint = null;
+    this.lastCheckpoint = null;
+    this.heartbeatTimer = 0;
+    this.checkpointTimer = 0;
+    this.exiting = false;
+    this.rollbackCount = 0;
+    this.boundUpdateLayout = () => this.updateLayout();
+    this.resizeObserver = new ResizeObserver(() => this.updateLayout());
+  }
+
+  updateLayout() {
+    if (!this.enabled) return;
+    const viewport = window.visualViewport;
+    const width = viewport?.width ?? window.innerWidth;
+    const height = viewport?.height ?? window.innerHeight;
+    elements.workspace.classList.toggle('local-portrait', height > width);
+  }
+
+  async runGuarded(action) {
+    try {
+      return await action();
+    } catch (error) {
+      let cleanupError = null;
+      try {
+        if (this.session) await this.abortServerSession();
+      } catch (caught) {
+        cleanupError = caught;
+      } finally {
+        this.restoreSinglePlayer();
+      }
+      if (cleanupError) {
+        throw new Error(`${error.message}; local cleanup failed: ${cleanupError.message}`);
+      }
+      throw error;
+    }
+  }
+
+  async enter() {
+    if (isLinkRoomOpen()) throw new Error('Close the remote Room before starting local 2P');
+    this.enabled = true;
+    elements.workspace.classList.add('local-2p');
+    elements['player-two-panel'].hidden = false;
+    elements['local-2p-bar'].hidden = false;
+    elements['local-2p-toggle'].textContent = 'Exit 2P';
+    elements['player2-choice'].hidden = false;
+    elements['player2-runtime'].hidden = true;
+    elements['player2-visitor'].hidden = true;
+    elements['local-p1-ready'].disabled = true;
+    elements['local-p2-ready'].disabled = true;
+    elements['local-start'].disabled = true;
+    this.resizeObserver.observe(elements.workspace);
+    window.visualViewport?.addEventListener('resize', this.boundUpdateLayout);
+    window.addEventListener('resize', this.boundUpdateLayout);
+    this.updateLayout();
+    setMenuOpen(false);
+    applyControlState();
+    await this.refreshPlayer2Session();
+  }
+
+  async refreshPlayer2Session() {
+    const response = await fetch('/api/player2/session', { cache: 'no-store' });
+    const result = response.ok ? await response.json() : { authenticated: false };
+    currentPlayer2Session = result.authenticated ? result : null;
+    if (!currentPlayer2Session) return;
+    if (currentPlayer2Session.account.id === currentSession.account.id) {
+      currentPlayer2Session = null;
+      elements['player2-auth-status'].textContent = 'Choose a different account';
+      return;
+    }
+    if (currentPlayer2Session.permission === 'visitor') {
+      elements['player2-choice'].hidden = true;
+      elements['player2-visitor'].hidden = false;
+      const access = await fetch('/api/player2/access-request').then((item) =>
+        item.ok ? item.json() : { application: null });
+      const pending = access.application?.status === 'pending';
+      elements['player2-visitor-status'].textContent = pending
+        ? 'Player 2 access request pending' : 'Player 2 needs user access';
+      elements['player2-request-access'].disabled = pending;
+      return;
+    }
+    this.selectMode('account');
+  }
+
+  selectMode(mode) {
+    this.mode = mode;
+    elements['player2-choice'].hidden = true;
+    elements['player2-visitor'].hidden = true;
+    elements['player2-runtime'].hidden = false;
+    elements['player2-logout'].hidden = mode !== 'account';
+    elements['player2-account'].textContent = mode === 'guest'
+      ? `${currentSession.account.name || currentSession.account.id} / Guest P2`
+      : currentPlayer2Session.account.name || currentPlayer2Session.account.email ||
+        currentPlayer2Session.account.id;
+    this.renderRomCatalog();
+  }
+
+  renderRomCatalog() {
+    const selected = elements['player2-rom-select'].value;
+    elements['player2-rom-select'].replaceChildren(...roms.filter((rom) => rom.platform === 'gba').map((rom) => {
+      const option = document.createElement('option');
+      option.value = rom.id;
+      option.textContent = `[GBA] ${rom.title} (${rom.gameCode})`;
+      return option;
+    }));
+    if (roms.some((rom) => rom.id === selected && rom.platform === 'gba')) {
+      elements['player2-rom-select'].value = selected;
+    }
+  }
+
+  resetCableMetadata() {
+    this.guestHandshakePending = false;
+    this.lastPairSequence = -1;
+    this.lastReleaseSequence = -1;
+    this.checkpointSequence = 0;
+    this.pendingCheckpoint = null;
+  }
+
+  async loadPlayerTwo() {
+    if (!activeRom || activeRom.platform !== 'gba') {
+      throw new Error('Load a GBA ROM for Player 1 first');
+    }
+    const selected = roms.find((rom) =>
+      rom.id === elements['player2-rom-select'].value && rom.platform === 'gba');
+    if (!selected) throw new Error('Select a GBA ROM for Player 2');
+    if (this.session) await this.abortServerSession();
+    paused = true;
+    clearInterval(batteryTimer);
+    setStatus('Waiting for Player 2', 'loading');
+    const response = await apiFetch('/api/local-2p', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        player2Mode: this.mode,
+        player1RomId: activeRom.id,
+        player2RomId: selected.id,
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'Local 2P setup failed');
+    this.session = body.session;
+    this.resetCableMetadata();
+    await this.loadRuntime(playerTwo, selected, this.mode);
+    elements['player2-screen-empty'].hidden = true;
+    elements['player2-mute'].disabled = false;
+    elements['local-p1-ready'].disabled = false;
+    elements['local-p2-ready'].disabled = false;
+    elements['local-2p-status'].textContent = 'Set both players ready';
+    applyControlState();
+  }
+
+  async loadRuntime(runtime, rom, mode, checkpointState = null) {
+    runtime.setStatus('Loading ROM', 'loading');
+    const romResponse = await apiFetch(`/api/roms/${rom.id}/file`);
+    if (!romResponse.ok) throw new Error('ROM download failed');
+    await runtime.loadRom(rom, new Uint8Array(await romResponse.arrayBuffer()));
+    const savePrefix = runtime.slot === 0 ? '/api/saves' : `/api/player2/${mode}/saves`;
+    const batteryResponse = await apiFetch(`${savePrefix}/${rom.id}/battery`);
+    if (batteryResponse.ok) runtime.loadBattery(new Uint8Array(await batteryResponse.arrayBuffer()));
+    if (checkpointState) {
+      runtime.loadState(base64Bytes(checkpointState));
+    } else if (runtime.slot === 1) {
+      const stateResponse = await apiFetch(`${savePrefix}/${rom.id}/state`);
+      if (stateResponse.ok) runtime.loadState(new Uint8Array(await stateResponse.arrayBuffer()));
+    }
+    runtime.renderFrame();
+  }
+
+  async setReady(slot) {
+    if (!this.session) throw new Error('Load Player 2 before readying');
+    const headers = { 'Content-Type': 'application/json' };
+    if (slot === 1 && this.mode === 'account') {
+      headers['X-Player2-CSRF-Token'] = currentPlayer2Session.csrfToken;
+    }
+    const response = await apiFetch(
+      `/api/local-2p/${this.session.id}/${slot === 0 ? 'player1-ready' : 'player2-ready'}`,
+      { method: 'POST', headers, body: JSON.stringify({ ready: true }) },
+    );
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'Ready failed');
+    this.session = body.session;
+    elements[slot === 0 ? 'local-p1-ready' : 'local-p2-ready'].disabled = true;
+    const ready = this.session.participants.every((participant) => participant.ready);
+    elements['local-start'].disabled = !ready;
+    elements['local-2p-status'].textContent = ready ? 'Ready' : 'Waiting for other player';
+  }
+
+  async start() {
+    if (!this.session) return;
+    this.checkpointSequence = 0;
+    await this.checkpoint(true);
+    if (!this.lastCheckpoint) throw new Error('Initial paired checkpoint failed');
+    const response = await apiFetch(`/api/local-2p/${this.session.id}/start`, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'Local 2P start failed');
+    this.session = body.session;
+    if (!cableIdle() || !core._vba_link_set_player(0) ||
+        !playerTwo.core?._vba_link_set_player(1)) {
+      await this.abortServerSession();
+      throw new Error('Both cable cores must be idle before Start');
+    }
+    this.active = true;
+    paused = false;
+    playerTwo.paused = false;
+    playerTwo.running = true;
+    speedMode = false;
+    this.lastPairSequence = -1;
+    this.lastReleaseSequence = -1;
+    this.rollbackCount = 0;
+    elements['local-start'].disabled = true;
+    elements['local-p1-ready'].disabled = true;
+    elements['local-p2-ready'].disabled = true;
+    elements['local-2p-status'].textContent = 'Local cable active';
+    setStatus('Running / P1', 'running');
+    playerTwo.setStatus('Running / P2', 'running');
+    this.startTimers();
+    applyControlState();
+  }
+
+  startTimers() {
+    clearInterval(this.heartbeatTimer);
+    clearInterval(this.checkpointTimer);
+    this.heartbeatTimer = setInterval(() => runAction(() => this.heartbeat()), 30_000);
+    this.checkpointTimer = setInterval(() => runAction(() => this.checkpoint()), LINK_CHECKPOINT_INTERVAL);
+  }
+
+  async heartbeat() {
+    if (!this.session || !this.active) return;
+    const response = await apiFetch(`/api/local-2p/${this.session.id}/heartbeat`, { method: 'POST' });
+    if (!response.ok) {
+      if ([401, 403, 410].includes(response.status)) await this.exit();
+      throw new Error('Local 2P session expired');
+    }
+    this.session = (await response.json()).session;
+  }
+
+  step(timestamp) {
+    if (!this.active) return;
+    for (const runtime of [playerOne, playerTwo]) {
+      const elapsed = runtime.lastFrameTime ? Math.min(timestamp - runtime.lastFrameTime, 100) : 0;
+      runtime.lastFrameTime = timestamp;
+      runtime.frameDebt += elapsed;
+    }
+    const frameDuration = 1000 / FRAME_RATE;
+    let cycles = 0;
+    while (cycles < 3 && (playerOne.frameDebt >= frameDuration || playerTwo.frameDebt >= frameDuration)) {
+      this.releaseGuestIfIdle();
+      if (playerOne.frameDebt >= frameDuration && !playerOne.paused &&
+          !core._vba_link_waiting() && !core._vba_link_guest_held()) {
+        playerOne.runFrame();
+        playerOne.frameDebt -= frameDuration;
+      }
+      this.exchangeCable();
+      if (playerTwo.frameDebt >= frameDuration && !playerTwo.paused &&
+          !playerTwo.core._vba_link_waiting() && !playerTwo.core._vba_link_guest_held()) {
+        playerTwo.runFrame();
+        playerTwo.frameDebt -= frameDuration;
+      }
+      this.exchangeCable();
+      ++cycles;
+    }
+    playerOne.frameDebt = Math.min(playerOne.frameDebt, frameDuration * 2);
+    playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
+  }
+
+  exchangeCable() {
+    const result = applyDirectCablePair(playerOne.core, playerTwo.core, {
+      lastPairSequence: this.lastPairSequence,
+      guestHandshakePending: this.guestHandshakePending,
+    });
+    if (!result.applied) return;
+    this.guestHandshakePending = result.guestHandshakePending;
+    this.lastPairSequence = result.lastPairSequence;
+    logCableSequence('Local cable pair', result.sequence);
+  }
+
+  releaseGuestIfIdle() {
+    const result = releaseDirectCableGuest(
+      playerOne.core, playerTwo.core, this.lastReleaseSequence,
+    );
+    this.lastReleaseSequence = result.lastReleaseSequence;
+  }
+
+  runDirectCableProbe() {
+    if (!this.session || this.active || !playerOne.core || !playerTwo.core) {
+      throw new Error('Direct cable probe requires two loaded inactive runtimes');
+    }
+    const host = playerOne.core;
+    const guest = playerTwo.core;
+    if (!host._vba_link_set_player(0) || !guest._vba_link_set_player(1) ||
+        !guest._vba_link_test_set_data(0xabcd) ||
+        !host._vba_link_test_begin_request(0x1234, 3)) {
+      throw new Error('Real core cable probe setup failed');
+    }
+    try {
+      const pair = applyDirectCablePair(host, guest, {
+        lastPairSequence: -1,
+        guestHandshakePending: false,
+      });
+      if (!pair.applied) throw new Error('Real core cable pair was not applied');
+      const hostPeerData = Number(host._vba_link_test_finish_and_peer_data());
+      const guestPeerData = Number(guest._vba_link_test_finish_and_peer_data());
+      return {
+        applied: pair.applied,
+        sequence: pair.sequence,
+        masterData: pair.masterData,
+        slaveData: pair.slaveData,
+        hostPeerData,
+        guestPeerData,
+        independentMemories: host.HEAPU8.buffer !== guest.HEAPU8.buffer,
+      };
+    } finally {
+      host._vba_link_cancel_wait();
+      guest._vba_link_cancel_wait();
+      host._vba_link_set_player(-1);
+      guest._vba_link_set_player(-1);
+    }
+  }
+
+  isCableIdle() {
+    return directCableIdle([playerOne, playerTwo]);
+  }
+
+  async checkpoint(allowReady = false) {
+    if ((!this.active && !allowReady) || (!this.pendingCheckpoint && !this.isCableIdle())) return false;
+    if (!this.pendingCheckpoint) {
+      this.pendingCheckpoint = {
+        sequence: this.checkpointSequence,
+        states: [playerOne, playerTwo].map((runtime) => ({
+          slot: runtime.slot,
+          data: bytesBase64(runtime.exportState()),
+        })),
+        metadata: {
+          guestHandshakePending: this.guestHandshakePending,
+          lastPairSequence: this.lastPairSequence,
+          lastReleaseSequence: this.lastReleaseSequence,
+        },
+      };
+    }
+    const pending = this.pendingCheckpoint;
+    const response = await apiFetch(`/api/local-2p/${this.session.id}/checkpoint`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pending),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || 'Paired checkpoint failed');
+    this.lastCheckpoint = body.checkpoint;
+    this.checkpointSequence = pending.sequence + 1;
+    this.pendingCheckpoint = null;
+    return true;
+  }
+
+  async exit({ revokePlayer2 = true } = {}) {
+    if (this.exiting) return;
+    this.exiting = true;
+    let failure = null;
+    try {
+      clearInterval(this.heartbeatTimer);
+      clearInterval(this.checkpointTimer);
+      if (this.session && this.active) {
+        playerOne.paused = true;
+        playerTwo.paused = true;
+        const idle = await this.waitForCableIdle(750);
+        if (idle) {
+          const batteries = [playerOne, playerTwo].map((runtime) => ({
+            slot: runtime.slot,
+            data: bytesBase64(runtime.exportBattery()),
+          }));
+          const response = await apiFetch(`/api/local-2p/${this.session.id}/finish`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ batteries }),
+          });
+          if (!response.ok) throw new Error((await response.json()).error || 'Paired battery commit failed');
+        } else {
+          this.restorePairedCheckpoint();
+          await this.abortServerSession();
+        }
+      } else if (this.session) {
+        await this.abortServerSession();
+      }
+    } catch (error) {
+      failure = error;
+      if (this.lastCheckpoint) {
+        try {
+          this.restorePairedCheckpoint();
+        } catch (rollbackError) {
+          failure = new Error(`${error.message}; paired rollback failed: ${rollbackError.message}`);
+        }
+      }
+      try {
+        await this.abortServerSession();
+      } catch (abortError) {
+        failure = new Error(`${failure.message}; local abort failed: ${abortError.message}`);
+      }
+    } finally {
+      if (revokePlayer2 && this.mode === 'account' && currentPlayer2Session) {
+        try {
+          const response = await apiFetch('/auth/player2/logout', {
+            method: 'POST',
+            headers: { 'X-Player2-CSRF-Token': currentPlayer2Session.csrfToken },
+          });
+          if (!response.ok) throw new Error('Player 2 logout failed');
+          currentPlayer2Session = null;
+        } catch (logoutError) {
+          failure = failure
+            ? new Error(`${failure.message}; ${logoutError.message}`)
+            : logoutError;
+        }
+      }
+      this.restoreSinglePlayer();
+      this.exiting = false;
+    }
+    if (failure) throw failure;
+  }
+
+  restorePairedCheckpoint() {
+    if (!this.lastCheckpoint) return false;
+    for (const state of this.lastCheckpoint.states) {
+      (state.slot === 0 ? playerOne : playerTwo).loadState(base64Bytes(state.data));
+    }
+    ++this.rollbackCount;
+    return true;
+  }
+
+  waitForCableIdle(timeout) {
+    const deadline = performance.now() + timeout;
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.isCableIdle()) resolve(true);
+        else if (performance.now() >= deadline) resolve(false);
+        else setTimeout(check, 25);
+      };
+      check();
+    });
+  }
+
+  async abortServerSession() {
+    if (!this.session) return;
+    const response = await apiFetch(`/api/local-2p/${this.session.id}/abort`, { method: 'POST' });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || 'Local 2P abort failed');
+    }
+  }
+
+  restoreSinglePlayer() {
+    clearInterval(this.heartbeatTimer);
+    clearInterval(this.checkpointTimer);
+    if (playerOne.core) {
+      playerOne.core._vba_link_cancel_wait();
+      playerOne.core._vba_link_set_player(-1);
+    }
+    playerTwo.shutdown();
+    elements['player2-mute'].textContent = 'Unmute';
+    this.active = false;
+    this.enabled = false;
+    this.mode = null;
+    this.session = null;
+    this.lastCheckpoint = null;
+    playerOne.paused = false;
+    elements.workspace.classList.remove('local-2p', 'local-portrait');
+    elements['player-two-panel'].hidden = true;
+    elements['local-2p-bar'].hidden = true;
+    elements['local-2p-toggle'].textContent = '2P';
+    elements['player2-screen-empty'].hidden = false;
+    elements['player2-runtime'].hidden = true;
+    elements['player2-choice'].hidden = false;
+    elements['player2-logout'].hidden = true;
+    this.resizeObserver.disconnect();
+    window.visualViewport?.removeEventListener('resize', this.boundUpdateLayout);
+    window.removeEventListener('resize', this.boundUpdateLayout);
+    setStatus(activeRom ? 'Running' : 'Idle', activeRom ? 'running' : 'idle');
+    if (activeRom) restartBatteryTimer();
+    applyControlState();
+    elements.screen.focus?.();
+  }
+
+  async recover() {
+    const response = await apiFetch('/api/local-2p/recover', { method: 'POST' });
+    if (!response.ok) return;
+    const recovered = await response.json();
+    if (!recovered.session) return;
+    this.session = recovered.session;
+    await this.enter();
+    this.mode = recovered.session.player2Mode;
+    if (this.mode === 'account' && !currentPlayer2Session) {
+      await this.abortServerSession();
+      this.restoreSinglePlayer();
+      return;
+    }
+    this.selectMode(this.mode);
+    this.guestHandshakePending = recovered.session.guestHandshakePending;
+    this.lastPairSequence = recovered.session.lastPairSequence;
+    this.lastReleaseSequence = recovered.session.lastReleaseSequence;
+    this.checkpointSequence = recovered.session.lastCheckpointSequence + 1;
+    this.pendingCheckpoint = null;
+    const p1Rom = roms.find((rom) => rom.id === recovered.session.participants[0].romId);
+    const p2Rom = roms.find((rom) => rom.id === recovered.session.participants[1].romId);
+    if (!p1Rom || !p2Rom || !recovered.checkpoint) {
+      await this.abortServerSession();
+      this.restoreSinglePlayer();
+      return;
+    }
+    await this.loadRuntime(playerOne, p1Rom, 'account', recovered.checkpoint.states[0].data);
+    await this.loadRuntime(playerTwo, p2Rom, this.mode, recovered.checkpoint.states[1].data);
+    elements['screen-empty'].hidden = true;
+    elements['player2-screen-empty'].hidden = true;
+    if (!playerOne.core._vba_link_set_player(0) || !playerTwo.core._vba_link_set_player(1)) {
+      await this.abortServerSession();
+      this.restoreSinglePlayer();
+      return;
+    }
+    this.lastCheckpoint = recovered.checkpoint;
+    this.active = true;
+    setControls(true);
+    elements['player2-mute'].disabled = false;
+    this.startTimers();
+    startLoop();
+    setStatus('Running / P1', 'running');
+    playerTwo.setStatus('Running / P2', 'running');
+    elements['local-2p-status'].textContent = 'Recovered paired checkpoint';
+    applyControlState();
+  }
+}
+
+function bytesBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64Bytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; ++index) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+localTwoPlayer = new LocalTwoPlayerController();
 
 function animationLoop(timestamp) {
   if (!running) return;
+  if (localTwoPlayer?.active) {
+    try {
+      localTwoPlayer.step(timestamp);
+    } catch (error) {
+      runAction(async () => {
+        logEvent(`Local cable failed / ${error.message}`, true);
+        await localTwoPlayer.exit();
+      });
+    }
+    animationHandle = requestAnimationFrame(animationLoop);
+    return;
+  }
   if (linkDetachPending && !core._vba_link_transfer_active()) detachLinkCore();
   drainLinkMessages();
   const elapsed = lastFrameTime ? Math.min(timestamp - lastFrameTime, 100) : 0;
@@ -1021,7 +1819,7 @@ async function finishLinkRoom() {
 
 function restartBatteryTimer() {
   clearInterval(batteryTimer);
-  if (activeRom && !isLinkRoomOpen()) {
+  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer?.enabled) {
     batteryTimer = setInterval(() => saveBattery(false).catch((error) => logEvent(error.message, true)), 10000);
   }
 }
@@ -1121,6 +1919,7 @@ function exportName(extension) {
 
 async function loadSelectedRom() {
   if (isLinkRoomOpen()) throw new Error('Close the link room before loading another ROM');
+  if (localTwoPlayer?.session) throw new Error('Exit local 2P before loading another ROM');
   const selected = roms.find((rom) => rom.id === elements['rom-select'].value);
   if (!selected) return;
   setStatus('Loading ROM', 'loading');
@@ -1231,14 +2030,39 @@ const keyBindings = new Map([
   ['ArrowRight', 16], ['ArrowLeft', 32], ['ArrowUp', 64], ['ArrowDown', 128],
   ['KeyS', 256], ['KeyA', 512],
 ]);
+const player2KeyBindings = new Map([
+  ['KeyM', 1], ['KeyN', 2], ['KeyH', 4], ['KeyP', 8],
+  ['KeyL', 16], ['KeyJ', 32], ['KeyI', 64], ['KeyK', 128],
+  ['KeyO', 256], ['KeyU', 512],
+]);
+
+function isKeyboardControlTarget(target) {
+  return target.matches?.('input, select, textarea, button, [contenteditable="true"]');
+}
+
+function handleShortcut(event) {
+  if (!activeRom || event.repeat || isKeyboardControlTarget(event.target) ||
+      event.altKey || event.ctrlKey || event.metaKey) return false;
+
+  let control;
+  if (event.code === 'Space' && !event.shiftKey) control = elements['speed-toggle'];
+  else if (event.code === 'F1') control = elements[event.shiftKey ? 'quick-save' : 'quick-load'];
+  if (!control || control.disabled) return false;
+
+  event.preventDefault();
+  control.click();
+  return true;
+}
 
 function handleKey(event, pressed) {
-  if (!activeRom || event.target.matches('input, select, button')) return;
-  const value = keyBindings.get(event.code);
+  if (!activeRom || isKeyboardControlTarget(event.target)) return;
+  const player2Value = localTwoPlayer?.enabled ? player2KeyBindings.get(event.code) : null;
+  const runtime = player2Value ? playerTwo : playerOne;
+  const value = player2Value || keyBindings.get(event.code);
   if (!value) return;
   event.preventDefault();
-  if (pressed) keyMask |= value;
-  else keyMask &= ~value;
+  if (pressed) runtime.keyMask |= value;
+  else runtime.keyMask &= ~value;
 }
 
 function showAuthView(view) {
@@ -1277,6 +2101,7 @@ async function bootstrap() {
   await refreshCatalog();
   setStatus('Idle', 'idle');
   logEvent('Catalog ready');
+  await localTwoPlayer.runGuarded(() => localTwoPlayer.recover());
   clearInterval(sessionTimer);
   sessionTimer = setInterval(() => runAction(checkSession), 60_000);
 }
@@ -1295,6 +2120,13 @@ async function checkSession() {
 }
 
 async function logout() {
+  if (localTwoPlayer.enabled) {
+    try {
+      await localTwoPlayer.exit();
+    } catch (error) {
+      logEvent(`Local 2P cleanup failed / ${error.message}`, true);
+    }
+  }
   if (isLinkRoomOpen()) {
     try {
       await abortLinkRoom();
@@ -1321,6 +2153,50 @@ elements['refresh-roms'].addEventListener('click', () => runAction(async () => {
   setMenuOpen(false);
 }));
 elements['rom-select'].addEventListener('change', applyControlState);
+elements['local-2p-toggle'].addEventListener('click', () => runAction(() =>
+  localTwoPlayer.enabled
+    ? localTwoPlayer.exit()
+    : localTwoPlayer.runGuarded(() => localTwoPlayer.enter())));
+elements['local-exit'].addEventListener('click', () => runAction(() => localTwoPlayer.exit()));
+elements['player2-close'].addEventListener('click', () => runAction(() => localTwoPlayer.exit()));
+elements['player2-guest'].addEventListener('click', () => localTwoPlayer.selectMode('guest'));
+elements['player2-login'].addEventListener('click', () => {
+  const popup = window.open('/auth/player2/login', 'gbc-player2-login', 'popup,width=520,height=720');
+  if (!popup) elements['player2-auth-status'].textContent = 'Popup blocked. Allow popups and retry.';
+  else elements['player2-auth-status'].textContent = 'Choose the Player 2 account';
+});
+player2AuthChannel.addEventListener('message', (event) => {
+  if (event.data?.type !== 'gbc-player2-auth-complete') return;
+  runAction(async () => {
+    elements['player2-auth-status'].textContent = event.data.ok ? 'Login complete' : 'Login failed';
+    await localTwoPlayer.refreshPlayer2Session();
+  });
+});
+elements['player2-visitor-back'].addEventListener('click', () => runAction(async () => {
+  await apiFetch('/auth/player2/logout', {
+    method: 'POST',
+    headers: { 'X-Player2-CSRF-Token': currentPlayer2Session.csrfToken },
+  });
+  currentPlayer2Session = null;
+  elements['player2-visitor'].hidden = true;
+  elements['player2-choice'].hidden = false;
+}));
+elements['player2-request-access'].addEventListener('click', () => runAction(async () => {
+  const response = await apiFetch('/api/player2/access-request', {
+    method: 'POST',
+    headers: { 'X-Player2-CSRF-Token': currentPlayer2Session.csrfToken },
+  });
+  if (!response.ok) throw new Error((await response.json()).error || 'Access request failed');
+  elements['player2-request-access'].disabled = true;
+  elements['player2-visitor-status'].textContent = 'Player 2 access request pending';
+}));
+elements['player2-logout'].addEventListener('click', () => runAction(() => localTwoPlayer.exit()));
+elements['player2-load'].addEventListener('click', () => runAction(() =>
+  localTwoPlayer.runGuarded(() => localTwoPlayer.loadPlayerTwo())));
+elements['local-p1-ready'].addEventListener('click', () => runAction(() => localTwoPlayer.setReady(0)));
+elements['local-p2-ready'].addEventListener('click', () => runAction(() => localTwoPlayer.setReady(1)));
+elements['local-start'].addEventListener('click', () => runAction(() =>
+  localTwoPlayer.runGuarded(() => localTwoPlayer.start())));
 elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   const file = elements['rom-upload'].files[0];
   if (!file) return;
@@ -1337,6 +2213,7 @@ elements['rom-upload'].addEventListener('change', () => runAction(async () => {
 
 elements.pause.addEventListener('click', () => {
   paused = !paused;
+  if (localTwoPlayer.active) playerTwo.paused = paused;
   elements.pause.textContent = paused ? 'Resume' : 'Pause';
   const linkPaused = isLinkRoomOpen() && (linkRoom.paused || linkRoom.status === 'finishing');
   setStatus(paused ? 'Paused' : linkPaused ? 'Link paused' : 'Running',
@@ -1351,7 +2228,12 @@ elements['speed-toggle'].addEventListener('click', () => {
   elements['speed-toggle'].setAttribute('aria-pressed', String(speedMode));
   elements['speed-toggle'].textContent = speedMode ? 'Speed on' : 'Speed off';
 });
-elements.fullscreen.addEventListener('click', () => elements['screen-shell'].requestFullscreen());
+elements.fullscreen.addEventListener('click', () =>
+  (localTwoPlayer.enabled ? elements.workspace : elements['screen-shell']).requestFullscreen());
+elements['player2-mute'].addEventListener('click', () => {
+  playerTwo.muted = !playerTwo.muted;
+  elements['player2-mute'].textContent = playerTwo.muted ? 'Unmute' : 'Mute';
+});
 elements['quick-save'].addEventListener('click', () => runAction(saveQuickState));
 elements['quick-load'].addEventListener('click', () => runAction(loadQuickState));
 elements['export-state'].addEventListener('click', () => runAction(async () => {
@@ -1429,18 +2311,23 @@ document.addEventListener('keydown', (event) => {
     setMenuOpen(false, true);
     return;
   }
+  if (handleShortcut(event)) return;
   handleKey(event, true);
 });
 document.addEventListener('keyup', (event) => handleKey(event, false));
-window.addEventListener('blur', () => { keyMask = 0; touchMask = 0; });
+window.addEventListener('blur', () => {
+  playerOne.keyMask = 0; playerOne.touchMask = 0;
+  playerTwo.keyMask = 0; playerTwo.touchMask = 0;
+});
 
 for (const button of document.querySelectorAll('[data-button]')) {
   const value = Number(button.dataset.button);
-  const release = (event) => { event.preventDefault(); touchMask &= ~value; };
+  const runtime = button.dataset.player === '2' ? playerTwo : playerOne;
+  const release = (event) => { event.preventDefault(); runtime.touchMask &= ~value; };
   button.addEventListener('pointerdown', (event) => {
     event.preventDefault();
     button.setPointerCapture(event.pointerId);
-    touchMask |= value;
+    runtime.touchMask |= value;
   });
   button.addEventListener('pointerup', release);
   button.addEventListener('pointercancel', release);
@@ -1448,10 +2335,14 @@ for (const button of document.querySelectorAll('[data-button]')) {
 }
 
 window.addEventListener('pagehide', () => {
-  if (activeRom && !isLinkRoomOpen()) saveBattery(false).catch(() => {});
+  player2AuthChannel.close();
+  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer.enabled) saveBattery(false).catch(() => {});
 });
 
 window.__gbaPoc = {
+  checkpointLocal() {
+    return localTwoPlayer.checkpoint();
+  },
   diagnostics() {
     const pixels = canvasContext.getImageData(0, 0, frameWidth, frameHeight).data;
     let visiblePixels = 0;
@@ -1460,6 +2351,15 @@ window.__gbaPoc = {
       if (pixels[index] || pixels[index + 1] || pixels[index + 2]) ++visiblePixels;
       pixelHash ^= pixels[index] | (pixels[index + 1] << 8) | (pixels[index + 2] << 16);
       pixelHash = Math.imul(pixelHash, 16777619) >>> 0;
+    }
+    const player2Pixels = playerTwo.canvasContext.getImageData(
+      0, 0, playerTwo.frameWidth, playerTwo.frameHeight,
+    ).data;
+    let player2VisiblePixels = 0;
+    for (let index = 0; index < player2Pixels.length; index += 4) {
+      if (player2Pixels[index] || player2Pixels[index + 1] || player2Pixels[index + 2]) {
+        ++player2VisiblePixels;
+      }
     }
     return {
       running,
@@ -1501,6 +2401,35 @@ window.__gbaPoc = {
       frameHeight,
       visiblePixels,
       pixelHash,
+      players: [playerOne, playerTwo].map((runtime) => ({
+        slot: runtime.slot,
+        running: runtime.running,
+        activeRom: runtime.activeRom?.id || null,
+        frameCount: runtime.core ? Number(runtime.core._vba_frame_counter()) : 0,
+        audioSamples: runtime.core ? Number(runtime.core._vba_audio_total_samples()) : 0,
+        emulationSteps: runtime.core ? Number(runtime.core._vba_emulation_steps()) : 0,
+        inputMask: runtime.keyMask | runtime.touchMask,
+        muted: runtime.muted,
+        memoryBytes: runtime.core?.HEAPU8?.byteLength || 0,
+        linkPlayer: runtime.core ? Number(runtime.core._vba_link_player()) : -1,
+        generation: runtime.generation,
+        audioPointer: runtime.audioPointer,
+        audioContextState: runtime.audioContext?.state || 'closed',
+      })),
+      coresDistinct: Boolean(playerOne.core && playerTwo.core && playerOne.core !== playerTwo.core &&
+        playerOne.core.HEAPU8.buffer !== playerTwo.core.HEAPU8.buffer),
+      player2VisiblePixels,
+      localTwoPlayer: localTwoPlayer.enabled ? {
+        active: localTwoPlayer.active,
+        mode: localTwoPlayer.mode,
+        status: localTwoPlayer.session?.status || null,
+        sessionId: localTwoPlayer.session?.id || null,
+        lastPairSequence: localTwoPlayer.lastPairSequence,
+        checkpointSequence: localTwoPlayer.checkpointSequence,
+        checkpointPending: Boolean(localTwoPlayer.pendingCheckpoint),
+        hasPairedCheckpoint: Boolean(localTwoPlayer.lastCheckpoint),
+      } : null,
+      lastLocalRollbackCount: localTwoPlayer.rollbackCount,
       status: elements['runtime-status'].textContent,
     };
   },

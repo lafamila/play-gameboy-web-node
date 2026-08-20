@@ -142,6 +142,83 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   align-items: start;
 }
 
+.local-2p-bar {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 14px;
+}
+.local-2p-bar .status { margin: 0 auto 0 0; }
+.workspace.local-2p {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 14px;
+}
+.workspace.local-2p.local-portrait { grid-template-columns: minmax(0, 1fr); }
+.workspace.local-2p .save-column { display: none; }
+.workspace.local-2p .player-panel {
+  min-width: 0;
+  padding: 0;
+}
+.workspace.local-2p:not(.local-portrait) .player-two-panel {
+  padding-left: 14px;
+  border-left: 1px solid var(--line);
+}
+.workspace.local-2p .screen-shell {
+  min-height: 0;
+  max-height: none;
+}
+.workspace.local-2p .touch-controls {
+  grid-template-columns: 126px minmax(110px, 1fr) 150px;
+  min-height: 132px;
+  gap: 10px;
+  padding: 10px 0;
+}
+.workspace.local-2p .action-controls { width: 150px; }
+.workspace.local-2p .center-controls { width: min(180px, 100%); }
+.workspace.local-2p .quick-controls { display: none; }
+.workspace.local-2p .action-controls .speed-toggle { display: none; }
+.workspace.local-2p .action-controls .round { width: 52px; height: 52px; }
+.workspace.local-2p .face-buttons button,
+.workspace.local-2p .shoulder-buttons button { width: 52px; }
+.workspace.local-2p.local-portrait .player-panel {
+  width: min(760px, 100%);
+  justify-self: center;
+}
+
+.player-heading {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.player-heading .meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-heading button { margin-left: auto; }
+.player2-choice {
+  min-height: 300px;
+  display: grid;
+  align-content: center;
+  justify-items: stretch;
+  gap: 10px;
+  width: min(320px, 100%);
+  margin: 0 auto;
+}
+.player2-choice .meta { text-align: center; overflow-wrap: anywhere; }
+.player-rom-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 7px;
+  margin-bottom: 10px;
+}
+.player-two-panel .status { margin-left: auto; }
+.compact-touch .center-controls { align-self: center; }
+
 .player-column { min-width: 0; }
 
 .screen-shell {
@@ -158,7 +235,7 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   touch-action: none;
 }
 
-#screen {
+.screen-shell canvas {
   width: 100%;
   height: 100%;
   object-fit: contain;
@@ -299,6 +376,20 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   .screen-shell { min-height: 0; max-height: none; }
 }
 
+@media (max-width: 1120px) {
+  .workspace.local-2p:not(.local-portrait) .touch-controls {
+    grid-template-columns: 126px 1fr;
+  }
+  .workspace.local-2p:not(.local-portrait) .center-controls {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  .workspace.local-2p:not(.local-portrait) .action-controls {
+    grid-column: 2;
+    grid-row: 1;
+  }
+}
+
 @media (max-width: 620px) {
   main { padding: 12px; }
   .rom-toolbar { grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; }
@@ -309,4 +400,11 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   .center-controls { width: min(260px, 100%); grid-column: 1 / -1; grid-row: 2; }
   .action-controls { width: min(180px, 100%); grid-column: 2; grid-row: 1; }
   .keymap { display: none; }
+  .local-2p-bar { flex-wrap: wrap; }
+  .local-2p-bar .status { flex-basis: 100%; }
+  .workspace.local-2p { grid-template-columns: 1fr; }
+  .workspace.local-2p .player-two-panel { padding: 14px 0 0; border-left: 0; border-top: 1px solid var(--line); }
+  .workspace.local-2p .touch-controls { grid-template-columns: 126px 1fr; }
+  .workspace.local-2p .center-controls { grid-column: 1 / -1; grid-row: 2; }
+  .workspace.local-2p .action-controls { grid-column: 2; grid-row: 1; }
 }

@@ -11,7 +11,7 @@ import { buildAuthLogoutUrl, createApp } from '../server.mjs';
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'data');
 
-async function withServer(callback) {
+async function withServer(callback, appOptions = {}) {
   const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'play-gameboy-web-node-test-'));
   const config = createConfig({
     root: ROOT,
@@ -24,7 +24,7 @@ async function withServer(callback) {
     publicBaseUrl: 'http://127.0.0.1',
     secureCookies: false,
   });
-  const app = await createApp({ config });
+  const app = await createApp({ config, ...appOptions });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   const { port } = app.server.address();
   const origin = `http://127.0.0.1:${port}`;
@@ -51,6 +51,20 @@ async function login(origin, accountId, permission) {
       Cookie: response.headers.get('set-cookie').split(';', 1)[0],
       'X-CSRF-Token': session.csrfToken,
     },
+  };
+}
+
+async function loginPlayer2(origin, accountId, permission) {
+  const response = await fetch(`${origin}/__test/player2/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId, permission, name: accountId }),
+  });
+  assert.equal(response.status, 201);
+  const session = await response.json();
+  return {
+    session,
+    cookie: response.headers.get('set-cookie').split(';', 1)[0],
   };
 }
 
@@ -105,6 +119,186 @@ test('unauthenticated clients can render login shell but cannot read ROM data', 
   assert.match(login.headers.get('set-cookie'), /gbc_porting_oidc_state=.*HttpOnly.*SameSite=Lax/);
 }));
 
+test('Player 2 login uses select_account and a separate state cookie', () => withServer(async ({ origin }) => {
+  const login = await fetch(`${origin}/auth/player2/login`, { redirect: 'manual' });
+  assert.equal(login.status, 302);
+  const authorize = new URL(login.headers.get('location'));
+  assert.equal(authorize.searchParams.get('prompt'), 'select_account');
+  assert.match(login.headers.get('set-cookie'),
+    /gbc_porting_player2_oidc_state=.*HttpOnly.*SameSite=Lax/);
+  assert.doesNotMatch(login.headers.get('set-cookie'), /gbc_porting_oidc_state=/);
+}));
+
+test('Player 2 callback sets only the P2 cookie and returns a payload-free same-origin signal', async () => {
+  const callbackCalls = [];
+  const revoked = [];
+  const fakeAuth = {
+    async completeLogin(input) {
+      callbackCalls.push(input);
+      return {
+        rawSessionId: 'player2-raw-session',
+        purpose: 'player2',
+        returnTo: '/',
+        session: { subject: 'player-two-subject' },
+      };
+    },
+    async getSession(raw) {
+      return raw === 'player1-raw-session'
+        ? { accountId: 'player-one', subject: 'player-one-subject', permission: 'user' }
+        : null;
+    },
+    async logout(raw) { revoked.push(raw); },
+  };
+  await withServer(async ({ origin }) => {
+    const response = await fetch(`${origin}/auth/callback?code=code&state=p2-state`, {
+      headers: {
+        Cookie: 'gbc_porting_session=player1-raw-session; gbc_porting_player2_session=old-player2; gbc_porting_player2_oidc_state=p2-state',
+      },
+    });
+    assert.equal(response.status, 200);
+    const setCookie = response.headers.get('set-cookie');
+    assert.match(setCookie, /gbc_porting_player2_session=player2-raw-session/);
+    assert.doesNotMatch(setCookie, /gbc_porting_session=/);
+    const body = await response.text();
+    assert.match(body, /BroadcastChannel\('gbc-player2-auth'\)/);
+    assert.match(body, /postMessage\(\{"type":"gbc-player2-auth-complete","ok":true\}\)/);
+    assert.doesNotMatch(body, /window\.opener|location\.origin/);
+    assert.doesNotMatch(body, /player-one|player-two|raw-session|access_token|refresh_token/i);
+    assert.deepEqual(callbackCalls, [{ code: 'code', state: 'p2-state', stateCookie: 'p2-state' }]);
+    assert.deepEqual(revoked, ['old-player2']);
+  }, { auth: fakeAuth });
+});
+
+test('creating a replacement P2 test session revokes the previous app session', () => withServer(async ({ origin }) => {
+  const first = await loginPlayer2(origin, 'replace-p2-old', 'user');
+  const response = await fetch(`${origin}/__test/player2/session`, {
+    method: 'POST',
+    headers: { Cookie: first.cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId: 'replace-p2-new', permission: 'user' }),
+  });
+  assert.equal(response.status, 201);
+  const secondCookie = response.headers.get('set-cookie').split(';', 1)[0];
+  assert.equal((await fetch(`${origin}/api/player2/session`, {
+    headers: { Cookie: first.cookie },
+  }).then((item) => item.json())).authenticated, false);
+  assert.equal((await fetch(`${origin}/api/player2/session`, {
+    headers: { Cookie: secondCookie },
+  }).then((item) => item.json())).account.id, 'replace-p2-new');
+}));
+
+test('same-account callback revokes both the previous and rejected P2 sessions', async () => {
+  const revoked = [];
+  const fakeAuth = {
+    async completeLogin() {
+      return { rawSessionId: 'rejected-new-p2', purpose: 'player2', returnTo: '/',
+        session: { subject: 'primary-subject' } };
+    },
+    async getSession(raw) {
+      return raw === 'primary-session'
+        ? { accountId: 'primary', subject: 'primary-subject', permission: 'user' }
+        : null;
+    },
+    async logout(raw) { revoked.push(raw); },
+  };
+  await withServer(async ({ origin }) => {
+    const response = await fetch(`${origin}/auth/callback?code=code&state=p2-state`, {
+      headers: { Cookie: 'gbc_porting_session=primary-session; ' +
+        'gbc_porting_player2_session=previous-p2; gbc_porting_player2_oidc_state=p2-state' },
+    });
+    assert.equal(response.status, 401);
+    assert.deepEqual(revoked, ['previous-p2', 'rejected-new-p2']);
+    assert.match(response.headers.get('set-cookie'), /gbc_porting_player2_session=.*Max-Age=0/);
+  }, { auth: fakeAuth });
+});
+
+test('Player 2 session, access and logout remain isolated from Player 1', () => withServer(async ({ origin }) => {
+  const player1 = await login(origin, 'player-one', 'user');
+  const player2 = await loginPlayer2(origin, 'player-two', 'user');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  const p1Status = await fetch(`${origin}/api/session`, { headers: { Cookie: cookie } }).then((item) => item.json());
+  const p2Status = await fetch(`${origin}/api/player2/session`, { headers: { Cookie: cookie } }).then((item) => item.json());
+  assert.equal(p1Status.account.id, 'player-one');
+  assert.equal(p2Status.account.id, 'player-two');
+
+  const logout = await fetch(`${origin}/auth/player2/logout`, {
+    method: 'POST', headers: {
+      Cookie: cookie,
+      'X-CSRF-Token': player1.session.csrfToken,
+      'X-Player2-CSRF-Token': player2.session.csrfToken,
+    },
+  });
+  assert.equal(logout.status, 200);
+  assert.match(logout.headers.get('set-cookie'), /gbc_porting_player2_session=.*Max-Age=0/);
+  assert.doesNotMatch(logout.headers.get('set-cookie'), /gbc_porting_session=.*Max-Age=0/);
+  assert.equal((await fetch(`${origin}/api/session`, {
+    headers: { Cookie: player1.headers.Cookie },
+  }).then((item) => item.json())).account.id, 'player-one');
+}));
+
+test('Player 2 visitor access requests require the P2 CSRF token, not the P1 token', () => withServer(async ({ origin }) => {
+  const player1 = await login(origin, 'visitor-flow-player-one', 'user');
+  const player2 = await loginPlayer2(origin, 'visitor-flow-player-two', 'visitor');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  assert.equal((await fetch(`${origin}/api/player2/access-request`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken },
+  })).status, 403);
+  const requested = await fetch(`${origin}/api/player2/access-request`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-Player2-CSRF-Token': player2.session.csrfToken },
+  });
+  assert.equal(requested.status, 201);
+  assert.equal((await requested.json()).application.status, 'pending');
+  assert.equal((await fetch(`${origin}/api/session`, {
+    headers: { Cookie: player1.headers.Cookie },
+  }).then((response) => response.json())).account.id, 'visitor-flow-player-one');
+}));
+
+test('same-account Player 2 is cleared without replacing Player 1', () => withServer(async ({ origin }) => {
+  const player1 = await login(origin, 'same-player', 'user');
+  const player2 = await loginPlayer2(origin, 'same-player', 'user');
+  const response = await fetch(`${origin}/api/player2/session`, {
+    headers: { Cookie: `${player1.headers.Cookie}; ${player2.cookie}` },
+  });
+  assert.equal((await response.json()).authenticated, false);
+  assert.match(response.headers.get('set-cookie'), /gbc_porting_player2_session=.*Max-Age=0/);
+  assert.equal((await fetch(`${origin}/api/session`, {
+    headers: { Cookie: player1.headers.Cookie },
+  }).then((item) => item.json())).account.id, 'same-player');
+}));
+
+test('full logout revokes both app sessions and releases a preparing local pair', () => withServer(async ({ origin, app }) => {
+  const player1 = await login(origin, 'full-logout-one', 'user');
+  const player2 = await loginPlayer2(origin, 'full-logout-two', 'user');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  const rom = (await fetch(`${origin}/api/roms`, { headers: { Cookie: cookie } })
+    .then((response) => response.json())).find((item) => item.platform === 'gba');
+  assert.equal((await fetch(`${origin}/api/local-2p`, {
+    method: 'POST',
+    headers: {
+      Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      player2Mode: 'account', player1RomId: rom.id, player2RomId: rom.id,
+    }),
+  })).status, 201);
+  assert.equal(app.database.localSaveLocks.size, 2);
+  const logout = await fetch(`${origin}/auth/logout`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken },
+  });
+  assert.equal(logout.status, 200);
+  const setCookie = logout.headers.get('set-cookie');
+  assert.match(setCookie, /gbc_porting_session=.*Max-Age=0/);
+  assert.match(setCookie, /gbc_porting_player2_session=.*Max-Age=0/);
+  assert.equal(app.database.localSaveLocks.size, 0);
+  assert.equal((await fetch(`${origin}/api/session`, { headers: { Cookie: cookie } })
+    .then((response) => response.json())).authenticated, false);
+  assert.equal((await fetch(`${origin}/api/player2/session`, { headers: { Cookie: cookie } })
+    .then((response) => response.json())).authenticated, false);
+}));
+
 test('visitor sees only access request APIs and CSRF is enforced', () => withServer(async ({ origin }) => {
   const visitor = await login(origin, 'visitor-account', 'visitor');
   assert.equal((await fetch(`${origin}/api/roms`, { headers: visitor.headers })).status, 403);
@@ -122,17 +316,12 @@ test('visitor sees only access request APIs and CSRF is enforced', () => withSer
   assert.equal((await logout.json()).authLogoutUrl, '/');
 }));
 
-test('logout is idempotent and clears local cookies without refreshing a stale session', () => withServer(async ({ origin }) => {
+test('full logout rejects a stale session without a valid CSRF context', () => withServer(async ({ origin }) => {
   const response = await fetch(`${origin}/auth/logout`, {
     method: 'POST',
     headers: { Cookie: 'gbc_porting_session=stale-session' },
   });
-  assert.equal(response.status, 200);
-  const result = await response.json();
-  assert.equal(result.ok, true);
-  assert.match(response.headers.get('set-cookie'), /gbc_porting_session=.*Max-Age=0/);
-  assert.match(response.headers.get('set-cookie'), /gbc_porting_oidc_state=.*Max-Age=0/);
-  assert.equal(result.authLogoutUrl, '/');
+  assert.equal(response.status, 401);
 }));
 
 test('user can play and save but cannot upload ROMs or read reference save files', () => withServer(async ({ origin }) => {
@@ -303,4 +492,152 @@ test('two authenticated browser sessions exchange a cable word and atomically co
     hostSocket.close();
     guestSocket.close();
   }
+}));
+
+test('local 2P account and guest profiles are isolated and paired persistence blocks remote Rooms', () => withServer(async ({ origin }) => {
+  const player1 = await login(origin, 'local-player-one', 'user');
+  const player2 = await loginPlayer2(origin, 'local-player-two', 'user');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  const headers = {
+    Cookie: cookie,
+    'X-CSRF-Token': player1.session.csrfToken,
+    'X-Player2-CSRF-Token': player2.session.csrfToken,
+  };
+  const roms = await fetch(`${origin}/api/roms`, { headers }).then((response) => response.json());
+  const rom = roms.find((item) => item.platform === 'gba');
+  const primaryBattery = Buffer.alloc(131072, 0x10);
+  const guestBattery = Buffer.alloc(131072, 0x20);
+  const player2Battery = Buffer.alloc(131072, 0x30);
+  assert.equal((await fetch(`${origin}/api/saves/${rom.id}/battery`, {
+    method: 'PUT', headers, body: primaryBattery,
+  })).status, 200);
+  assert.equal((await fetch(`${origin}/api/player2/guest/saves/${rom.id}/battery`, {
+    method: 'PUT', headers, body: guestBattery,
+  })).status, 200);
+  assert.equal((await fetch(`${origin}/api/player2/account/saves/${rom.id}/battery`, {
+    method: 'PUT', headers, body: player2Battery,
+  })).status, 200);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), primaryBattery);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/player2/guest/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), guestBattery);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/player2/account/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), player2Battery);
+
+  const created = await fetch(`${origin}/api/local-2p`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player2Mode: 'account', player1RomId: rom.id, player2RomId: rom.id,
+    }),
+  });
+  assert.equal(created.status, 201);
+  const localSession = (await created.json()).session;
+  assert.equal((await fetch(`${origin}/api/link/rooms`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ romId: rom.id }),
+  })).status, 409);
+  for (const [action, readyHeaders] of [
+    ['player1-ready', headers],
+    ['player2-ready', headers],
+  ]) {
+    assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/${action}`, {
+      method: 'POST', headers: { ...readyHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ready: true }),
+    })).status, 200);
+  }
+  assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/checkpoint`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sequence: 0, states: [
+      { slot: 0, data: Buffer.from('paired-state-one').toString('base64') },
+      { slot: 1, data: Buffer.from('paired-state-two').toString('base64') },
+    ] }),
+  })).status, 200);
+  assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/start`, {
+    method: 'POST', headers,
+  })).status, 200);
+  const finalOne = Buffer.alloc(131072, 0x41);
+  const finalTwo = Buffer.alloc(131072, 0x42);
+  assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/finish`, {
+    method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ batteries: [
+      { slot: 0, data: finalOne.toString('base64') },
+      { slot: 1, data: finalTwo.toString('base64') },
+    ] }),
+  })).status, 200);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), finalOne);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/player2/account/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), finalTwo);
+  assert.deepEqual(Buffer.from(await fetch(`${origin}/api/player2/guest/saves/${rom.id}/battery`, {
+    headers,
+  }).then((response) => response.arrayBuffer())), guestBattery);
+}));
+
+test('P2 logout requires both CSRF slots and never performs account-wide local cleanup', () => withServer(async ({ origin, app }) => {
+  const player1 = await login(origin, 'logout-owner', 'user');
+  const player2 = await loginPlayer2(origin, 'logout-player2', 'user');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  const rom = (await fetch(`${origin}/api/roms`, { headers: { Cookie: cookie } })
+    .then((response) => response.json())).find((item) => item.platform === 'gba');
+  const created = await fetch(`${origin}/api/local-2p`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken,
+      'Content-Type': 'application/json' },
+    body: JSON.stringify({ player2Mode: 'account', player1RomId: rom.id, player2RomId: rom.id }),
+  });
+  const local = (await created.json()).session;
+  app.database.localLinkSessions.set('unrelated-local', {
+    id: 'unrelated-local', ownerAccountId: 'another-owner',
+    player2AccountId: 'logout-player2', player2Mode: 'account', status: 'preparing',
+    leaseExpiresAt: Date.now() + 60_000, createdAt: Date.now(), updatedAt: Date.now(),
+    lastCheckpointSequence: -1, guestHandshakePending: false,
+    lastPairSequence: -1, lastReleaseSequence: -1,
+  });
+  assert.equal((await fetch(`${origin}/auth/player2/logout`, {
+    method: 'POST', headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken },
+  })).status, 403);
+  assert.equal((await fetch(`${origin}/auth/player2/logout`, {
+    method: 'POST', headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken,
+      'X-Player2-CSRF-Token': player2.session.csrfToken },
+  })).status, 200);
+  assert.equal((await app.database.getLocalLinkSession(local.id)).status, 'aborted');
+  assert.equal(app.database.localSaveLocks.size, 0);
+  assert.equal(app.database.playAdmissionLocks.size, 0);
+  assert.equal((await app.database.getLocalLinkSession('unrelated-local')).status, 'preparing');
+}));
+
+test('local recovery is POST+CSRF and account-mode operations revalidate current P2 permission', () => withServer(async ({ origin, app }) => {
+  const player1 = await login(origin, 'permission-owner', 'user');
+  const player2 = await loginPlayer2(origin, 'permission-player2', 'user');
+  const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  const rom = (await fetch(`${origin}/api/roms`, { headers: { Cookie: cookie } })
+    .then((response) => response.json())).find((item) => item.platform === 'gba');
+  const local = (await fetch(`${origin}/api/local-2p`, {
+    method: 'POST', headers: { Cookie: cookie, 'X-CSRF-Token': player1.session.csrfToken,
+      'Content-Type': 'application/json' },
+    body: JSON.stringify({ player2Mode: 'account', player1RomId: rom.id, player2RomId: rom.id }),
+  }).then((response) => response.json())).session;
+  assert.notEqual((await fetch(`${origin}/api/local-2p/recover`, {
+    headers: { Cookie: cookie },
+  })).status, 200);
+  assert.equal((await fetch(`${origin}/api/local-2p/recover`, {
+    method: 'POST', headers: { Cookie: cookie },
+  })).status, 403);
+  const visitorReplacement = await fetch(`${origin}/__test/player2/session`, {
+    method: 'POST', headers: { Cookie: player2.cookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId: 'permission-player2', permission: 'visitor' }),
+  });
+  const visitorCookie = visitorReplacement.headers.get('set-cookie').split(';', 1)[0];
+  assert.equal((await fetch(`${origin}/api/local-2p/${local.id}/heartbeat`, {
+    method: 'POST', headers: { Cookie: `${player1.headers.Cookie}; ${visitorCookie}`,
+      'X-CSRF-Token': player1.session.csrfToken },
+  })).status, 403);
+  await app.localLinkService.abort({ id: local.id, player1: {
+    accountId: 'permission-owner', permission: 'user', subject: 'permission-owner',
+  } });
 }));

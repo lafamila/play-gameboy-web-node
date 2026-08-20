@@ -276,14 +276,16 @@ test('two authenticated browser sessions exchange a cable word and atomically co
     const offer = waitForSocketMessage(guestSocket, 'link-offer');
     const hostPair = waitForSocketMessage(hostSocket, 'link-pair');
     const guestPair = waitForSocketMessage(guestSocket, 'link-pair');
-    hostSocket.send(JSON.stringify({ type: 'link-offer', sequence: 0, speed: 3, data: 0x1234 }));
-    assert.deepEqual(await offer, { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234 });
-    guestSocket.send(JSON.stringify({ type: 'link-response', sequence: 0, speed: 3, data: 0xabcd }));
+    hostSocket.send(JSON.stringify({ type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 }));
+    assert.deepEqual(await offer, { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 });
+    guestSocket.send(JSON.stringify({
+      type: 'link-response', sequence: 0, speed: 3, data: 0xabcd, ticks: 0,
+    }));
     assert.deepEqual(await hostPair, {
-      type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd,
+      type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
     });
     assert.deepEqual(await guestPair, {
-      type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd,
+      type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
     });
 
     const battery = await fixture('.sa1');

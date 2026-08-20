@@ -418,6 +418,33 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
   const webSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
   const sockets = new Map();
 
+  function trace(event, fields = {}) {
+    if (!config.linkDebug) return;
+    if (Number.isSafeInteger(fields.sequence) &&
+        ['link-offer', 'link-response', 'link-pair'].includes(fields.type) &&
+        fields.sequence >= 10 && fields.sequence % 100 !== 0) return;
+    console.info('[link]', JSON.stringify({ event, ...fields }));
+  }
+
+  function diagnosticFields(message) {
+    const state = message?.state;
+    if (!state || typeof state !== 'object' || Array.isArray(state)) return {};
+    const fields = {};
+    for (const key of [
+      'slot', 'corePlayer', 'sequence', 'requestData', 'requestTicks', 'linkTime',
+      'siocnt', 'siodata8', 'lastOfferSequence', 'pendingOffers', 'pendingPairs',
+      'preparedResponses', 'frameCount',
+    ]) {
+      if (Number.isSafeInteger(state[key])) fields[key] = state[key];
+    }
+    for (const key of [
+      'waiting', 'transferActive', 'requestPending', 'guestHeld', 'guestHandshakePending',
+    ]) {
+      if (typeof state[key] === 'boolean') fields[key] = state[key];
+    }
+    return fields;
+  }
+
   function accountSockets(roomId, accountId, create = false) {
     let room = sockets.get(roomId);
     if (!room && create) {
@@ -438,11 +465,32 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
 
   const onServiceMessage = ({ roomId, targetAccountId, message }) => {
     const room = sockets.get(roomId);
-    if (!room) return;
+    if (!room) {
+      trace('send.skipped', {
+        roomId, targetAccountId, type: message?.type, sequence: message?.sequence, reason: 'no-room-sockets',
+      });
+      return;
+    }
+    let targetCount = 0;
     for (const [accountId, targets] of room) {
       if (targetAccountId && accountId !== targetAccountId) continue;
-      for (const target of targets) send(target, message);
+      for (const target of targets) {
+        send(target, message);
+        ++targetCount;
+      }
     }
+    trace('send', {
+      roomId, targetAccountId, targetCount, type: message?.type, sequence: message?.sequence,
+      ...(['link-offer', 'link-response'].includes(message?.type)
+        ? { data: message?.data, ticks: message?.ticks }
+        : message?.type === 'link-pair'
+          ? {
+              ticks: message?.ticks,
+              masterData: message?.masterData,
+              slaveData: message?.slaveData,
+            }
+          : {}),
+    });
   };
   linkService.on('message', onServiceMessage);
 
@@ -471,7 +519,14 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
     const { roomId, accountId, room } = context;
     accountSockets(roomId, accountId, true).add(webSocket);
     webSocket.isAlive = true;
-    send(webSocket, { type: 'connected', room });
+    trace('connected', {
+      roomId,
+      accountId,
+      slot: room.participants?.find((participant) => participant?.accountId === accountId)?.slot,
+      status: room.status,
+      paused: room.paused,
+    });
+    send(webSocket, { type: 'connected', room, debug: config.linkDebug });
     webSocket.on('pong', () => { webSocket.isAlive = true; });
     webSocket.on('message', (payload, isBinary) => {
       void (async () => {
@@ -479,10 +534,25 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
         let message;
         try { message = JSON.parse(payload.toString('utf8')); }
         catch { throw new AuthError(400, 'Invalid link message JSON'); }
+        trace('receive', {
+          roomId, accountId, type: message?.type, sequence: message?.sequence,
+          ...(['link-offer', 'link-response'].includes(message?.type)
+            ? { data: message?.data, ticks: message?.ticks }
+            : {}),
+        });
+        if (message?.type === 'diagnostic') {
+          trace('client-state', { roomId, accountId, ...diagnosticFields(message) });
+          return;
+        }
         await linkService.handleMessage({ roomId, accountId, message });
-      })().catch((error) => send(webSocket, {
-        type: 'error', code: error.code || 'LINK_ERROR', message: error.message,
-      }));
+      })().catch((error) => {
+        trace('receive.error', {
+          roomId, accountId, code: error.code || 'LINK_ERROR', message: error.message,
+        });
+        send(webSocket, {
+          type: 'error', code: error.code || 'LINK_ERROR', message: error.message,
+        });
+      });
     });
     webSocket.on('close', () => {
       const account = accountSockets(roomId, accountId);
@@ -492,6 +562,7 @@ function attachLinkWebSockets({ server, config, auth, linkService }) {
         void linkService.disconnect({ roomId, accountId }).catch(() => {});
       }
       if (sockets.get(roomId)?.size === 0) sockets.delete(roomId);
+      trace('disconnected', { roomId, accountId, remainingSockets: account?.size ?? 0 });
     });
   });
 

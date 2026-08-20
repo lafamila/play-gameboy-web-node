@@ -110,6 +110,7 @@ extern int linktime;
 extern void StartLink(u16);
 extern void StartGPLink(u16);
 extern void StartJOYLink(u16);
+extern void WriteLinkData(u16);
 extern void LinkUpdate();
 `,
     ],
@@ -131,7 +132,7 @@ extern void LinkUpdate();
     StartLink(value);
     break;
   case 0x12a:
-    UPDATE_REG(0x12a, value);
+    WriteLinkData(value);
     break;
   case 0x134:
     StartGPLink(value);
@@ -164,3 +165,73 @@ extern void LinkUpdate();
   }
   await writeFile(gbaFilename, gbaSource);
 }
+
+if (!gbaSource.includes('extern bool linkCpuActive;')) {
+  const before = `extern int linktime;
+`;
+  const after = `extern int linktime;
+extern bool linkCpuActive;
+`;
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 CPU link activity declaration context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+if (!gbaSource.includes('extern void WriteLinkData(u16);')) {
+  const before = `extern void StartJOYLink(u16);
+`;
+  const after = `extern void StartJOYLink(u16);
+extern void WriteLinkData(u16);
+`;
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 link data declaration context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+if (gbaSource.includes(`  case 0x12a:
+    UPDATE_REG(0x12a, value);
+`)) {
+  gbaSource = gbaSource.replace(
+    `  case 0x12a:
+    UPDATE_REG(0x12a, value);
+`,
+    `  case 0x12a:
+    WriteLinkData(value);
+`,
+  );
+}
+
+if (!gbaSource.includes('linkCpuActive = true;')) {
+  const before = `void CPULoop(int ticks)\n{${'  '}\n`;
+  const after = `void CPULoop(int ticks)\n{${'  '}\n` +
+`  linkCpuActive = true;
+`;
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 CPU loop start context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+if (!gbaSource.includes('linkCpuActive = false;')) {
+  const before = `    }
+  }
+}
+
+struct EmulatedSystem GBASystem = {
+`;
+  const after = `    }
+  }
+  linkCpuActive = false;
+}
+
+struct EmulatedSystem GBASystem = {
+`;
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 CPU loop end context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+await writeFile(gbaFilename, gbaSource);

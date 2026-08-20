@@ -281,12 +281,12 @@ VBA_EXPORT int vba_load_rom(const uint8_t* data, int size, int system) {
 
 VBA_EXPORT int vba_run_frame() {
   if (!g_loaded) return 0;
-  if (vbaLinkWaiting()) return 2;
+  if (vbaLinkWaiting() || vbaLinkGuestHeld()) return 2;
   const uint64_t target = g_frame_counter + 1;
   for (int attempt = 0; attempt < 4 && g_frame_counter < target; ++attempt) {
     g_emulator->emuMain(g_emulator->emuCount);
     ++g_emulation_steps;
-    if (vbaLinkWaiting()) return 2;
+    if (vbaLinkWaiting() || vbaLinkGuestHeld()) return 2;
   }
   return g_frame_counter >= target ? 1 : 0;
 }
@@ -400,8 +400,18 @@ VBA_EXPORT int vba_link_request_pending() { return vbaLinkRequestPending(); }
 VBA_EXPORT int vba_link_request_sequence() { return vbaLinkRequestSequence(); }
 VBA_EXPORT int vba_link_request_speed() { return vbaLinkRequestSpeed(); }
 VBA_EXPORT int vba_link_request_data() { return vbaLinkRequestData(); }
-VBA_EXPORT int vba_link_prepare_remote(int sequence, int speed, int master_data) {
-  return vbaLinkPrepareRemote(sequence, speed, master_data);
+VBA_EXPORT int vba_link_request_ticks() { return vbaLinkRequestTicks(); }
+VBA_EXPORT int vba_link_guest_held() { return vbaLinkGuestHeld(); }
+VBA_EXPORT int vba_link_time() { return linktime; }
+VBA_EXPORT int vba_link_siocnt() {
+  return ioMem ? READ16LE(&ioMem[0x128]) : -1;
+}
+VBA_EXPORT int vba_link_siodata8() {
+  return ioMem ? READ16LE(&ioMem[0x12a]) : -1;
+}
+VBA_EXPORT int vba_link_prepare_remote(int sequence, int speed, int master_data,
+                                      int transfer_ticks) {
+  return vbaLinkPrepareRemote(sequence, speed, master_data, transfer_ticks);
 }
 VBA_EXPORT int vba_link_apply_pair(int sequence, int speed, int master_data,
                                   int slave_data) {
@@ -426,7 +436,7 @@ bool RunNativeLinkProbe() {
   StartLink(0x6083);
   if (!vba_link_request_pending() || !vba_link_waiting() ||
       vba_link_request_sequence() != 0 || vba_link_request_speed() != 3 ||
-      vba_link_request_data() != 0x1234) {
+      vba_link_request_data() != 0x1234 || vba_link_request_ticks() != 0) {
     fprintf(stderr, "LINK probe request=%d wait=%d seq=%d speed=%d data=%04x\n",
             vba_link_request_pending(), vba_link_waiting(),
             vba_link_request_sequence(), vba_link_request_speed(),
@@ -447,7 +457,50 @@ bool RunNativeLinkProbe() {
             vba_link_transfer_active(), vba_link_waiting(),
             READ16LE(&ioMem[0x120]), READ16LE(&ioMem[0x122]));
   }
-  return vba_link_set_player(-1) && passed;
+  if (!passed || !vba_link_set_player(-1) || !vba_link_set_player(1)) return false;
+
+  WRITE16LE(&ioMem[0x12a], 0xabcd);
+  if (vba_link_prepare_remote(0, 3, 0x1234, 0) != 0xabcd) {
+    fprintf(stderr, "LINK guest first transfer failed\n");
+    return false;
+  }
+  StartLink(0x6083);
+  if (!(READ16LE(&ioMem[0x128]) & 0x80) ||
+      !vba_link_apply_pair(0, 3, 0x1234, 0xabcd)) {
+    fprintf(stderr, "LINK guest transfer start bit was not preserved\n");
+    return false;
+  }
+  linktime = 100000;
+  LinkUpdate();
+  if (vba_link_guest_held()) {
+    fprintf(stderr, "LINK guest held before serial response write\n");
+    return false;
+  }
+  WriteLinkData(0xabcd);
+  if (!vba_link_guest_held()) {
+    fprintf(stderr, "LINK guest was not held after serial response write\n");
+    return false;
+  }
+  linktime = 1000;
+  if (vba_link_prepare_remote(1, 3, 0x5678, 2000) != -2 || vba_link_waiting()) {
+    fprintf(stderr, "LINK guest accepted transfer before scheduled tick\n");
+    return false;
+  }
+  linktime = 2500;
+  LinkUpdate();
+  if (vba_link_prepare_remote(1, 3, 0x5678, 2000) != 0xabcd ||
+      !vba_link_waiting() || linktime != 500) {
+    fprintf(stderr, "LINK guest scheduled transfer failed wait=%d ticks=%d\n",
+            vba_link_waiting(), linktime);
+    return false;
+  }
+  StartLink(0x6003);
+  if (READ16LE(&ioMem[0x128]) & 0x80) {
+    fprintf(stderr, "LINK guest forced an unrequested transfer start bit\n");
+    return false;
+  }
+  vba_link_cancel_wait();
+  return vba_link_set_player(-1);
 }
 
 int main(int argc, char** argv) {

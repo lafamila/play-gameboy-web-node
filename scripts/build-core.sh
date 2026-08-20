@@ -86,7 +86,7 @@ SOURCES=(
   "${SOURCE_DIR}/src/gb/gbSound.cpp"
 )
 
-EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_quality","_vba_state_audio_quality","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_link_set_player","_vba_link_player","_vba_link_waiting","_vba_link_transfer_active","_vba_link_request_pending","_vba_link_request_sequence","_vba_link_request_speed","_vba_link_request_data","_vba_link_prepare_remote","_vba_link_apply_pair","_vba_link_cancel_wait","_vba_shutdown"]'
+EXPORTS='["_malloc","_free","_vba_load_rom","_vba_run_frame","_vba_set_joypad","_vba_framebuffer","_vba_frame_stride","_vba_frame_width","_vba_frame_height","_vba_frame_counter","_vba_emulation_steps","_vba_load_state","_vba_export_state","_vba_load_battery","_vba_export_battery","_vba_export_data","_vba_export_size","_vba_audio_available","_vba_audio_total_samples","_vba_audio_quality","_vba_state_audio_quality","_vba_audio_read","_vba_last_error","_vba_state_version","_vba_link_set_player","_vba_link_player","_vba_link_waiting","_vba_link_transfer_active","_vba_link_request_pending","_vba_link_request_sequence","_vba_link_request_speed","_vba_link_request_data","_vba_link_request_ticks","_vba_link_guest_held","_vba_link_time","_vba_link_siocnt","_vba_link_siodata8","_vba_link_prepare_remote","_vba_link_apply_pair","_vba_link_cancel_wait","_vba_shutdown"]'
 
 em++ \
   -std=gnu++14 \

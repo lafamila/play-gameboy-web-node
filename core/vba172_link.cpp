@@ -13,6 +13,7 @@
 #define UPDATE_REG(address, value) WRITE16LE(((u16 *)&ioMem[address]), value)
 
 int linktime = 0;
+bool linkCpuActive = false;
 extern int* extTicks;
 
 namespace {
@@ -27,10 +28,27 @@ int g_speed = 3;
 int g_transferPhase = 0;
 int g_masterData = 0xffff;
 int g_slaveData = 0xffff;
+int g_requestTicks = 0;
 int g_remoteSequence = -1;
 int g_remoteMasterData = 0xffff;
+int g_remoteTicks = 0;
 bool g_waiting = false;
 bool g_requestPending = false;
+bool g_guestHeld = false;
+bool g_guestHoldPending = false;
+
+bool PrepareScheduledGuestResponse(bool interruptCpu) {
+  if (g_player != 1 || g_remoteSequence != g_sequence || g_waiting ||
+      g_transferPhase || linktime < g_remoteTicks) {
+    return false;
+  }
+  if (g_sequence == 0) linktime = 0;
+  else linktime -= g_remoteTicks;
+  g_slaveData = READ16LE(&ioMem[0x12a]);
+  g_waiting = true;
+  if (interruptCpu && linkCpuActive && extTicks) *extTicks = 0;
+  return true;
+}
 
 void WriteRoleBits(u16 value) {
   value &= 0xffbb;
@@ -60,8 +78,10 @@ void StartPairedTransfer(int sequence, int speed, int masterData, int slaveData)
   g_transferPhase = 1;
   g_waiting = false;
   g_requestPending = false;
+  g_guestHeld = false;
+  g_guestHoldPending = false;
   g_remoteSequence = -1;
-  linktime = 0;
+  g_remoteTicks = 0;
   WRITE32LE(&ioMem[0x120], 0xffffffff);
   WRITE32LE(&ioMem[0x124], 0xffffffff);
   UPDATE_REG(0x128, READ16LE(&ioMem[0x128]) | 0x80);
@@ -80,11 +100,14 @@ void StartLink(u16 value) {
     if ((value & 0x80) && g_player == 0 && !g_waiting && !g_transferPhase) {
       g_masterData = READ16LE(&ioMem[0x12a]);
       g_speed = value & 3;
+      g_requestTicks = g_sequence == 0 ? 0 : std::max(linktime, 0);
+      linktime = 0;
       g_requestPending = true;
       g_waiting = true;
-      if (extTicks) *extTicks = 0;
-    } else if (g_player != 0) {
+      if (linkCpuActive && extTicks) *extTicks = 0;
+    } else if (g_player != 0 && (value & 0x80)) {
       value &= 0xff7f;
+      value |= (g_waiting || g_transferPhase) ? 0x80 : 0;
     }
     WriteRoleBits(value);
     return;
@@ -112,9 +135,23 @@ void StartJOYLink(u16 value) {
   UPDATE_REG(0x140, value);
 }
 
+void WriteLinkData(u16 value) {
+  if (!ioMem) return;
+  UPDATE_REG(0x12a, value);
+  if (g_player == 1 && g_guestHoldPending) {
+    g_guestHoldPending = false;
+    g_guestHeld = true;
+    if (linkCpuActive && extTicks) *extTicks = 0;
+  }
+}
+
 void LinkUpdate() {
-  if (!ioMem || g_player < 0 || !g_transferPhase) {
+  if (!ioMem || g_player < 0) {
     linktime = 0;
+    return;
+  }
+  if (!g_transferPhase) {
+    PrepareScheduledGuestResponse(true);
     return;
   }
 
@@ -137,6 +174,9 @@ void LinkUpdate() {
                (READ16LE(&ioMem[0x128]) & 0xff0f) |
                    (std::max(g_player, 0) << 4));
     ++g_sequence;
+    if (g_player == 1) {
+      g_guestHoldPending = true;
+    }
   }
 }
 
@@ -147,10 +187,14 @@ void vbaLinkReset() {
   g_transferPhase = 0;
   g_masterData = 0xffff;
   g_slaveData = 0xffff;
+  g_requestTicks = 0;
   g_remoteSequence = -1;
   g_remoteMasterData = 0xffff;
+  g_remoteTicks = 0;
   g_waiting = false;
   g_requestPending = false;
+  g_guestHeld = false;
+  g_guestHoldPending = false;
   linktime = 0;
 }
 
@@ -158,6 +202,10 @@ int vbaLinkSetPlayer(int playerId) {
   if (playerId < -1 || playerId > 1 || g_transferPhase || g_waiting) return 0;
   g_player = playerId;
   g_sequence = 0;
+  g_requestTicks = 0;
+  linktime = 0;
+  g_guestHeld = false;
+  g_guestHoldPending = false;
   if (ioMem && playerId >= 0) WriteRoleBits(READ16LE(&ioMem[0x128]));
   return 1;
 }
@@ -169,16 +217,26 @@ int vbaLinkRequestPending() { return g_requestPending ? 1 : 0; }
 int vbaLinkRequestSequence() { return g_sequence; }
 int vbaLinkRequestSpeed() { return g_speed; }
 int vbaLinkRequestData() { return g_masterData; }
+int vbaLinkRequestTicks() { return g_requestTicks; }
+int vbaLinkGuestHeld() { return g_guestHeld ? 1 : 0; }
 
-int vbaLinkPrepareRemote(int sequence, int speed, int masterData) {
-  if (!ioMem || g_player != 1 || sequence != g_sequence || g_transferPhase) return -1;
-  if (g_waiting && g_remoteSequence == sequence) return READ16LE(&ioMem[0x12a]);
-  if (g_waiting) return -1;
-  g_remoteSequence = sequence;
-  g_remoteMasterData = masterData & 0xffff;
-  g_speed = speed & 3;
-  g_waiting = true;
-  return READ16LE(&ioMem[0x12a]);
+int vbaLinkPrepareRemote(int sequence, int speed, int masterData, int transferTicks) {
+  if (!ioMem || g_player != 1 || sequence != g_sequence || g_transferPhase ||
+      g_guestHoldPending || transferTicks < 0) {
+    return -1;
+  }
+  if (g_waiting && g_remoteSequence == sequence) return g_slaveData;
+  if (g_waiting || (g_remoteSequence >= 0 && g_remoteSequence != sequence)) return -1;
+  if (g_remoteSequence < 0) {
+    g_guestHeld = false;
+    g_guestHoldPending = false;
+    g_remoteSequence = sequence;
+    g_remoteMasterData = masterData & 0xffff;
+    g_remoteTicks = transferTicks;
+    g_speed = speed & 3;
+  }
+  PrepareScheduledGuestResponse(false);
+  return g_waiting ? g_slaveData : -2;
 }
 
 int vbaLinkApplyPair(int sequence, int speed, int masterData, int slaveData) {
@@ -196,5 +254,8 @@ void vbaLinkCancelWait() {
   if (g_transferPhase) return;
   g_waiting = false;
   g_requestPending = false;
+  g_guestHeld = false;
+  g_guestHoldPending = false;
   g_remoteSequence = -1;
+  g_remoteTicks = 0;
 }

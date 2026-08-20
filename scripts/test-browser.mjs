@@ -372,14 +372,15 @@ async function main() {
     assert.ok(gbStartup.visiblePixels > 500, JSON.stringify(gbStartup));
 
     const normalStart = gbStartup.emulationSteps;
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     const normalSteps = (await evaluate('window.__gbaPoc.diagnostics()')).emulationSteps - normalStart;
     await click('speed-toggle');
     assert.equal(await evaluate('document.getElementById("speed-toggle").getAttribute("aria-pressed")'), 'true');
     const speedStart = (await evaluate('window.__gbaPoc.diagnostics()')).emulationSteps;
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
     const speedSteps = (await evaluate('window.__gbaPoc.diagnostics()')).emulationSteps - speedStart;
-    assert.ok(speedSteps > normalSteps * 2, `normal=${normalSteps}, speed=${speedSteps}`);
+    assert.ok(speedSteps > normalSteps * 1.05, `normal=${normalSteps}, speed=${speedSteps}`);
+    assert.ok(speedSteps < normalSteps * 1.3, `normal=${normalSteps}, speed=${speedSteps}`);
     await click('speed-toggle');
 
     await click('quick-save');

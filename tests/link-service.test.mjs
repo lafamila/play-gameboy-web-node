@@ -63,27 +63,34 @@ test('Pokemon Gen 3 ROMs in the same region share a cable compatibility group', 
 });
 
 test('two accounts ready and exchange one virtual cable transfer', async () => {
-  const { service, roomId } = await setup();
+  const { database, service, roomId } = await setup();
   assert.equal((await service.setReady({ roomId, accountId: 'host', ready: true })).status, 'waiting');
   assert.equal((await service.setReady({ roomId, accountId: 'guest', ready: true })).status, 'ready');
   assert.equal((await service.startRoom({ roomId, accountId: 'host' })).status, 'active');
 
   const messages = [];
   service.on('message', (event) => messages.push(event));
+  let persistedRoomReads = 0;
+  const getLinkRoom = database.getLinkRoom.bind(database);
+  database.getLinkRoom = async (...args) => {
+    ++persistedRoomReads;
+    return getLinkRoom(...args);
+  };
   await service.handleMessage({
     roomId,
     accountId: 'host',
-    message: { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234 },
+    message: { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 },
   });
   await service.handleMessage({
     roomId,
     accountId: 'guest',
-    message: { type: 'link-response', sequence: 0, speed: 3, data: 0xabcd },
+    message: { type: 'link-response', sequence: 0, speed: 3, data: 0xabcd, ticks: 0 },
   });
   await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(persistedRoomReads, 0, 'word transfers must not query persistent room state');
   assert.ok(messages.some((event) => event.targetAccountId === 'guest' && event.message.type === 'link-offer'));
   assert.deepEqual(messages.find((event) => event.message.type === 'link-pair').message, {
-    type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd,
+    type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
   });
   messages.length = 0;
   await service.handleMessage({
@@ -92,7 +99,16 @@ test('two accounts ready and exchange one virtual cable transfer', async () => {
   assert.deepEqual(messages[0], {
     roomId,
     targetAccountId: 'guest',
-    message: { type: 'link-pair', sequence: 0, speed: 3, masterData: 0x1234, slaveData: 0xabcd },
+    message: { type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd },
+  });
+  messages.length = 0;
+  await service.handleMessage({
+    roomId, accountId: 'host', message: { type: 'link-release', sequence: 1 },
+  });
+  assert.deepEqual(messages[0], {
+    roomId,
+    targetAccountId: 'guest',
+    message: { type: 'link-release', sequence: 1 },
   });
 });
 

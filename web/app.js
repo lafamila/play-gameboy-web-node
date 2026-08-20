@@ -1,10 +1,12 @@
 import createVbaModule from '/core/vba172.js';
-import { LinkMessageQueue } from '/link-message-queue.js';
+import { hostTransferData, isSlaveHandshake, LinkMessageQueue } from '/link-message-queue.js';
 
 const FRAME_RATE = 59.7275;
 const CORE_SAMPLE_RATE = 44100;
+const SPEED_MODE_MULTIPLIER = 1.125;
 const LINK_CHECKPOINT_INTERVAL = 30_000;
 const LINK_ROOM_POLL_INTERVAL = 3_000;
+const LINK_DIAGNOSTIC_INTERVAL = 1_000;
 
 const elements = Object.fromEntries([
   'auth-loading', 'login-view', 'login-link', 'visitor-view', 'app-view', 'visitor-account',
@@ -58,6 +60,8 @@ let linkSocketGeneration = 0;
 let linkReconnectTimer;
 let linkRoomTimer;
 let linkCheckpointTimer;
+let linkDiagnosticTimer;
+let linkPumpScheduled = false;
 let linkRoomRefreshing = false;
 let linkCheckpointing = false;
 let linkCheckpointPendingSequence = null;
@@ -66,7 +70,12 @@ let linkFinishSubmitted = false;
 let linkCorePlayer = -1;
 let linkDetachPending = false;
 let linkLastOfferSequence = -1;
+let linkGuestHandshakePending = false;
+let linkLastReleaseSequence = -1;
 let linkTransferActive = false;
+let linkIdleSince = 0;
+let linkFinishIdle = false;
+let linkDebugEnabled = false;
 const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
@@ -108,6 +117,10 @@ function logEvent(message, error = false) {
   while (elements['event-log'].children.length > 30) {
     elements['event-log'].lastElementChild.remove();
   }
+}
+
+function logCableSequence(message, sequence) {
+  if (sequence < 10 || sequence % 100 === 0) logEvent(`${message} ${sequence}`);
 }
 
 function setMenuOpen(open, focusToggle = false) {
@@ -163,6 +176,23 @@ function activeGbaSelected() {
 function cableIdle() {
   return Boolean(core && !core._vba_link_waiting() && !core._vba_link_transfer_active() &&
     !core._vba_link_request_pending());
+}
+
+function updateLinkIdleGate(now = performance.now()) {
+  const idle = cableIdle();
+  if (!idle) {
+    linkIdleSince = 0;
+    if (linkFinishIdle) {
+      linkFinishIdle = false;
+      renderLinkRoom();
+    }
+    return;
+  }
+  if (!linkIdleSince) linkIdleSince = now;
+  if (!linkFinishIdle && now - linkIdleSince >= 750) {
+    linkFinishIdle = true;
+    renderLinkRoom();
+  }
 }
 
 function setControls(enabled) {
@@ -327,7 +357,7 @@ function renderAudio(event) {
   const left = event.outputBuffer.getChannelData(0);
   const right = event.outputBuffer.getChannelData(1);
   const linkBlocked = isLinkRoomOpen() &&
-    (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing || core?._vba_link_waiting());
+    (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing);
   if (!core || !running || paused || linkBlocked || muted || speedMode) {
     if (core && speedMode && audioPointer) {
       while (core._vba_audio_available() > 0) {
@@ -339,7 +369,8 @@ function renderAudio(event) {
     left.fill(0); right.fill(0); return;
   }
   const ratio = CORE_SAMPLE_RATE / audioContext.sampleRate;
-  pullAudio(Math.ceil((left.length * ratio + 2) * 2));
+  const bufferMultiplier = linkRoom?.status === 'active' ? 3 : 1;
+  pullAudio(Math.ceil((left.length * bufferMultiplier * ratio + 2) * 2));
   for (let i = 0; i < left.length; ++i) {
     const frame = Math.floor(audioPosition);
     left[i] = audioQueue[frame * 2] || 0;
@@ -390,17 +421,18 @@ function animationLoop(timestamp) {
   drainLinkMessages();
   const elapsed = lastFrameTime ? Math.min(timestamp - lastFrameTime, 100) : 0;
   lastFrameTime = timestamp;
-  frameDebt += elapsed * (speedMode ? 4 : 1);
+  frameDebt += elapsed * (speedMode ? SPEED_MODE_MULTIPLIER : 1);
   const frameDuration = 1000 / FRAME_RATE;
   const linkBlocked = isLinkRoomOpen() &&
     (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing ||
-      (linkRoom.status === 'active' && linkCorePlayer < 0));
+      (linkRoom.status === 'active' &&
+        (linkCorePlayer < 0 || Boolean(core?._vba_link_guest_held()))));
   if (linkBlocked) frameDebt = Math.min(frameDebt, frameDuration);
   if (!paused && !linkBlocked) {
     let frames = 0;
-    const maxFrames = speedMode ? 12 : 3;
+    const maxFrames = 3;
     while (frameDebt >= frameDuration && frames < maxFrames) {
-      core._vba_set_joypad(keyMask | touchMask | gamepadMask() | (speedMode ? 1024 : 0));
+      core._vba_set_joypad(keyMask | touchMask | gamepadMask());
       const result = core._vba_run_frame();
       if (result === 2) {
         maybeSendLinkOffer();
@@ -418,6 +450,8 @@ function animationLoop(timestamp) {
     if (linkRoom) renderLinkRoom();
   }
   drainLinkMessages();
+  maybeSendLinkRelease();
+  if (linkRoom?.status === 'active') updateLinkIdleGate(timestamp);
   animationHandle = requestAnimationFrame(animationLoop);
 }
 
@@ -442,6 +476,35 @@ function sendLinkMessage(message) {
   return true;
 }
 
+function sendLinkDiagnostic() {
+  const participant = currentLinkParticipant();
+  if (!linkDebugEnabled || !core || !participant || linkRoom?.status !== 'active' ||
+      !linkSocketOpen()) return;
+  sendLinkMessage({
+    type: 'diagnostic',
+    state: {
+      slot: participant.slot,
+      corePlayer: linkCorePlayer,
+      sequence: Number(core._vba_link_request_sequence()),
+      waiting: Boolean(core._vba_link_waiting()),
+      transferActive: Boolean(core._vba_link_transfer_active()),
+      requestPending: Boolean(core._vba_link_request_pending()),
+      guestHeld: Boolean(core._vba_link_guest_held()),
+      guestHandshakePending: linkGuestHandshakePending,
+      requestData: Number(core._vba_link_request_data()),
+      requestTicks: Number(core._vba_link_request_ticks()),
+      linkTime: Number(core._vba_link_time()),
+      siocnt: Number(core._vba_link_siocnt()),
+      siodata8: Number(core._vba_link_siodata8()),
+      lastOfferSequence: linkLastOfferSequence,
+      pendingOffers: linkMessageQueue.pendingOffers,
+      pendingPairs: linkMessageQueue.pendingPairs,
+      preparedResponses: linkMessageQueue.preparedResponses,
+      frameCount: Number(core._vba_frame_counter()),
+    },
+  });
+}
+
 function syncLinkTransfer() {
   if (!core || linkRoom?.status !== 'active') return;
   sendLinkMessage({ type: 'sync', sequence: Number(core._vba_link_request_sequence()) });
@@ -453,14 +516,34 @@ function maybeSendLinkOffer() {
       !core._vba_link_request_pending()) return;
   const sequence = Number(core._vba_link_request_sequence());
   if (sequence === linkLastOfferSequence) return;
+  const rawData = Number(core._vba_link_request_data());
+  const data = hostTransferData(rawData, linkGuestHandshakePending);
   if (sendLinkMessage({
     type: 'link-offer',
     sequence,
     speed: Number(core._vba_link_request_speed()),
-    data: Number(core._vba_link_request_data()),
+    data,
+    ticks: Number(core._vba_link_request_ticks()),
   })) {
     linkLastOfferSequence = sequence;
+    if (data !== rawData && (sequence < 10 || sequence % 100 === 0)) {
+      logEvent('Cable master handshake restored');
+    }
+    logCableSequence('Cable offer sent', sequence);
     renderLinkRoom();
+  }
+}
+
+function maybeSendLinkRelease() {
+  const participant = currentLinkParticipant();
+  if (participant?.slot !== 0 || linkRoom?.status !== 'active' || linkRoom.paused ||
+      !core || core._vba_link_waiting() || core._vba_link_transfer_active() ||
+      core._vba_link_request_pending() || (Number(core._vba_link_siocnt()) & 0x4000)) return;
+  const sequence = Number(core._vba_link_request_sequence());
+  if (sequence <= 0 || sequence === linkLastReleaseSequence) return;
+  if (sendLinkMessage({ type: 'link-release', sequence })) {
+    linkLastReleaseSequence = sequence;
+    logEvent('Cable peer released');
   }
 }
 
@@ -471,20 +554,60 @@ function drainLinkMessages() {
     slot: participant.slot,
     currentSequence: () => Number(core._vba_link_request_sequence()),
     transferActive: () => Boolean(core._vba_link_transfer_active()),
-    prepareRemote: (sequence, speed, masterData) =>
-      core._vba_link_prepare_remote(sequence, speed, masterData),
-    sendResponse: (message) => sendLinkMessage(message),
+    prepareRemote: (sequence, speed, masterData, ticks) =>
+      core._vba_link_prepare_remote(sequence, speed, masterData, ticks),
+    sendResponse: (message) => {
+      const sent = sendLinkMessage(message);
+      if (sent) logCableSequence('Cable response sent', message.sequence);
+      return sent;
+    },
     applyPair: (sequence, speed, masterData, slaveData) =>
       core._vba_link_apply_pair(sequence, speed, masterData, slaveData),
     onPairApplied: (pair) => {
+      if (participant.slot === 0) {
+        linkGuestHandshakePending = isSlaveHandshake(pair.slaveData);
+      }
       linkLastOfferSequence = -1;
       linkRoom = {
         ...linkRoom,
         nextTransferSequence: Math.max(linkRoom.nextTransferSequence || 0, pair.sequence + 1),
       };
+      logCableSequence('Cable pair applied', pair.sequence);
       renderLinkRoom();
     },
   });
+}
+
+function scheduleLinkPump() {
+  if (linkPumpScheduled) return;
+  linkPumpScheduled = true;
+  queueMicrotask(() => {
+    linkPumpScheduled = false;
+    pumpLinkCore();
+  });
+}
+
+function pumpLinkCore() {
+  if (!core || !running || paused || linkRoom?.status !== 'active' || linkRoom.paused ||
+      linkCheckpointing || linkCorePlayer < 0) return;
+
+  drainLinkMessages();
+  if (core._vba_link_waiting()) {
+    maybeSendLinkOffer();
+    return;
+  }
+  if (core._vba_link_guest_held()) return;
+
+  core._vba_set_joypad(keyMask | touchMask | gamepadMask());
+  const previousFrame = Number(core._vba_frame_counter());
+  const result = core._vba_run_frame();
+  if (Number(core._vba_frame_counter()) !== previousFrame) renderFrame();
+  if (result === 2) maybeSendLinkOffer();
+  drainLinkMessages();
+  maybeSendLinkRelease();
+  lastFrameTime = performance.now();
+  frameDebt = 0;
+  if (result === 0) scheduleLinkPump();
 }
 
 function attachLinkCore() {
@@ -564,7 +687,7 @@ function renderLinkRoom() {
   elements['link-start'].disabled = room.status !== 'ready' || room.paused || !linkSocketOpen();
   elements['link-finish'].hidden = !['active', 'finishing'].includes(room.status);
   elements['link-finish'].disabled = !['active', 'finishing'].includes(room.status) || room.paused || linkFinishSubmitted ||
-    linkCheckpointPendingSequence !== null || !linkSocketOpen() || !cableIdle();
+    linkCheckpointPendingSequence !== null || !linkSocketOpen() || !linkFinishIdle;
   elements['link-finish'].textContent = linkFinishSubmitted ? 'Saving...' : 'Finish + save';
   elements['link-abort'].hidden = terminal;
   elements['link-close'].hidden = !terminal;
@@ -586,6 +709,7 @@ function updateLinkRoom(room) {
     elements['speed-toggle'].textContent = 'Speed off';
     clearInterval(batteryTimer);
     attachLinkCore();
+    scheduleLinkPump();
   } else if (['completed', 'aborted'].includes(linkRoom.status)) {
     detachLinkCore();
     clearLinkTimers();
@@ -599,20 +723,24 @@ function clearLinkTimers() {
   clearTimeout(linkReconnectTimer);
   clearInterval(linkRoomTimer);
   clearInterval(linkCheckpointTimer);
+  clearInterval(linkDiagnosticTimer);
   linkReconnectTimer = undefined;
   linkRoomTimer = undefined;
   linkCheckpointTimer = undefined;
+  linkDiagnosticTimer = undefined;
 }
 
 function startLinkTimers() {
   clearInterval(linkRoomTimer);
   clearInterval(linkCheckpointTimer);
+  clearInterval(linkDiagnosticTimer);
   linkRoomTimer = setInterval(() => refreshLinkRoom().catch((error) => logEvent(error.message, true)),
     LINK_ROOM_POLL_INTERVAL);
   linkCheckpointTimer = setInterval(() => submitLinkCheckpoint().catch((error) => {
     linkCheckpointPendingSequence = null;
     logEvent(error.message, true);
   }), LINK_CHECKPOINT_INTERVAL);
+  linkDiagnosticTimer = setInterval(sendLinkDiagnostic, LINK_DIAGNOSTIC_INTERVAL);
 }
 
 function closeLinkSocket() {
@@ -664,12 +792,16 @@ function openLinkSocket() {
 async function handleLinkMessage(message) {
   if (!message || typeof message.type !== 'string') return;
   if (message.type === 'connected') {
+    linkDebugEnabled = Boolean(message.debug);
     updateLinkRoom(message.room);
     syncLinkTransfer();
+    sendLinkDiagnostic();
+    scheduleLinkPump();
     return;
   }
   if (message.type === 'room') {
     updateLinkRoom(message.room);
+    scheduleLinkPump();
     return;
   }
   if (message.type === 'paused') {
@@ -681,14 +813,26 @@ async function handleLinkMessage(message) {
   }
   if (message.type === 'link-offer') {
     if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' || linkRoom.paused) return;
+    logCableSequence('Cable offer received', message.sequence);
     linkMessageQueue.enqueueOffer(message);
     drainLinkMessages();
+    scheduleLinkPump();
     renderLinkRoom();
     return;
   }
   if (message.type === 'link-pair') {
+    logCableSequence('Cable pair received', message.sequence);
     linkMessageQueue.enqueuePair(message);
     drainLinkMessages();
+    scheduleLinkPump();
+    return;
+  }
+  if (message.type === 'link-release') {
+    if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' ||
+        Number(core?._vba_link_request_sequence()) !== message.sequence) return;
+    core._vba_link_cancel_wait();
+    logEvent('Cable peer finished');
+    scheduleLinkPump();
     return;
   }
   if (message.type === 'checkpoint-saved') {
@@ -765,7 +909,11 @@ function enterLinkRoom(room, inviteCode) {
   linkCheckpointPendingSequence = null;
   linkCheckpointPendingState = '';
   linkFinishSubmitted = false;
+  linkIdleSince = 0;
+  linkFinishIdle = false;
   linkLastOfferSequence = -1;
+  linkGuestHandshakePending = false;
+  linkLastReleaseSequence = -1;
   linkMessageQueue.clear();
   speedMode = false;
   elements['speed-toggle'].setAttribute('aria-pressed', 'false');
@@ -1326,6 +1474,7 @@ window.__gbaPoc = {
       audioState: audioContext?.state || 'uninitialized',
       inputMask: keyMask | touchMask,
       speedMode,
+      speedMultiplier: speedMode ? SPEED_MODE_MULTIPLIER : 1,
       linkRoom: linkRoom ? {
         id: linkRoom.id,
         status: linkRoom.status,
@@ -1333,6 +1482,19 @@ window.__gbaPoc = {
         slot: currentLinkParticipant()?.slot ?? null,
         socketOpen: linkSocketOpen(),
         checkpointPending: linkCheckpointPendingSequence,
+        corePlayer: linkCorePlayer,
+        coreSequence: core ? Number(core._vba_link_request_sequence()) : null,
+        coreWaiting: core ? Boolean(core._vba_link_waiting()) : null,
+        coreTransferActive: core ? Boolean(core._vba_link_transfer_active()) : null,
+        coreRequestPending: core ? Boolean(core._vba_link_request_pending()) : null,
+        coreGuestHeld: core ? Boolean(core._vba_link_guest_held()) : null,
+        guestHandshakePending: linkGuestHandshakePending,
+        coreRequestTicks: core ? Number(core._vba_link_request_ticks()) : null,
+        lastOfferSequence: linkLastOfferSequence,
+        pendingOffers: linkMessageQueue.pendingOffers,
+        pendingPairs: linkMessageQueue.pendingPairs,
+        preparedResponses: linkMessageQueue.preparedResponses,
+        finishIdle: linkFinishIdle,
       } : null,
       emulationSteps: core ? Number(core._vba_emulation_steps()) : 0,
       frameWidth,

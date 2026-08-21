@@ -44,6 +44,18 @@ test('account and guest local players use server-owned isolated save profiles', 
   assert.equal(database.localSaveLocks.size, 2);
 });
 
+test('pair cleanup still releases locks after Player 2 loses play permission', async () => {
+  const { database, service } = await setup();
+  const session = await service.create({
+    player1: host, player2: guest, player2Mode: 'account',
+    player1RomId: HOST_ROM, player2RomId: GUEST_ROM,
+  });
+  const aborted = await service.abortForPair(host, { ...guest, permission: 'visitor' });
+  assert.equal(aborted.id, session.id);
+  assert.equal(aborted.status, 'aborted');
+  assert.equal(database.localSaveLocks.size, 0);
+});
+
 test('same-account P2 and incompatible ROM pairs are rejected before start', async () => {
   const { database, service } = await setup();
   await assert.rejects(() => service.create({
@@ -63,6 +75,9 @@ test('same-account P2 and incompatible ROM pairs are rejected before start', asy
 
 test('ready/start/checkpoint/final battery operations remain paired and atomic', async () => {
   const { database, service } = await setup();
+  assert.equal(database.localLinkSessions.size, 0);
+  assert.equal(database.localSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
   const session = await service.create({
     player1: host, player2: guest, player2Mode: 'account',
     player1RomId: HOST_ROM, player2RomId: GUEST_ROM,
@@ -82,6 +97,7 @@ test('ready/start/checkpoint/final battery operations remain paired and atomic',
   });
   assert.equal(checkpoint.checkpoints.length, 2);
   await service.start({ id: session.id, player1: host, player2: guest });
+  assert.equal((await database.getLocalLinkSession(session.id)).status, 'active');
   const batteryA = Buffer.alloc(131072, 0x11);
   const batteryB = Buffer.alloc(131072, 0x22);
   await service.finish({

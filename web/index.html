@@ -27,19 +27,20 @@
     <div id="app-view" hidden>
     <main>
       <section class="rom-toolbar" aria-label="ROM selection">
-        <select id="rom-select" aria-label="ROM"></select>
-        <button id="load-rom" class="primary" type="button">Load</button>
-        <div class="app-menu">
-          <button
-            id="menu-toggle"
-            class="menu-toggle"
-            type="button"
-            aria-label="Account menu"
-            aria-controls="app-menu-panel"
-            aria-expanded="false"
-            title="Account menu"
-          >&#9776;</button>
-          <div id="app-menu-panel" class="menu-panel" aria-label="Account and save actions" hidden>
+        <div class="rom-toolbar-player rom-toolbar-player-one">
+          <select id="rom-select" aria-label="Player 1 ROM"></select>
+          <button id="load-rom" class="primary" type="button">Load</button>
+          <div class="app-menu">
+            <button
+              id="menu-toggle"
+              class="menu-toggle"
+              type="button"
+              aria-label="Account menu"
+              aria-controls="app-menu-panel"
+              aria-expanded="false"
+              title="Account menu"
+            >&#9776;</button>
+            <div id="app-menu-panel" class="menu-panel" aria-label="Account and save actions" hidden>
             <div id="account-name" class="account-name"></div>
             <div id="rom-meta" class="meta menu-meta"></div>
             <a class="source-link menu-command" href="/core/VisualBoyAdvance-src-1.7.2.zip">Core source</a>
@@ -69,14 +70,19 @@
             </div>
 
             <button id="logout" class="menu-command" type="button">Logout</button>
+            </div>
           </div>
+        </div>
+        <div id="player2-toolbar" class="rom-toolbar-player rom-toolbar-player-two" hidden>
+          <select id="player2-rom-select" aria-label="Player 2 ROM"></select>
+          <button id="player2-load" class="primary" type="button">Load</button>
+          <span id="player2-account" class="meta player2-identity">Player 2</span>
+          <button id="player2-logout" type="button" hidden>Logout P2</button>
         </div>
       </section>
 
       <section id="local-2p-bar" class="local-2p-bar" hidden aria-label="Local two player controls">
         <span id="local-2p-status" class="status idle">Player 2 setup</span>
-        <button id="local-p1-ready" type="button" disabled>P1 Ready</button>
-        <button id="local-start" class="primary" type="button" disabled>Start</button>
         <button id="local-exit" class="danger" type="button">Exit 2P</button>
       </section>
 
@@ -128,15 +134,13 @@
             <span>Move: arrows</span><span>A: X</span><span>B: Z</span>
             <span>L: A</span><span>R: S</span><span>Start: Enter</span><span>Select: Backspace</span>
           </div>
+          <div class="local-link-actions" aria-label="Player 1 cable actions">
+            <button id="local-p1-ready" type="button" disabled>P1 Ready</button>
+            <button id="local-start" class="primary" type="button" disabled>Start</button>
+          </div>
         </div>
 
         <div id="player-two-panel" class="player-column player-panel player-two-panel" data-player="2" hidden>
-          <div class="player-heading">
-            <strong>Player 2</strong>
-            <span id="player2-account" class="meta">Choose player</span>
-            <button id="player2-logout" type="button" hidden>Logout P2</button>
-          </div>
-
           <div id="player2-choice" class="player2-choice">
             <button id="player2-login" class="primary" type="button">Login</button>
             <button id="player2-guest" type="button">Continue as guest</button>
@@ -151,11 +155,6 @@
           </div>
 
           <div id="player2-runtime" hidden>
-            <div class="player-rom-toolbar">
-              <select id="player2-rom-select" aria-label="Player 2 ROM"></select>
-              <button id="player2-load" class="primary" type="button">Load</button>
-              <button id="local-p2-ready" type="button" disabled>P2 Ready</button>
-            </div>
             <div class="screen-shell" id="player2-screen-shell">
               <canvas id="player2-screen" width="240" height="160" aria-label="Player 2 game screen"></canvas>
               <div id="player2-screen-empty" class="screen-empty">Select ROM</div>
@@ -191,6 +190,9 @@
             <div class="keymap">
               <span>Move: I/J/K/L</span><span>A: M</span><span>B: N</span>
               <span>L: U</span><span>R: O</span><span>Start: P</span><span>Select: H</span>
+            </div>
+            <div class="local-link-actions local-link-actions-player-two" aria-label="Player 2 cable actions">
+              <button id="local-p2-ready" type="button" disabled>P2 Ready</button>
             </div>
           </div>
         </div>

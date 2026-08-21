@@ -13,6 +13,26 @@ const SPEED_MODE_MULTIPLIER = 1.125;
 const LINK_CHECKPOINT_INTERVAL = 30_000;
 const LINK_ROOM_POLL_INTERVAL = 3_000;
 const LINK_DIAGNOSTIC_INTERVAL = 1_000;
+const STANDALONE_BATTERY_RECOVERY_KEY = 'gbc-standalone-battery-recovery';
+
+function stalePlayerTwoLoadError() {
+  const error = new Error('Player 2 load was superseded');
+  error.code = 'PLAYER2_LOAD_STALE';
+  return error;
+}
+
+function assertCurrentLoad(isCurrent) {
+  if (!isCurrent()) throw stalePlayerTwoLoadError();
+}
+
+async function optionalSaveBytes(response, label) {
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error || `${label} failed (${response.status})`);
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}
 
 const elements = Object.fromEntries([
   'auth-loading', 'login-view', 'login-link', 'visitor-view', 'app-view', 'visitor-account',
@@ -33,6 +53,7 @@ const elements = Object.fromEntries([
   'player-two-panel', 'player2-account', 'player2-logout', 'player2-choice', 'player2-login',
   'player2-guest', 'player2-close', 'player2-auth-status', 'player2-visitor',
   'player2-visitor-status', 'player2-request-access', 'player2-visitor-back', 'player2-runtime',
+  'player2-toolbar',
   'player2-rom-select', 'player2-load', 'player2-screen', 'player2-screen-shell',
   'player2-screen-empty', 'player2-mute', 'player2-runtime-status',
 ].map((id) => [id, document.getElementById(id)]));
@@ -80,6 +101,7 @@ class PlayerRuntime {
     this.audioQueue = [];
     this.audioPosition = 0;
     this.batteryTimer = 0;
+    this.batterySavePromise = Promise.resolve();
     this.hasStoredQuickState = false;
   }
 
@@ -183,9 +205,11 @@ class PlayerRuntime {
     this.canvasContext.putImageData(this.imageData, 0, 0);
   }
 
-  async loadRom(rom, romBytes) {
+  async loadRom(rom, romBytes, isCurrent = () => true) {
     await this.ensureCore();
+    assertCurrentLoad(isCurrent);
     await this.ensureAudio();
+    assertCurrentLoad(isCurrent);
     const isGba = rom.platform === 'gba';
     this.romIdentity = ascii(romBytes.subarray(isGba ? 0xa0 : 0x134, isGba ? 0xb0 : 0x143));
     const loaded = this.withBytes(romBytes, (pointer, size) =>
@@ -237,6 +261,8 @@ class PlayerRuntime {
   }
 
   shutdown() {
+    clearInterval(this.batteryTimer);
+    this.batteryTimer = 0;
     this.running = false;
     this.keyMask = 0;
     this.touchMask = 0;
@@ -326,7 +352,9 @@ const copyFeedbackTimers = new Map();
 async function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
   if (options.method && !['GET', 'HEAD'].includes(options.method.toUpperCase())) {
-    if (currentSession?.csrfToken) headers.set('X-CSRF-Token', currentSession.csrfToken);
+    if (currentSession?.csrfToken && !headers.has('X-CSRF-Token')) {
+      headers.set('X-CSRF-Token', currentSession.csrfToken);
+    }
   }
   const response = await fetch(url, { ...options, headers });
   if (response.status === 401 && currentSession &&
@@ -449,22 +477,26 @@ function setControls(enabled) {
 function applyControlState() {
   const roomOpen = isLinkRoomOpen();
   const localOpen = Boolean(localTwoPlayer?.enabled);
+  const localCableOpen = Boolean(localTwoPlayer?.preparing || localTwoPlayer?.active);
   for (const id of ['pause', 'mute', 'fullscreen']) elements[id].disabled = !emulatorControlsEnabled;
-  elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen || localOpen;
-  elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen || localOpen;
-  elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || localOpen || !hasStoredQuickState;
+  elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen;
+  elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen;
+  elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen || !hasStoredQuickState;
 
   const saveAdminEnabled = emulatorControlsEnabled &&
     ['admin', 'superadmin'].includes(currentSession?.permission);
-  elements['export-state'].disabled = !saveAdminEnabled || roomOpen || localOpen;
-  elements['import-state'].disabled = !saveAdminEnabled || roomOpen || localOpen;
-  elements['import-battery'].disabled = !saveAdminEnabled || roomOpen || localOpen;
-  elements['export-battery'].disabled = !saveAdminEnabled || localOpen;
+  elements['export-state'].disabled = !saveAdminEnabled || roomOpen || localCableOpen;
+  elements['import-state'].disabled = !saveAdminEnabled || roomOpen || localCableOpen;
+  elements['import-battery'].disabled = !saveAdminEnabled || roomOpen || localCableOpen;
+  elements['export-battery'].disabled = !saveAdminEnabled || localCableOpen;
   elements['import-state-label'].classList.toggle('disabled', elements['import-state'].disabled);
   elements['import-battery-label'].classList.toggle('disabled', elements['import-battery'].disabled);
-  const localSessionOpen = Boolean(localTwoPlayer?.session);
-  elements['rom-select'].disabled = roomOpen || localSessionOpen;
-  elements['load-rom'].disabled = roomOpen || localSessionOpen || roms.length === 0;
+  elements['rom-select'].disabled = roomOpen || localCableOpen;
+  elements['load-rom'].disabled = roomOpen || localCableOpen || roms.length === 0;
+  const playerTwoLoadBlocked = localCableOpen || Boolean(localTwoPlayer?.playerTwoLoading);
+  elements['player2-rom-select'].disabled = playerTwoLoadBlocked;
+  elements['player2-load'].disabled = playerTwoLoadBlocked || !localTwoPlayer?.mode ||
+    !elements['player2-rom-select'].value;
 
   const canEnterRoom = activeGbaSelected() && !linkRoom && !localOpen;
   elements['link-create'].disabled = !canEnterRoom;
@@ -651,8 +683,12 @@ class LocalTwoPlayerController {
   constructor() {
     this.enabled = false;
     this.active = false;
+    this.preparing = false;
+    this.playerTwoLoading = false;
+    this.playerTwoLoadGeneration = 0;
     this.mode = null;
     this.session = null;
+    this.ready = [false, false];
     this.lastPairSequence = -1;
     this.lastReleaseSequence = -1;
     this.guestHandshakePending = false;
@@ -703,10 +739,9 @@ class LocalTwoPlayerController {
     elements['local-2p-toggle'].textContent = 'Exit 2P';
     elements['player2-choice'].hidden = false;
     elements['player2-runtime'].hidden = true;
+    elements['player2-toolbar'].hidden = true;
     elements['player2-visitor'].hidden = true;
-    elements['local-p1-ready'].disabled = true;
-    elements['local-p2-ready'].disabled = true;
-    elements['local-start'].disabled = true;
+    this.clearReady();
     this.resizeObserver.observe(elements.workspace);
     window.visualViewport?.addEventListener('resize', this.boundUpdateLayout);
     window.addEventListener('resize', this.boundUpdateLayout);
@@ -745,12 +780,14 @@ class LocalTwoPlayerController {
     elements['player2-choice'].hidden = true;
     elements['player2-visitor'].hidden = true;
     elements['player2-runtime'].hidden = false;
+    elements['player2-toolbar'].hidden = false;
     elements['player2-logout'].hidden = mode !== 'account';
     elements['player2-account'].textContent = mode === 'guest'
       ? `${currentSession.account.name || currentSession.account.id} / Guest P2`
       : currentPlayer2Session.account.name || currentPlayer2Session.account.email ||
         currentPlayer2Session.account.id;
     this.renderRomCatalog();
+    applyControlState();
   }
 
   renderRomCatalog() {
@@ -772,6 +809,34 @@ class LocalTwoPlayerController {
     this.lastReleaseSequence = -1;
     this.checkpointSequence = 0;
     this.pendingCheckpoint = null;
+    this.lastCheckpoint = null;
+  }
+
+  bothRuntimesLoaded() {
+    return Boolean(playerOne.running && playerTwo.running &&
+      playerOne.activeRom?.platform === 'gba' && playerTwo.activeRom?.platform === 'gba');
+  }
+
+  clearReady() {
+    this.ready = [false, false];
+    this.renderReadyControls();
+  }
+
+  renderReadyControls() {
+    const canReady = this.enabled && this.bothRuntimesLoaded() && !this.playerTwoLoading &&
+      !this.preparing && !this.active;
+    for (const slot of [0, 1]) {
+      const button = elements[slot === 0 ? 'local-p1-ready' : 'local-p2-ready'];
+      button.disabled = !canReady;
+      button.textContent = this.ready[slot] ? `P${slot + 1} Not ready` : `P${slot + 1} Ready`;
+      button.setAttribute('aria-pressed', String(this.ready[slot]));
+    }
+    elements['local-start'].disabled = !canReady || !this.ready.every(Boolean);
+    if (this.active) elements['local-2p-status'].textContent = 'Local cable active';
+    else if (this.preparing) elements['local-2p-status'].textContent = 'Starting local cable';
+    else if (!this.bothRuntimesLoaded()) elements['local-2p-status'].textContent = 'Load both GBA players';
+    else if (this.ready.every(Boolean)) elements['local-2p-status'].textContent = 'Ready to start';
+    else elements['local-2p-status'].textContent = 'Players running independently';
   }
 
   async loadPlayerTwo() {
@@ -781,51 +846,215 @@ class LocalTwoPlayerController {
     const selected = roms.find((rom) =>
       rom.id === elements['player2-rom-select'].value && rom.platform === 'gba');
     if (!selected) throw new Error('Select a GBA ROM for Player 2');
-    if (this.session) await this.abortServerSession();
-    paused = true;
-    clearInterval(batteryTimer);
-    setStatus('Waiting for Player 2', 'loading');
-    const response = await apiFetch('/api/local-2p', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        player2Mode: this.mode,
-        player1RomId: activeRom.id,
-        player2RomId: selected.id,
-      }),
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || 'Local 2P setup failed');
-    this.session = body.session;
-    this.resetCableMetadata();
-    await this.loadRuntime(playerTwo, selected, this.mode);
-    elements['player2-screen-empty'].hidden = true;
-    elements['player2-mute'].disabled = false;
-    elements['local-p1-ready'].disabled = false;
-    elements['local-p2-ready'].disabled = false;
-    elements['local-2p-status'].textContent = 'Set both players ready';
+    if (this.preparing || this.active) throw new Error('Stop the local cable before loading another ROM');
+    if (this.playerTwoLoading) throw new Error('Player 2 is already loading');
+    const generation = ++this.playerTwoLoadGeneration;
+    const isCurrent = () => this.enabled && generation === this.playerTwoLoadGeneration;
+    const previous = playerTwo.running && playerTwo.activeRom ? {
+      rom: playerTwo.activeRom,
+      state: playerTwo.exportState(),
+      battery: playerTwo.core._vba_export_battery() ? playerTwo.exportBytes() : null,
+      paused: playerTwo.paused,
+      muted: playerTwo.muted,
+    } : null;
+    this.playerTwoLoading = true;
+    this.clearReady();
+    clearInterval(playerTwo.batteryTimer);
     applyControlState();
+    if (previous) playerTwo.paused = true;
+    playerTwo.setStatus('Loading ROM', 'loading');
+    let loadData = null;
+    let mutationStarted = false;
+    try {
+      if (previous) await persistStandaloneBattery(playerTwo, this.mode);
+      assertCurrentLoad(isCurrent);
+      loadData = await this.fetchRuntimeLoadData(selected, this.mode, null, isCurrent);
+      assertCurrentLoad(isCurrent);
+      mutationStarted = true;
+      await this.applyRuntimeLoad(playerTwo, selected, loadData, isCurrent);
+      elements['player2-screen-empty'].hidden = true;
+      elements['player2-mute'].disabled = false;
+      return true;
+    } catch (error) {
+      if (error.code === 'PLAYER2_LOAD_STALE') return false;
+      let failure = error;
+      if (previous) {
+        try {
+          if (mutationStarted) {
+            let previousRomBytes = previous.rom.id === selected.id ? loadData?.romBytes : null;
+            if (!previousRomBytes) {
+              const response = await apiFetch(`/api/roms/${previous.rom.id}/file`);
+              if (!response.ok) throw new Error('Previous Player 2 ROM recovery failed');
+              previousRomBytes = new Uint8Array(await response.arrayBuffer());
+            }
+            assertCurrentLoad(isCurrent);
+            await playerTwo.loadRom(previous.rom, previousRomBytes, isCurrent);
+            if (previous.battery) playerTwo.loadBattery(previous.battery);
+            playerTwo.loadState(previous.state);
+          }
+          playerTwo.paused = previous.paused;
+          playerTwo.muted = previous.muted;
+          playerTwo.setStatus(previous.paused ? 'Paused' : 'Running',
+            previous.paused ? 'idle' : 'running');
+        } catch (recoveryError) {
+          failure = new Error(`${error.message}; Player 2 recovery failed: ${recoveryError.message}`);
+        }
+      } else if (mutationStarted) {
+        playerTwo.shutdown();
+        elements['player2-screen-empty'].hidden = false;
+      } else {
+        playerTwo.setStatus('Idle', 'idle');
+      }
+      throw failure;
+    } finally {
+      if (generation === this.playerTwoLoadGeneration) {
+        this.playerTwoLoading = false;
+        if (playerTwo.running) restartPlayerTwoBatteryTimer();
+        this.renderReadyControls();
+        applyControlState();
+      }
+    }
+  }
+
+  async fetchRuntimeLoadData(rom, mode, checkpointState, isCurrent = () => true) {
+    assertCurrentLoad(isCurrent);
+    const romResponse = await apiFetch(`/api/roms/${rom.id}/file`);
+    if (!romResponse.ok) throw new Error('ROM download failed');
+    const romBytes = new Uint8Array(await romResponse.arrayBuffer());
+    assertCurrentLoad(isCurrent);
+    const savePrefix = `/api/player2/${mode}/saves`;
+    const batteryResponse = await apiFetch(`${savePrefix}/${rom.id}/battery`);
+    const batteryBytes = await optionalSaveBytes(batteryResponse, 'Player 2 battery request');
+    assertCurrentLoad(isCurrent);
+    let stateBytes = checkpointState ? base64Bytes(checkpointState) : null;
+    if (!stateBytes) {
+      const stateResponse = await apiFetch(`${savePrefix}/${rom.id}/state`);
+      stateBytes = await optionalSaveBytes(stateResponse, 'Player 2 state request');
+    }
+    assertCurrentLoad(isCurrent);
+    return { romBytes, batteryBytes, stateBytes };
+  }
+
+  async applyRuntimeLoad(runtime, rom, data, isCurrent = () => true) {
+    await runtime.loadRom(rom, data.romBytes, isCurrent);
+    assertCurrentLoad(isCurrent);
+    if (data.batteryBytes) runtime.loadBattery(data.batteryBytes);
+    if (data.stateBytes) runtime.loadState(data.stateBytes);
+    runtime.renderFrame();
   }
 
   async loadRuntime(runtime, rom, mode, checkpointState = null) {
     runtime.setStatus('Loading ROM', 'loading');
-    const romResponse = await apiFetch(`/api/roms/${rom.id}/file`);
-    if (!romResponse.ok) throw new Error('ROM download failed');
-    await runtime.loadRom(rom, new Uint8Array(await romResponse.arrayBuffer()));
-    const savePrefix = runtime.slot === 0 ? '/api/saves' : `/api/player2/${mode}/saves`;
-    const batteryResponse = await apiFetch(`${savePrefix}/${rom.id}/battery`);
-    if (batteryResponse.ok) runtime.loadBattery(new Uint8Array(await batteryResponse.arrayBuffer()));
-    if (checkpointState) {
-      runtime.loadState(base64Bytes(checkpointState));
-    } else if (runtime.slot === 1) {
-      const stateResponse = await apiFetch(`${savePrefix}/${rom.id}/state`);
-      if (stateResponse.ok) runtime.loadState(new Uint8Array(await stateResponse.arrayBuffer()));
+    if (runtime.slot === 0) {
+      const romResponse = await apiFetch(`/api/roms/${rom.id}/file`);
+      if (!romResponse.ok) throw new Error('ROM download failed');
+      await runtime.loadRom(rom, new Uint8Array(await romResponse.arrayBuffer()));
+      const batteryResponse = await apiFetch(`/api/saves/${rom.id}/battery`);
+      if (batteryResponse.ok) runtime.loadBattery(new Uint8Array(await batteryResponse.arrayBuffer()));
+      if (checkpointState) runtime.loadState(base64Bytes(checkpointState));
+      runtime.renderFrame();
+      return;
     }
-    runtime.renderFrame();
+    const data = await this.fetchRuntimeLoadData(rom, mode, checkpointState);
+    await this.applyRuntimeLoad(runtime, rom, data);
   }
 
   async setReady(slot) {
-    if (!this.session) throw new Error('Load Player 2 before readying');
+    if (!this.bothRuntimesLoaded()) throw new Error('Load both GBA players before readying');
+    if (this.preparing || this.active) return;
+    this.ready[slot] = !this.ready[slot];
+    this.renderReadyControls();
+  }
+
+  async start() {
+    if (this.preparing || this.active || this.playerTwoLoading) return;
+    if (!this.bothRuntimesLoaded() || !this.ready.every(Boolean)) {
+      throw new Error('Both loaded GBA players must be ready');
+    }
+    const previousPaused = [playerOne.paused, playerTwo.paused];
+    this.preparing = true;
+    playerOne.paused = true;
+    playerTwo.paused = true;
+    clearInterval(batteryTimer);
+    clearInterval(playerTwo.batteryTimer);
+    this.renderReadyControls();
+    applyControlState();
+    try {
+      await Promise.all([
+        persistStandaloneBattery(playerOne, 'account'),
+        persistStandaloneBattery(playerTwo, this.mode),
+      ]);
+      const response = await apiFetch('/api/local-2p', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          player2Mode: this.mode,
+          player1RomId: playerOne.activeRom.id,
+          player2RomId: playerTwo.activeRom.id,
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || 'Local 2P setup failed');
+      this.session = body.session;
+      this.resetCableMetadata();
+      await this.setServerReady(0);
+      await this.setServerReady(1);
+      await this.checkpoint(true);
+      if (!this.lastCheckpoint) throw new Error('Initial paired checkpoint failed');
+      const startResponse = await apiFetch(`/api/local-2p/${this.session.id}/start`, { method: 'POST' });
+      const startBody = await startResponse.json().catch(() => ({}));
+      if (!startResponse.ok) throw new Error(startBody.error || 'Local 2P start failed');
+      this.session = startBody.session;
+      if (!cableIdle() || !core._vba_link_set_player(0) ||
+          !playerTwo.core?._vba_link_set_player(1)) {
+        throw new Error('Both cable cores must be idle before Start');
+      }
+      this.active = true;
+      this.preparing = false;
+      paused = false;
+      playerTwo.paused = false;
+      playerTwo.running = true;
+      speedMode = false;
+      elements['speed-toggle'].setAttribute('aria-pressed', 'false');
+      elements['speed-toggle'].textContent = 'Speed off';
+      this.lastPairSequence = -1;
+      this.lastReleaseSequence = -1;
+      this.rollbackCount = 0;
+      this.renderReadyControls();
+      setStatus('Running / P1', 'running');
+      playerTwo.setStatus('Running / P2', 'running');
+      this.startTimers();
+      applyControlState();
+    } catch (error) {
+      let failure = error;
+      for (const runtime of [playerOne, playerTwo]) {
+        runtime.core?._vba_link_cancel_wait();
+        runtime.core?._vba_link_set_player(-1);
+      }
+      if (this.session) {
+        try {
+          await this.abortServerSession();
+        } catch (abortError) {
+          failure = new Error(`${error.message}; local abort failed: ${abortError.message}`);
+        }
+      }
+      this.session = null;
+      this.active = false;
+      this.preparing = false;
+      this.resetCableMetadata();
+      playerOne.paused = previousPaused[0];
+      playerTwo.paused = previousPaused[1];
+      setStatus(playerOne.paused ? 'Paused' : 'Running', playerOne.paused ? 'idle' : 'running');
+      playerTwo.setStatus(playerTwo.paused ? 'Paused' : 'Running', playerTwo.paused ? 'idle' : 'running');
+      restartBatteryTimer();
+      restartPlayerTwoBatteryTimer();
+      this.renderReadyControls();
+      applyControlState();
+      throw failure;
+    }
+  }
+
+  async setServerReady(slot) {
     const headers = { 'Content-Type': 'application/json' };
     if (slot === 1 && this.mode === 'account') {
       headers['X-Player2-CSRF-Token'] = currentPlayer2Session.csrfToken;
@@ -835,44 +1064,8 @@ class LocalTwoPlayerController {
       { method: 'POST', headers, body: JSON.stringify({ ready: true }) },
     );
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || 'Ready failed');
+    if (!response.ok) throw new Error(body.error || 'Server Ready failed');
     this.session = body.session;
-    elements[slot === 0 ? 'local-p1-ready' : 'local-p2-ready'].disabled = true;
-    const ready = this.session.participants.every((participant) => participant.ready);
-    elements['local-start'].disabled = !ready;
-    elements['local-2p-status'].textContent = ready ? 'Ready' : 'Waiting for other player';
-  }
-
-  async start() {
-    if (!this.session) return;
-    this.checkpointSequence = 0;
-    await this.checkpoint(true);
-    if (!this.lastCheckpoint) throw new Error('Initial paired checkpoint failed');
-    const response = await apiFetch(`/api/local-2p/${this.session.id}/start`, { method: 'POST' });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || 'Local 2P start failed');
-    this.session = body.session;
-    if (!cableIdle() || !core._vba_link_set_player(0) ||
-        !playerTwo.core?._vba_link_set_player(1)) {
-      await this.abortServerSession();
-      throw new Error('Both cable cores must be idle before Start');
-    }
-    this.active = true;
-    paused = false;
-    playerTwo.paused = false;
-    playerTwo.running = true;
-    speedMode = false;
-    this.lastPairSequence = -1;
-    this.lastReleaseSequence = -1;
-    this.rollbackCount = 0;
-    elements['local-start'].disabled = true;
-    elements['local-p1-ready'].disabled = true;
-    elements['local-p2-ready'].disabled = true;
-    elements['local-2p-status'].textContent = 'Local cable active';
-    setStatus('Running / P1', 'running');
-    playerTwo.setStatus('Running / P2', 'running');
-    this.startTimers();
-    applyControlState();
   }
 
   startTimers() {
@@ -921,6 +1114,21 @@ class LocalTwoPlayerController {
     playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
   }
 
+  stepIndependent(timestamp) {
+    if (!this.enabled || this.active || this.preparing || !playerTwo.running || !playerTwo.core) return;
+    const elapsed = playerTwo.lastFrameTime ? Math.min(timestamp - playerTwo.lastFrameTime, 100) : 0;
+    playerTwo.lastFrameTime = timestamp;
+    playerTwo.frameDebt += elapsed;
+    const frameDuration = 1000 / FRAME_RATE;
+    let frames = 0;
+    while (!playerTwo.paused && playerTwo.frameDebt >= frameDuration && frames < 3) {
+      playerTwo.runFrame();
+      playerTwo.frameDebt -= frameDuration;
+      ++frames;
+    }
+    playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
+  }
+
   exchangeCable() {
     const result = applyDirectCablePair(playerOne.core, playerTwo.core, {
       lastPairSequence: this.lastPairSequence,
@@ -940,7 +1148,7 @@ class LocalTwoPlayerController {
   }
 
   runDirectCableProbe() {
-    if (!this.session || this.active || !playerOne.core || !playerTwo.core) {
+    if (this.active || this.preparing || !playerOne.core || !playerTwo.core) {
       throw new Error('Direct cable probe requires two loaded inactive runtimes');
     }
     const host = playerOne.core;
@@ -1037,6 +1245,8 @@ class LocalTwoPlayerController {
         }
       } else if (this.session) {
         await this.abortServerSession();
+      } else if (playerTwo.running) {
+        await persistStandaloneBattery(playerTwo, this.mode);
       }
     } catch (error) {
       failure = error;
@@ -1113,6 +1323,9 @@ class LocalTwoPlayerController {
     playerTwo.shutdown();
     elements['player2-mute'].textContent = 'Unmute';
     this.active = false;
+    this.preparing = false;
+    ++this.playerTwoLoadGeneration;
+    this.playerTwoLoading = false;
     this.enabled = false;
     this.mode = null;
     this.session = null;
@@ -1124,6 +1337,7 @@ class LocalTwoPlayerController {
     elements['local-2p-toggle'].textContent = '2P';
     elements['player2-screen-empty'].hidden = false;
     elements['player2-runtime'].hidden = true;
+    elements['player2-toolbar'].hidden = true;
     elements['player2-choice'].hidden = false;
     elements['player2-logout'].hidden = true;
     this.resizeObserver.disconnect();
@@ -1172,12 +1386,14 @@ class LocalTwoPlayerController {
     }
     this.lastCheckpoint = recovered.checkpoint;
     this.active = true;
+    this.preparing = false;
     setControls(true);
     elements['player2-mute'].disabled = false;
     this.startTimers();
     startLoop();
     setStatus('Running / P1', 'running');
     playerTwo.setStatus('Running / P2', 'running');
+    this.renderReadyControls();
     elements['local-2p-status'].textContent = 'Recovered paired checkpoint';
     applyControlState();
   }
@@ -1197,6 +1413,15 @@ function base64Bytes(value) {
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; ++index) bytes[index] = binary.charCodeAt(index);
   return bytes;
+}
+
+function hashBytes(bytes) {
+  let hash = 2166136261;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
 }
 
 localTwoPlayer = new LocalTwoPlayerController();
@@ -1250,6 +1475,7 @@ function animationLoop(timestamp) {
   drainLinkMessages();
   maybeSendLinkRelease();
   if (linkRoom?.status === 'active') updateLinkIdleGate(timestamp);
+  localTwoPlayer?.stepIndependent(timestamp);
   animationHandle = requestAnimationFrame(animationLoop);
 }
 
@@ -1819,8 +2045,173 @@ async function finishLinkRoom() {
 
 function restartBatteryTimer() {
   clearInterval(batteryTimer);
-  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer?.enabled) {
+  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer?.preparing && !localTwoPlayer?.active) {
     batteryTimer = setInterval(() => saveBattery(false).catch((error) => logEvent(error.message, true)), 10000);
+  }
+}
+
+function batterySaveIdentity(runtime, mode) {
+  const owner = runtime.slot === 0 || mode === 'guest' ? currentSession : currentPlayer2Session;
+  return {
+    accountId: owner?.account?.id,
+    csrfToken: owner?.csrfToken,
+  };
+}
+
+function clearStandaloneBatteryRecovery(slot, mode, accountId, romId) {
+  try {
+    const records = JSON.parse(sessionStorage.getItem(STANDALONE_BATTERY_RECOVERY_KEY) || '[]');
+    if (!Array.isArray(records)) return;
+    const remaining = records.filter((record) =>
+      record.slot !== slot || record.mode !== mode || record.accountId !== accountId ||
+      record.romId !== romId);
+    if (remaining.length) {
+      sessionStorage.setItem(STANDALONE_BATTERY_RECOVERY_KEY, JSON.stringify(remaining));
+    } else {
+      sessionStorage.removeItem(STANDALONE_BATTERY_RECOVERY_KEY);
+    }
+  } catch {
+    sessionStorage.removeItem(STANDALONE_BATTERY_RECOVERY_KEY);
+  }
+}
+
+function queueBatteryWrite(runtime, mode, { romId, accountId, csrfToken, bytes }) {
+  validateBattery(bytes);
+  const save = async () => {
+    const prefix = runtime.slot === 0 ? '/api/saves' : `/api/player2/${mode}/saves`;
+    const response = await apiFetch(`${prefix}/${romId}/battery`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        ...(runtime.slot === 1 && mode === 'account'
+          ? { 'X-Player2-CSRF-Token': csrfToken }
+          : { 'X-CSRF-Token': csrfToken }),
+      },
+      body: bytes,
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error || `P${runtime.slot + 1} battery save failed`);
+    }
+    clearStandaloneBatteryRecovery(runtime.slot, mode, accountId, romId);
+    return bytes.byteLength;
+  };
+  runtime.batterySavePromise = runtime.batterySavePromise.catch(() => {}).then(save);
+  return runtime.batterySavePromise;
+}
+
+function persistStandaloneBattery(runtime, mode) {
+  if (!runtime.running || !runtime.activeRom || !runtime.core) return Promise.resolve(false);
+  const romId = runtime.activeRom.id;
+  const { accountId, csrfToken } = batterySaveIdentity(runtime, mode);
+  if (!accountId || !csrfToken || !runtime.core._vba_export_battery()) return Promise.resolve(false);
+  return queueBatteryWrite(runtime, mode, {
+    romId, accountId, csrfToken, bytes: runtime.exportBytes(),
+  });
+}
+
+function restartPlayerTwoBatteryTimer() {
+  clearInterval(playerTwo.batteryTimer);
+  if (localTwoPlayer?.enabled && playerTwo.running &&
+      !localTwoPlayer.preparing && !localTwoPlayer.active) {
+    playerTwo.batteryTimer = setInterval(() => {
+      persistStandaloneBattery(playerTwo, localTwoPlayer.mode)
+        .catch((error) => logEvent(error.message, true));
+    }, 10000);
+  }
+}
+
+function stashStandaloneBatteries() {
+  const records = [];
+  for (const [runtime, mode, accountId] of [
+    [playerOne, 'account', currentSession?.account?.id],
+    [playerTwo, localTwoPlayer?.mode, localTwoPlayer?.mode === 'account'
+      ? currentPlayer2Session?.account?.id : currentSession?.account?.id],
+  ]) {
+    if (!runtime.running || !runtime.activeRom || !runtime.core || !accountId) continue;
+    if (!runtime.core._vba_export_battery()) continue;
+    const bytes = runtime.exportBytes();
+    validateBattery(bytes);
+    records.push({ slot: runtime.slot, mode, accountId, romId: runtime.activeRom.id,
+      data: bytesBase64(bytes) });
+  }
+  try {
+    if (records.length) {
+      const existing = JSON.parse(sessionStorage.getItem(STANDALONE_BATTERY_RECOVERY_KEY) || '[]');
+      const merged = new Map((Array.isArray(existing) ? existing : []).map((record) => [
+        `${record.slot}:${record.mode}:${record.accountId}:${record.romId}`, record,
+      ]));
+      for (const record of records) {
+        merged.set(`${record.slot}:${record.mode}:${record.accountId}:${record.romId}`, record);
+      }
+      sessionStorage.setItem(STANDALONE_BATTERY_RECOVERY_KEY,
+        JSON.stringify([...merged.values()]));
+    }
+  } catch (error) {
+    logEvent(`Reload battery recovery unavailable / ${error.message}`, true);
+  }
+}
+
+async function flushStandaloneBatteryRecovery() {
+  let records;
+  try {
+    records = JSON.parse(sessionStorage.getItem(STANDALONE_BATTERY_RECOVERY_KEY) || '[]');
+  } catch {
+    sessionStorage.removeItem(STANDALONE_BATTERY_RECOVERY_KEY);
+    return;
+  }
+  if (!Array.isArray(records) || !records.length) return;
+  const needsPlayer2 = records.some((record) => record?.slot === 1 && record.mode === 'account');
+  const player2Response = needsPlayer2
+    ? await fetch('/api/player2/session', { cache: 'no-store' }).catch(() => null)
+    : null;
+  let player2OwnerResolved = false;
+  if (player2Response?.ok) {
+    const result = await player2Response.json();
+    if (result.authenticated) {
+      currentPlayer2Session = result;
+      player2OwnerResolved = true;
+    }
+  }
+  const remaining = [];
+  for (const record of records) {
+    if (![0, 1].includes(record?.slot) || !['account', 'guest'].includes(record?.mode) ||
+        typeof record.accountId !== 'string' || typeof record.romId !== 'string' ||
+        !roms.some((rom) => rom.id === record.romId)) continue;
+    let bytes;
+    try {
+      bytes = base64Bytes(record.data);
+      validateBattery(bytes);
+    } catch {
+      continue;
+    }
+    let owner;
+    if (record.slot === 1 && record.mode === 'account') {
+      if (!player2OwnerResolved) {
+        remaining.push(record);
+        continue;
+      }
+      owner = currentPlayer2Session;
+    } else {
+      owner = currentSession;
+    }
+    if (!owner || owner.account.id !== record.accountId) continue;
+    const runtime = record.slot === 0 ? playerOne : playerTwo;
+    try {
+      await queueBatteryWrite(runtime, record.mode, {
+        romId: record.romId,
+        accountId: record.accountId,
+        csrfToken: owner.csrfToken,
+        bytes,
+      });
+    } catch {
+      remaining.push(record);
+    }
+  }
+  if (remaining.length) {
+    sessionStorage.setItem(STANDALONE_BATTERY_RECOVERY_KEY, JSON.stringify(remaining));
+  } else {
+    sessionStorage.removeItem(STANDALONE_BATTERY_RECOVERY_KEY);
   }
 }
 
@@ -1874,24 +2265,34 @@ async function loadQuickState() {
 }
 
 async function saveBattery(showLog = true) {
-  if (!activeRom || !core._vba_export_battery()) return;
-  const bytes = getExportBytes();
-  validateBattery(bytes);
-  await putAccountSave('battery', bytes);
-  if (showLog) logEvent(`Battery saved (${bytes.byteLength} bytes)`);
+  const size = await persistStandaloneBattery(playerOne, 'account');
+  if (!size) return false;
+  if (showLog) logEvent(`Battery saved (${size} bytes)`);
   await updateStoredStateControls();
+  return true;
 }
 
 async function loadBatteryBytes(bytes, source, persist = false) {
   validateBattery(bytes);
   const result = withCoreBytes(bytes, (pointer, size) => core._vba_load_battery(pointer, size));
   if (!result) throw new Error(coreError('Battery load failed'));
-  if (persist) await putAccountSave('battery', bytes);
+  if (persist) {
+    const { accountId, csrfToken } = batterySaveIdentity(playerOne, 'account');
+    await queueBatteryWrite(playerOne, 'account', {
+      romId: activeRom.id, accountId, csrfToken, bytes,
+    });
+  }
   logEvent(`${source} loaded (${bytes.byteLength} bytes)`);
   await updateStoredStateControls();
 }
 
 async function putAccountSave(kind, bytes) {
+  if (kind === 'battery') {
+    const { accountId, csrfToken } = batterySaveIdentity(playerOne, 'account');
+    return queueBatteryWrite(playerOne, 'account', {
+      romId: activeRom.id, accountId, csrfToken, bytes,
+    });
+  }
   const response = await apiFetch(`/api/saves/${activeRom.id}/${kind}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/octet-stream' },
@@ -1919,53 +2320,71 @@ function exportName(extension) {
 
 async function loadSelectedRom() {
   if (isLinkRoomOpen()) throw new Error('Close the link room before loading another ROM');
-  if (localTwoPlayer?.session) throw new Error('Exit local 2P before loading another ROM');
+  if (localTwoPlayer?.preparing || localTwoPlayer?.active) {
+    throw new Error('Stop the local cable before loading another ROM');
+  }
   const selected = roms.find((rom) => rom.id === elements['rom-select'].value);
   if (!selected) return;
+  if (localTwoPlayer?.enabled) localTwoPlayer.clearReady();
+  const previousRunning = Boolean(activeRom && core && running);
+  if (previousRunning) {
+    clearInterval(batteryTimer);
+    await persistStandaloneBattery(playerOne, 'account');
+  }
   setStatus('Loading ROM', 'loading');
   setControls(false);
-  await ensureCore();
-  await ensureAudio();
-  const response = await apiFetch(`/api/roms/${selected.id}/file`);
-  if (!response.ok) throw new Error('ROM download failed');
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  const isGba = selected.platform === 'gba';
-  romIdentity = ascii(bytes.subarray(isGba ? 0xa0 : 0x134, isGba ? 0xb0 : 0x143));
-  const result = withCoreBytes(bytes, (pointer, size) =>
-    core._vba_load_rom(pointer, size, isGba ? 0 : 1));
-  if (!result) throw new Error(coreError('ROM load failed'));
-  linkCorePlayer = -1;
-  linkDetachPending = false;
-  linkTransferActive = false;
-  linkMessageQueue.clear();
-  frameWidth = core._vba_frame_width();
-  frameHeight = core._vba_frame_height();
-  elements.screen.width = frameWidth;
-  elements.screen.height = frameHeight;
-  elements['screen-shell'].style.aspectRatio = `${frameWidth} / ${frameHeight}`;
-  imageData = canvasContext.createImageData(frameWidth, frameHeight);
-  speedMode = false;
-  elements['speed-toggle'].setAttribute('aria-pressed', 'false');
-  elements['speed-toggle'].textContent = 'Speed off';
-  activeRom = selected;
-  elements['screen-empty'].hidden = true;
-  elements['rom-meta'].textContent = `${selected.platform.toUpperCase()} / ${selected.title} / rev ${selected.revision} / ${(selected.size / 1048576).toFixed(1)} MiB`;
+  try {
+    await ensureCore();
+    await ensureAudio();
+    const response = await apiFetch(`/api/roms/${selected.id}/file`);
+    if (!response.ok) throw new Error('ROM download failed');
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const isGba = selected.platform === 'gba';
+    romIdentity = ascii(bytes.subarray(isGba ? 0xa0 : 0x134, isGba ? 0xb0 : 0x143));
+    const result = withCoreBytes(bytes, (pointer, size) =>
+      core._vba_load_rom(pointer, size, isGba ? 0 : 1));
+    if (!result) throw new Error(coreError('ROM load failed'));
+    linkCorePlayer = -1;
+    linkDetachPending = false;
+    linkTransferActive = false;
+    linkMessageQueue.clear();
+    frameWidth = core._vba_frame_width();
+    frameHeight = core._vba_frame_height();
+    elements.screen.width = frameWidth;
+    elements.screen.height = frameHeight;
+    elements['screen-shell'].style.aspectRatio = `${frameWidth} / ${frameHeight}`;
+    imageData = canvasContext.createImageData(frameWidth, frameHeight);
+    speedMode = false;
+    elements['speed-toggle'].setAttribute('aria-pressed', 'false');
+    elements['speed-toggle'].textContent = 'Speed off';
+    activeRom = selected;
+    elements['screen-empty'].hidden = true;
+    elements['rom-meta'].textContent = `${selected.platform.toUpperCase()} / ${selected.title} / rev ${selected.revision} / ${(selected.size / 1048576).toFixed(1)} MiB`;
 
-  const batteryResponse = await apiFetch(`/api/saves/${selected.id}/battery`);
-  if (batteryResponse.ok) {
-    await loadBatteryBytes(new Uint8Array(await batteryResponse.arrayBuffer()), 'Account battery');
-  }
-  const stateResponse = await apiFetch(`/api/saves/${selected.id}/state`);
-  if (stateResponse.ok) {
-    await loadStateBytes(new Uint8Array(await stateResponse.arrayBuffer()), 'Account state');
-  }
+    const batteryResponse = await apiFetch(`/api/saves/${selected.id}/battery`);
+    if (batteryResponse.ok) {
+      await loadBatteryBytes(new Uint8Array(await batteryResponse.arrayBuffer()), 'Account battery');
+    }
+    const stateResponse = await apiFetch(`/api/saves/${selected.id}/state`);
+    if (stateResponse.ok) {
+      await loadStateBytes(new Uint8Array(await stateResponse.arrayBuffer()), 'Account state');
+    }
 
-  setControls(true);
-  renderFixtures();
-  await updateStoredStateControls();
-  startLoop();
-  restartBatteryTimer();
-  logEvent(`ROM loaded / ${selected.gameCode}`);
+    setControls(true);
+    renderFixtures();
+    await updateStoredStateControls();
+    startLoop();
+    restartBatteryTimer();
+    localTwoPlayer?.renderReadyControls();
+    logEvent(`ROM loaded / ${selected.gameCode}`);
+  } catch (error) {
+    if (previousRunning && activeRom && core) {
+      setControls(true);
+      setStatus('Running', 'running');
+      restartBatteryTimer();
+    }
+    throw error;
+  }
 }
 
 async function refreshCatalog() {
@@ -2099,6 +2518,7 @@ async function bootstrap() {
   showAuthView('app');
   setControls(false);
   await refreshCatalog();
+  await flushStandaloneBatteryRecovery();
   setStatus('Idle', 'idle');
   logEvent('Catalog ready');
   await localTwoPlayer.runGuarded(() => localTwoPlayer.recover());
@@ -2173,10 +2593,14 @@ player2AuthChannel.addEventListener('message', (event) => {
   });
 });
 elements['player2-visitor-back'].addEventListener('click', () => runAction(async () => {
-  await apiFetch('/auth/player2/logout', {
+  const response = await apiFetch('/auth/player2/logout', {
     method: 'POST',
     headers: { 'X-Player2-CSRF-Token': currentPlayer2Session.csrfToken },
   });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(body.error || `Player 2 logout failed (${response.status})`);
+  }
   currentPlayer2Session = null;
   elements['player2-visitor'].hidden = true;
   elements['player2-choice'].hidden = false;
@@ -2192,11 +2616,15 @@ elements['player2-request-access'].addEventListener('click', () => runAction(asy
 }));
 elements['player2-logout'].addEventListener('click', () => runAction(() => localTwoPlayer.exit()));
 elements['player2-load'].addEventListener('click', () => runAction(() =>
-  localTwoPlayer.runGuarded(() => localTwoPlayer.loadPlayerTwo())));
+  localTwoPlayer.loadPlayerTwo()));
+elements['rom-select'].addEventListener('change', () => {
+  if (localTwoPlayer.enabled) localTwoPlayer.clearReady();
+});
+elements['player2-rom-select'].addEventListener('change', () => localTwoPlayer.clearReady());
 elements['local-p1-ready'].addEventListener('click', () => runAction(() => localTwoPlayer.setReady(0)));
 elements['local-p2-ready'].addEventListener('click', () => runAction(() => localTwoPlayer.setReady(1)));
 elements['local-start'].addEventListener('click', () => runAction(() =>
-  localTwoPlayer.runGuarded(() => localTwoPlayer.start())));
+  localTwoPlayer.start()));
 elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   const file = elements['rom-upload'].files[0];
   if (!file) return;
@@ -2336,12 +2764,35 @@ for (const button of document.querySelectorAll('[data-button]')) {
 
 window.addEventListener('pagehide', () => {
   player2AuthChannel.close();
-  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer.enabled) saveBattery(false).catch(() => {});
+  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer.preparing && !localTwoPlayer.active) {
+    stashStandaloneBatteries();
+    persistStandaloneBattery(playerOne, 'account').catch(() => {});
+  }
+  if (localTwoPlayer.enabled && playerTwo.running &&
+      !localTwoPlayer.preparing && !localTwoPlayer.active) {
+    persistStandaloneBattery(playerTwo, localTwoPlayer.mode).catch(() => {});
+  }
 });
 
 window.__gbaPoc = {
   checkpointLocal() {
     return localTwoPlayer.checkpoint();
+  },
+  flushStandaloneBatteries() {
+    return Promise.all([
+      persistStandaloneBattery(playerOne, 'account'),
+      localTwoPlayer.enabled && playerTwo.running
+        ? persistStandaloneBattery(playerTwo, localTwoPlayer.mode) : false,
+    ]);
+  },
+  flushBatteryRecovery() {
+    return flushStandaloneBatteryRecovery();
+  },
+  batteryHash(slot) {
+    const runtime = slot === 1 ? playerTwo : playerOne;
+    if (!runtime.core?._vba_export_battery()) return null;
+    const bytes = runtime.exportBytes();
+    return { hash: hashBytes(bytes), size: bytes.byteLength };
   },
   diagnostics() {
     const pixels = canvasContext.getImageData(0, 0, frameWidth, frameHeight).data;
@@ -2404,6 +2855,7 @@ window.__gbaPoc = {
       players: [playerOne, playerTwo].map((runtime) => ({
         slot: runtime.slot,
         running: runtime.running,
+        paused: runtime.paused,
         activeRom: runtime.activeRom?.id || null,
         frameCount: runtime.core ? Number(runtime.core._vba_frame_counter()) : 0,
         audioSamples: runtime.core ? Number(runtime.core._vba_audio_total_samples()) : 0,
@@ -2418,9 +2870,13 @@ window.__gbaPoc = {
       })),
       coresDistinct: Boolean(playerOne.core && playerTwo.core && playerOne.core !== playerTwo.core &&
         playerOne.core.HEAPU8.buffer !== playerTwo.core.HEAPU8.buffer),
+      standaloneAutosave: [Boolean(batteryTimer), Boolean(playerTwo.batteryTimer)],
       player2VisiblePixels,
       localTwoPlayer: localTwoPlayer.enabled ? {
         active: localTwoPlayer.active,
+        preparing: localTwoPlayer.preparing,
+        playerTwoLoading: localTwoPlayer.playerTwoLoading,
+        ready: [...localTwoPlayer.ready],
         mode: localTwoPlayer.mode,
         status: localTwoPlayer.session?.status || null,
         sessionId: localTwoPlayer.session?.id || null,

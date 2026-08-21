@@ -494,7 +494,7 @@ test('two authenticated browser sessions exchange a cable word and atomically co
   }
 }));
 
-test('local 2P account and guest profiles are isolated and paired persistence blocks remote Rooms', () => withServer(async ({ origin }) => {
+test('standalone local players remain unlocked until one paired Start transaction', () => withServer(async ({ origin, app }) => {
   const player1 = await login(origin, 'local-player-one', 'user');
   const player2 = await loginPlayer2(origin, 'local-player-two', 'user');
   const cookie = `${player1.headers.Cookie}; ${player2.cookie}`;
@@ -526,7 +526,16 @@ test('local 2P account and guest profiles are isolated and paired persistence bl
   assert.deepEqual(Buffer.from(await fetch(`${origin}/api/player2/account/saves/${rom.id}/battery`, {
     headers,
   }).then((response) => response.arrayBuffer())), player2Battery);
+  assert.equal(app.database.localLinkSessions.size, 0);
+  assert.equal(app.database.localSaveLocks.size, 0);
+  assert.equal(app.database.playAdmissionLocks.size, 0);
 
+  let startCalls = 0;
+  const originalStart = app.localLinkService.start.bind(app.localLinkService);
+  app.localLinkService.start = async (options) => {
+    ++startCalls;
+    return originalStart(options);
+  };
   const created = await fetch(`${origin}/api/local-2p`, {
     method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -535,6 +544,8 @@ test('local 2P account and guest profiles are isolated and paired persistence bl
   });
   assert.equal(created.status, 201);
   const localSession = (await created.json()).session;
+  assert.equal(app.database.localLinkSessions.size, 1);
+  assert.equal(app.database.localSaveLocks.size, 2);
   assert.equal((await fetch(`${origin}/api/link/rooms`, {
     method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
     body: JSON.stringify({ romId: rom.id }),
@@ -558,6 +569,7 @@ test('local 2P account and guest profiles are isolated and paired persistence bl
   assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/start`, {
     method: 'POST', headers,
   })).status, 200);
+  assert.equal(startCalls, 1);
   const finalOne = Buffer.alloc(131072, 0x41);
   const finalTwo = Buffer.alloc(131072, 0x42);
   assert.equal((await fetch(`${origin}/api/local-2p/${localSession.id}/finish`, {

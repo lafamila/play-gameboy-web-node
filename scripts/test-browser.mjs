@@ -218,7 +218,8 @@ async function main() {
     assert.equal(await evaluate('document.querySelector(".topbar")'), null);
     assert.equal(await evaluate('document.getElementById("account-permission")'), null);
     assert.equal(await evaluate('document.getElementById("app-menu-panel").hidden'), true);
-    assert.equal(await evaluate('document.querySelectorAll(".rom-toolbar > *").length'), 3);
+    assert.equal(await evaluate('document.querySelectorAll(".rom-toolbar > .rom-toolbar-player").length'), 2);
+    assert.equal(await evaluate('document.querySelectorAll(".rom-toolbar-player-one > *").length'), 3);
     await click('menu-toggle');
     assert.equal(await evaluate('document.getElementById("app-menu-panel").hidden'), false);
     assert.equal(await evaluate('document.getElementById("menu-toggle").getAttribute("aria-expanded")'), 'true');
@@ -378,25 +379,70 @@ async function main() {
       'document.getElementById("player2-visitor-status").innerText.includes("pending")',
       'Player 2 visitor request',
     );
+    const beforePlayerTwoVisitorLogout = await evaluate(
+      'document.querySelector("#event-log li")?.innerText || ""',
+    );
     await click('player2-visitor-back');
-    await waitExpression('!document.getElementById("player2-choice").hidden', 'Player 2 visitor logout');
+    await waitExpression(
+      `!document.getElementById('player2-choice').hidden || ` +
+      `(document.querySelector('#event-log li')?.innerText || '') !== ` +
+      `${JSON.stringify(beforePlayerTwoVisitorLogout)}`,
+      'Player 2 visitor logout result',
+    );
+    const playerTwoSessionAfterVisitorLogout = await evaluate(`fetch('/api/player2/session', {
+      cache: 'no-store'
+    }).then(async response => ({status: response.status, body: await response.json()}))`);
+    assert.equal(playerTwoSessionAfterVisitorLogout.status, 200,
+      JSON.stringify(playerTwoSessionAfterVisitorLogout));
+    assert.equal(playerTwoSessionAfterVisitorLogout.body.authenticated, false,
+      JSON.stringify(playerTwoSessionAfterVisitorLogout));
+    assert.equal(await evaluate('!document.getElementById("player2-choice").hidden'), true,
+      JSON.stringify(playerTwoSessionAfterVisitorLogout));
     await click('local-exit');
     await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null', 'close visitor setup');
     await click('local-2p-toggle');
-    await waitExpression('!document.getElementById("player2-choice").hidden', 'Player 2 BroadcastChannel setup');
+    await waitExpression(
+      '!document.getElementById("player2-choice").hidden || document.querySelector("#event-log li.error")',
+      'Player 2 BroadcastChannel setup result',
+    );
+    const playerTwoSetupResult = await evaluate(`({
+      choiceVisible: !document.getElementById('player2-choice').hidden,
+      diagnostics: window.__gbaPoc.diagnostics(),
+      event: document.querySelector('#event-log li')?.innerText || ''
+    })`);
+    assert.equal(playerTwoSetupResult.choiceVisible, true, JSON.stringify(playerTwoSetupResult));
     assert.equal(await evaluate(`fetch('/__test/player2/session', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({accountId: 'browser-player-two', permission: 'user', name: 'Browser Player Two'})
     }).then(response => response.ok)`), true);
-    assert.equal(await evaluate(`Promise.all([
+    const seededPlayerTwoBatteryHash = await evaluate(`Promise.all([
       fetch('/api/player2/session').then(response => response.json()),
       fetch('/api/saves/${localRomId}/state').then(response => response.arrayBuffer())
-    ]).then(([session, state]) => fetch('/api/player2/account/saves/${localRomId}/state', {
-      method: 'PUT',
-      headers: {'X-Player2-CSRF-Token': session.csrfToken, 'Content-Type': 'application/gzip'},
-      body: state
-    })).then(response => response.ok)`), true);
+    ]).then(async ([session, state]) => {
+      const battery = new Uint8Array(131072);
+      for (let index = 0; index < battery.length; ++index) battery[index] = (index * 37 + 11) & 255;
+      let hash = 2166136261;
+      for (const byte of battery) {
+        hash ^= byte;
+        hash = Math.imul(hash, 16777619) >>> 0;
+      }
+      const responses = await Promise.all([
+        fetch('/api/player2/account/saves/${localRomId}/state', {
+          method: 'PUT',
+          headers: {'X-Player2-CSRF-Token': session.csrfToken, 'Content-Type': 'application/gzip'},
+          body: state
+        }),
+        fetch('/api/player2/account/saves/${localRomId}/battery', {
+          method: 'PUT',
+          headers: {'X-Player2-CSRF-Token': session.csrfToken,
+            'Content-Type': 'application/octet-stream'},
+          body: battery
+        })
+      ]);
+      if (!responses.every(response => response.ok)) throw new Error('P2 save seed failed');
+      return hash.toString(16).padStart(8, '0');
+    })`);
     await evaluate(`(() => {
       const NativeWebSocket = window.WebSocket;
       window.__localWebSocketCount = 0;
@@ -406,6 +452,58 @@ async function main() {
           return Reflect.construct(Target, args);
         }
       });
+      const nativeFetch = window.fetch;
+      window.__localRequestCounts = {};
+      window.__localEvents = [];
+      window.__requestSequences = {};
+      window.__romFileRequestCount = 0;
+      window.fetch = (...args) => {
+        const path = new URL(String(args[0]), location.href).pathname;
+        const method = String(args[1]?.method || 'GET').toUpperCase();
+        const tracked = path === '/api/local-2p' ||
+          (path.startsWith('/api/local-2p/') && path !== '/api/local-2p/recover') ||
+          (method === 'PUT' && path.endsWith('/battery'));
+        let sequence = 0;
+        if (tracked) {
+          sequence = (window.__requestSequences[path] || 0) + 1;
+          window.__requestSequences[path] = sequence;
+          window.__localEvents.push('request:' + path + ':' + sequence);
+        }
+        if (path === '/api/local-2p' ||
+            (path.startsWith('/api/local-2p/') && path !== '/api/local-2p/recover')) {
+          window.__localRequestCounts[path] = (window.__localRequestCounts[path] || 0) + 1;
+        }
+        const romFile = path.endsWith('/file') && path.startsWith('/api/roms/');
+        if (romFile) {
+          window.__romFileRequestCount += 1;
+        }
+        const delayMs = romFile ? Number(window.__romFileDelayMs || 0) : 0;
+        if (romFile) window.__romFileDelayMs = 0;
+        let request;
+        if (method === 'GET' && path.includes('/api/player2/') && path.endsWith('/battery') &&
+            window.__failNextPlayerTwoBattery) {
+          window.__failNextPlayerTwoBattery = false;
+          request = Promise.resolve(new Response(JSON.stringify({error: 'simulated battery failure'}), {
+            status: 500, headers: {'Content-Type': 'application/json'}
+          }));
+        } else {
+          request = delayMs
+            ? new Promise(resolve => setTimeout(resolve, delayMs)).then(() => nativeFetch(...args))
+            : nativeFetch(...args);
+        }
+        return request.then(async response => {
+          if (tracked && method === 'PUT' && path.endsWith('/battery') &&
+              window.__batteryResponseDelays > 0) {
+            --window.__batteryResponseDelays;
+            await new Promise(resolve => setTimeout(resolve, 250));
+          }
+          if (tracked) window.__localEvents.push('response:' + path + ':' + sequence);
+          return response;
+        }, error => {
+          if (tracked) window.__localEvents.push('rejection:' + path + ':' + sequence);
+          throw error;
+        });
+      };
     })()`);
     await evaluate(`(() => {
       const channel = new BroadcastChannel('gbc-player2-auth');
@@ -413,24 +511,153 @@ async function main() {
       channel.close();
     })()`);
     await waitExpression('!document.getElementById("player2-runtime").hidden', 'Player 2 account panel');
+    assert.equal(await evaluate(`(async () => {
+      const [session, battery] = await Promise.all([
+        fetch('/api/player2/session').then(response => response.json()),
+        fetch('/api/player2/account/saves/${localRomId}/battery')
+          .then(response => response.arrayBuffer()).then(buffer => new Uint8Array(buffer))
+      ]);
+      let binary = '';
+      for (let offset = 0; offset < battery.length; offset += 0x8000) {
+        binary += String.fromCharCode(...battery.subarray(offset, offset + 0x8000));
+      }
+      sessionStorage.setItem('gbc-standalone-battery-recovery', JSON.stringify([{
+        slot: 1, mode: 'account', accountId: session.account.id,
+        romId: ${JSON.stringify(localRomId)}, data: btoa(binary)
+      }]));
+      const nativeFetch = window.fetch;
+      let unresolved = true;
+      window.fetch = (...args) => {
+        const path = new URL(String(args[0]), location.href).pathname;
+        if (unresolved && path === '/api/player2/session') {
+          unresolved = false;
+          return Promise.resolve(new Response(JSON.stringify({authenticated: false}), {
+            status: 200, headers: {'Content-Type': 'application/json'}
+          }));
+        }
+        return nativeFetch(...args);
+      };
+      await window.__gbaPoc.flushBatteryRecovery();
+      const retained = JSON.parse(sessionStorage.getItem('gbc-standalone-battery-recovery'))
+        .some(record => record.slot === 1 && record.mode === 'account');
+      window.fetch = nativeFetch;
+      await window.__gbaPoc.flushBatteryRecovery();
+      return retained && sessionStorage.getItem('gbc-standalone-battery-recovery') === null;
+    })()`), true);
     await evaluate(`document.getElementById('player2-rom-select').value = ${JSON.stringify(localRomId)}`);
+    const p1BeforeP2Load = await evaluate('window.__gbaPoc.diagnostics().players[0].emulationSteps');
+    const romRequestsBeforeInitialP2Load = await evaluate('window.__romFileRequestCount');
+    await evaluate('window.__romFileDelayMs = 500');
     await click('player2-load');
     await waitExpression(
-      'window.__gbaPoc.diagnostics().localTwoPlayer?.status === "preparing" && window.__gbaPoc.diagnostics().coresDistinct',
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.playerTwoLoading && ' +
+      'document.getElementById("player2-load").disabled && ' +
+      'document.getElementById("player2-rom-select").disabled',
+      'exclusive Player 2 load controls',
+    );
+    await click('player2-load');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(await evaluate('window.__romFileRequestCount'), romRequestsBeforeInitialP2Load + 1);
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.status === null && window.__gbaPoc.diagnostics().coresDistinct',
       'two independent VBA modules',
       30000,
     );
     const dualLoaded = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(dualLoaded.players[0].emulationSteps > p1BeforeP2Load, JSON.stringify(dualLoaded));
     assert.equal(dualLoaded.players[0].activeRom, localRomId);
     assert.equal(dualLoaded.players[1].activeRom, localRomId);
     assert.equal(dualLoaded.players[1].muted, true);
+    assert.equal(dualLoaded.players[0].paused, false);
+    assert.equal(dualLoaded.players[1].paused, false);
+    assert.equal(dualLoaded.localTwoPlayer.preparing, false);
+    assert.deepEqual(dualLoaded.localTwoPlayer.ready, [false, false]);
+    assert.equal(dualLoaded.localTwoPlayer.sessionId, null);
     assert.ok(dualLoaded.player2VisiblePixels > 1000, JSON.stringify(dualLoaded));
+    assert.equal(await evaluate(`fetch('/api/player2/account/saves/${localRomId}/battery')
+      .then(response => response.arrayBuffer()).then(buffer => {
+        let hash = 2166136261;
+        for (const byte of new Uint8Array(buffer)) {
+          hash ^= byte;
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+      })`), seededPlayerTwoBatteryHash);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const independentRunning = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(independentRunning.players[0].emulationSteps > dualLoaded.players[0].emulationSteps,
+      JSON.stringify({ dualLoaded, independentRunning }));
+    assert.ok(independentRunning.players[1].emulationSteps > dualLoaded.players[1].emulationSteps,
+      JSON.stringify({ dualLoaded, independentRunning }));
+    const beforeFailedP2Load = await evaluate('window.__gbaPoc.diagnostics()');
+    const beforeFailedP2Event = await evaluate(
+      'document.querySelector("#event-log li")?.innerText || ""',
+    );
+    await evaluate('window.__failNextPlayerTwoBattery = true; window.__romFileDelayMs = 250');
+    await click('player2-load');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.playerTwoLoading && ' +
+      'document.getElementById("player2-load").disabled',
+      'failed Player 2 load enters loading state',
+    );
+    await waitExpression(
+      `!window.__gbaPoc.diagnostics().localTwoPlayer?.playerTwoLoading && ` +
+      `(document.querySelector('#event-log li')?.innerText || '') !== ${JSON.stringify(beforeFailedP2Event)}`,
+      'failed Player 2 load recovery',
+      30000,
+    );
+    const afterFailedP2Load = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(afterFailedP2Load.players[1].activeRom, beforeFailedP2Load.players[1].activeRom);
+    assert.equal(afterFailedP2Load.players[1].generation, beforeFailedP2Load.players[1].generation);
+    assert.equal(afterFailedP2Load.players[1].running, true);
+    assert.equal(afterFailedP2Load.players[1].paused, false);
+    assert.equal(afterFailedP2Load.standaloneAutosave[1], true);
+    const failedP2Progress = afterFailedP2Load.players[1].emulationSteps;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.ok(await evaluate(
+      `window.__gbaPoc.diagnostics().players[1].emulationSteps > ${failedP2Progress}`,
+    ));
+    const p1BeforeP2Reload = independentRunning.players[0].emulationSteps;
+    const p2HashBeforeReload = await evaluate('window.__gbaPoc.batteryHash(1)');
+    const romRequestsBeforeP2Reload = await evaluate('window.__romFileRequestCount');
+    await click('player2-load');
+    await waitExpression(
+      `window.__romFileRequestCount > ${romRequestsBeforeP2Reload}`,
+      'Player 2 reload request',
+      30000,
+    );
+    await waitExpression(
+      'document.getElementById("player2-runtime-status").innerText === "Ready"',
+      'Player 2 independent reload',
+      30000,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const independentReloaded = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(independentReloaded.players[0].emulationSteps > p1BeforeP2Reload,
+      JSON.stringify({ independentRunning, independentReloaded }));
+    assert.ok(independentReloaded.players[1].emulationSteps > 0, JSON.stringify(independentReloaded));
+    assert.deepEqual(await evaluate('window.__gbaPoc.batteryHash(1)'), p2HashBeforeReload);
+    assert.deepEqual(await evaluate(`fetch('/api/player2/account/saves/${localRomId}/battery')
+      .then(response => response.arrayBuffer()).then(buffer => {
+        const bytes = new Uint8Array(buffer);
+        let hash = 2166136261;
+        for (const byte of bytes) {
+          hash ^= byte;
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return {hash: hash.toString(16).padStart(8, '0'), size: bytes.byteLength};
+      })`), p2HashBeforeReload);
     assert.equal(await evaluate('window.__localWebSocketCount'), 0);
-    assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), true);
-    assert.equal(await evaluate('document.getElementById("quick-load").disabled'), true);
-    assert.equal(await evaluate('document.getElementById("import-state").disabled'), true);
-    assert.equal(await evaluate('document.getElementById("rom-select").disabled'), true);
-    assert.equal(await evaluate('document.getElementById("load-rom").disabled'), true);
+    assert.deepEqual(await evaluate('window.__localRequestCounts'), {});
+    assert.equal(await evaluate('document.getElementById("speed-toggle").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("quick-load").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("import-state").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("rom-select").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("load-rom").disabled'), false);
+    assert.equal(await evaluate(`fetch('/api/session').then(response => response.json()).then(session =>
+      fetch('/api/local-2p/recover', {
+        method: 'POST', headers: {'X-CSRF-Token': session.csrfToken}
+      })).then(response => response.json()).then(body => body.session)`), null);
     const realCoreCableProbe = await evaluate('window.__gbaPoc.runDirectCableProbe()');
     assert.deepEqual(realCoreCableProbe, {
       applied: true,
@@ -472,14 +699,139 @@ async function main() {
     });
     await waitExpression('window.__gbaPoc.diagnostics().players[1].inputMask === 0', 'Player 2 touch release');
     await click('local-p1-ready');
+    assert.deepEqual(await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer.ready'), [true, false]);
+    await click('local-p1-ready');
+    assert.deepEqual(await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer.ready'), [false, false]);
+    await click('local-p1-ready');
     await click('local-p2-ready');
     await waitExpression('!document.getElementById("local-start").disabled', 'both local players ready');
+    await evaluate(`document.getElementById('player2-rom-select')
+      .dispatchEvent(new Event('change', {bubbles: true}))`);
+    assert.deepEqual(await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer.ready'), [false, false]);
+    assert.equal(await evaluate('document.getElementById("local-start").disabled'), true);
+    await click('local-p1-ready');
+    await click('local-p2-ready');
+    await waitExpression('!document.getElementById("local-start").disabled', 'ready after ROM selection change');
+    assert.deepEqual(await evaluate('window.__localRequestCounts'), {});
+    assert.equal(await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer.sessionId'), null);
+    await evaluate(`(() => {
+      const nativeFetch = window.fetch;
+      let failed = false;
+      window.fetch = (...args) => {
+        const path = new URL(String(args[0]), location.href).pathname;
+        if (!failed && path === '/api/local-2p') {
+          failed = true;
+          return Promise.resolve(new Response(JSON.stringify({error: 'simulated create failure'}), {
+            status: 500, headers: {'Content-Type': 'application/json'}
+          }));
+        }
+        return nativeFetch(...args);
+      };
+      window.__restoreLocalCreateFetch = () => { window.fetch = nativeFetch; };
+    })()`);
+    const beforeCreateFailure = await evaluate('window.__gbaPoc.diagnostics()');
+    await click('local-start');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.sessionId === null && ' +
+      '!window.__gbaPoc.diagnostics().localTwoPlayer?.preparing',
+      'pre-session Start failure rollback',
+      30000,
+    );
+    await evaluate('window.__restoreLocalCreateFetch()');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const afterCreateFailure = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(afterCreateFailure.players[0].emulationSteps > beforeCreateFailure.players[0].emulationSteps,
+      JSON.stringify({beforeCreateFailure, afterCreateFailure}));
+    assert.ok(afterCreateFailure.players[1].emulationSteps > beforeCreateFailure.players[1].emulationSteps,
+      JSON.stringify({beforeCreateFailure, afterCreateFailure}));
+    assert.deepEqual(afterCreateFailure.standaloneAutosave, [true, true]);
+    assert.deepEqual(afterCreateFailure.localTwoPlayer.ready, [true, true]);
+    await waitExpression('!document.getElementById("local-start").disabled',
+      'retry after pre-session failure');
+    await evaluate(`(() => {
+      const nativeFetch = window.fetch;
+      let failed = false;
+      window.fetch = (...args) => {
+        const path = new URL(String(args[0]), location.href).pathname;
+        if (!failed && path.endsWith('/start') && path.startsWith('/api/local-2p/')) {
+          failed = true;
+          return Promise.resolve(new Response(JSON.stringify({error: 'simulated Start failure'}), {
+            status: 500, headers: {'Content-Type': 'application/json'}
+          }));
+        }
+        return nativeFetch(...args);
+      };
+      window.__restoreLocalStartFetch = () => { window.fetch = nativeFetch; };
+    })()`);
+    const beforeFailedStart = await evaluate('window.__gbaPoc.diagnostics()');
+    await click('local-start');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.sessionId === null && ' +
+      '!window.__gbaPoc.diagnostics().localTwoPlayer?.preparing',
+      'failed local Start rollback',
+      30000,
+    );
+    await evaluate('window.__restoreLocalStartFetch()');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const afterFailedStart = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(afterFailedStart.players[0].emulationSteps > beforeFailedStart.players[0].emulationSteps,
+      JSON.stringify({ beforeFailedStart, afterFailedStart }));
+    assert.ok(afterFailedStart.players[1].emulationSteps > beforeFailedStart.players[1].emulationSteps,
+      JSON.stringify({ beforeFailedStart, afterFailedStart }));
+    assert.deepEqual(afterFailedStart.standaloneAutosave, [true, true]);
+    assert.deepEqual(afterFailedStart.localTwoPlayer.ready, [true, true]);
+    assert.equal(await evaluate(`fetch('/api/session').then(response => response.json()).then(session =>
+      fetch('/api/local-2p/recover', {
+        method: 'POST', headers: {'X-CSRF-Token': session.csrfToken}
+      })).then(response => response.json()).then(body => body.session)`), null);
+    await waitExpression('!document.getElementById("local-start").disabled', 'retry local Start');
+    await evaluate(`(() => {
+      window.__localRequestCounts = {};
+      window.__localEvents = [];
+      window.__requestSequences = {};
+      window.__batteryResponseDelays = 2;
+      window.__priorStandaloneFlush = window.__gbaPoc.flushStandaloneBatteries();
+      return true;
+    })()`);
+    await waitExpression(
+      `window.__requestSequences['/api/saves/${localRomId}/battery'] === 1 && ` +
+      `window.__requestSequences['/api/player2/account/saves/${localRomId}/battery'] === 1`,
+      'queued prior battery flushes',
+    );
     await click('local-start');
     await waitExpression(
       'window.__gbaPoc.diagnostics().localTwoPlayer?.active && window.__gbaPoc.diagnostics().players[0].linkPlayer === 0 && window.__gbaPoc.diagnostics().players[1].linkPlayer === 1',
       'direct local cable start',
     );
     const dualStart = await evaluate('window.__gbaPoc.diagnostics()');
+    const localStartCounts = await evaluate(`(() => {
+      const counts = window.__localRequestCounts;
+      const sessionId = window.__gbaPoc.diagnostics().localTwoPlayer.sessionId;
+      return {
+        create: counts['/api/local-2p'] || 0,
+        p1Ready: counts['/api/local-2p/' + sessionId + '/player1-ready'] || 0,
+        p2Ready: counts['/api/local-2p/' + sessionId + '/player2-ready'] || 0,
+        checkpoint: counts['/api/local-2p/' + sessionId + '/checkpoint'] || 0,
+        start: counts['/api/local-2p/' + sessionId + '/start'] || 0,
+      };
+    })()`);
+    assert.deepEqual(localStartCounts, {
+      create: 1, p1Ready: 1, p2Ready: 1, checkpoint: 1, start: 1,
+    });
+    const localStartEvents = await evaluate('window.__localEvents');
+    const p1BatteryPath = `/api/saves/${localRomId}/battery`;
+    const p2BatteryPath = `/api/player2/account/saves/${localRomId}/battery`;
+    const createRequestIndex = localStartEvents.indexOf('request:/api/local-2p:1');
+    assert.equal(await evaluate(`window.__requestSequences[${JSON.stringify(p1BatteryPath)}]`), 2);
+    assert.equal(await evaluate(`window.__requestSequences[${JSON.stringify(p2BatteryPath)}]`), 2);
+    assert.ok(localStartEvents.indexOf(`response:${p1BatteryPath}:1`) <
+      localStartEvents.indexOf(`request:${p1BatteryPath}:2`), JSON.stringify(localStartEvents));
+    assert.ok(localStartEvents.indexOf(`response:${p2BatteryPath}:1`) <
+      localStartEvents.indexOf(`request:${p2BatteryPath}:2`), JSON.stringify(localStartEvents));
+    assert.ok(localStartEvents.indexOf(`response:${p1BatteryPath}:2`) < createRequestIndex,
+      JSON.stringify(localStartEvents));
+    assert.ok(localStartEvents.indexOf(`response:${p2BatteryPath}:2`) < createRequestIndex,
+      JSON.stringify(localStartEvents));
     assert.equal(dualStart.localTwoPlayer.hasPairedCheckpoint, true);
     assert.equal(dualStart.localTwoPlayer.checkpointSequence, 1);
     await new Promise((resolve) => setTimeout(resolve, 1800));
@@ -551,19 +903,83 @@ async function main() {
     const localLandscape = await evaluate(`(() => {
       const first = document.getElementById('player-one-panel').getBoundingClientRect();
       const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      const firstToolbar = document.querySelector('.rom-toolbar-player-one').getBoundingClientRect();
+      const secondToolbar = document.getElementById('player2-toolbar').getBoundingClientRect();
+      const firstControls = document.querySelector('#player-one-panel .touch-controls').getBoundingClientRect();
+      const secondControls = document.querySelector('#player-two-panel .touch-controls').getBoundingClientRect();
+      const firstActions = document.querySelector('#player-one-panel .local-link-actions').getBoundingClientRect();
+      const secondActions = document.querySelector('#player-two-panel .local-link-actions').getBoundingClientRect();
       return {firstLeft: first.left, firstRight: first.right, secondLeft: second.left,
-        secondRight: second.right, scrollWidth: document.documentElement.scrollWidth, innerWidth};
+        secondRight: second.right, firstToolbarLeft: firstToolbar.left,
+        firstToolbarRight: firstToolbar.right, firstToolbarTop: firstToolbar.top,
+        secondToolbarLeft: secondToolbar.left, secondToolbarRight: secondToolbar.right,
+        secondToolbarTop: secondToolbar.top, firstControlsBottom: firstControls.bottom,
+        firstActionsTop: firstActions.top, secondControlsBottom: secondControls.bottom,
+        secondActionsTop: secondActions.top, scrollWidth: document.documentElement.scrollWidth,
+        innerWidth, hasPlayerHeading: Boolean(document.querySelector('.player-heading')),
+        hasPlayerRomToolbar: Boolean(document.querySelector('.player-rom-toolbar'))};
     })()`);
     assert.ok(localLandscape.firstRight <= localLandscape.secondLeft + 1, JSON.stringify(localLandscape));
+    assert.ok(localLandscape.firstToolbarRight <= localLandscape.secondToolbarLeft + 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstToolbarTop - localLandscape.secondToolbarTop) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(localLandscape.firstControlsBottom <= localLandscape.firstActionsTop + 1,
+      JSON.stringify(localLandscape));
+    assert.ok(localLandscape.secondControlsBottom <= localLandscape.secondActionsTop + 1,
+      JSON.stringify(localLandscape));
+    assert.equal(localLandscape.hasPlayerHeading, false);
+    assert.equal(localLandscape.hasPlayerRomToolbar, false);
     assert.ok(localLandscape.scrollWidth <= localLandscape.innerWidth, JSON.stringify(localLandscape));
+    await captureLocal(600, 360, 'local-2p-compact-landscape.png');
+    const localCompactLandscape = await evaluate(`(() => {
+      const firstToolbar = document.querySelector('.rom-toolbar-player-one').getBoundingClientRect();
+      const secondToolbar = document.getElementById('player2-toolbar').getBoundingClientRect();
+      const controls = [...document.querySelectorAll('#player2-toolbar > *')]
+        .filter(element => !element.hidden)
+        .map(element => {
+          const rect = element.getBoundingClientRect();
+          return {id: element.id, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom};
+        });
+      return {firstLeft: firstToolbar.left, firstRight: firstToolbar.right,
+        firstTop: firstToolbar.top, secondLeft: secondToolbar.left,
+        secondRight: secondToolbar.right, secondTop: secondToolbar.top,
+        controls, portrait: document.getElementById('workspace').classList.contains('local-portrait'),
+        scrollWidth: document.documentElement.scrollWidth, innerWidth};
+    })()`);
+    assert.equal(localCompactLandscape.portrait, false, JSON.stringify(localCompactLandscape));
+    assert.ok(localCompactLandscape.firstRight <= localCompactLandscape.secondLeft + 1,
+      JSON.stringify(localCompactLandscape));
+    assert.ok(Math.abs(localCompactLandscape.firstTop - localCompactLandscape.secondTop) <= 1,
+      JSON.stringify(localCompactLandscape));
+    for (let index = 1; index < localCompactLandscape.controls.length; ++index) {
+      assert.ok(localCompactLandscape.controls[index - 1].right <=
+        localCompactLandscape.controls[index].left + 1, JSON.stringify(localCompactLandscape));
+    }
+    assert.ok(localCompactLandscape.secondRight <= localCompactLandscape.innerWidth,
+      JSON.stringify(localCompactLandscape));
+    assert.ok(localCompactLandscape.scrollWidth <= localCompactLandscape.innerWidth,
+      JSON.stringify(localCompactLandscape));
     await captureLocal(430, 932, 'local-2p-portrait.png');
     const localPortrait = await evaluate(`(() => {
       const first = document.getElementById('player-one-panel').getBoundingClientRect();
       const second = document.getElementById('player-two-panel').getBoundingClientRect();
-      return {firstBottom: first.bottom, secondTop: second.top,
+      const firstToolbar = document.querySelector('.rom-toolbar-player-one').getBoundingClientRect();
+      const secondToolbar = document.getElementById('player2-toolbar').getBoundingClientRect();
+      const firstActions = document.querySelector('#player-one-panel .local-link-actions').getBoundingClientRect();
+      const secondActions = document.querySelector('#player-two-panel .local-link-actions').getBoundingClientRect();
+      return {firstBottom: first.bottom, secondTop: second.top, secondBottom: second.bottom,
+        firstToolbarBottom: firstToolbar.bottom, secondToolbarTop: secondToolbar.top,
+        firstActionsBottom: firstActions.bottom, secondActionsBottom: secondActions.bottom,
         scrollWidth: document.documentElement.scrollWidth, innerWidth};
     })()`);
     assert.ok(localPortrait.firstBottom <= localPortrait.secondTop + 1, JSON.stringify(localPortrait));
+    assert.ok(localPortrait.firstToolbarBottom <= localPortrait.secondToolbarTop + 1,
+      JSON.stringify(localPortrait));
+    assert.ok(localPortrait.firstActionsBottom <= localPortrait.firstBottom + 1,
+      JSON.stringify(localPortrait));
+    assert.ok(localPortrait.secondActionsBottom <= localPortrait.secondBottom + 1,
+      JSON.stringify(localPortrait));
     assert.ok(localPortrait.scrollWidth <= localPortrait.innerWidth, JSON.stringify(localPortrait));
     await captureLocal(1440, 900, 'local-2p-landscape-restored.png');
     const localLandscapeRestored = await evaluate(`(() => {
@@ -625,11 +1041,59 @@ async function main() {
     assert.ok(guestDualLoaded.players[1].generation > dualLoaded.players[1].generation);
     assert.ok(guestDualLoaded.players[1].audioPointer > 0);
     assert.equal(guestDualLoaded.players[1].muted, true);
+    const guestIndependentStart = guestDualLoaded.players[1].emulationSteps;
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.ok(await evaluate(
+      `window.__gbaPoc.diagnostics().players[1].emulationSteps > ${guestIndependentStart}`,
+    ));
+    assert.equal(await evaluate('window.__gbaPoc.diagnostics().localTwoPlayer.sessionId'), null);
+    const guestP2HashBeforeExit = await evaluate('window.__gbaPoc.batteryHash(1)');
+    await evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide'))");
+    assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('gbc-standalone-battery-recovery'))
+      .some(record => record.slot === 1 && record.mode === 'guest' && record.romId === ${JSON.stringify(localRomId)})`), true);
+    await click('local-exit');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null',
+      'independent Guest P2 exit', 30000);
+    assert.deepEqual(await evaluate(`fetch('/api/player2/guest/saves/${localRomId}/battery')
+      .then(response => response.arrayBuffer()).then(buffer => {
+        const bytes = new Uint8Array(buffer);
+        let hash = 2166136261;
+        for (const byte of bytes) {
+          hash ^= byte;
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return {hash: hash.toString(16).padStart(8, '0'), size: bytes.byteLength};
+      })`), guestP2HashBeforeExit);
+
+    await click('local-2p-toggle');
+    await waitExpression('!document.getElementById("player2-choice").hidden', 'Guest P2 restart choice');
+    await click('player2-guest');
+    await evaluate(`document.getElementById('player2-rom-select').value = ${JSON.stringify(localRomId)}`);
+    await click('player2-load');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().localTwoPlayer?.mode === "guest" && window.__gbaPoc.diagnostics().coresDistinct',
+      'Guest P2 reload after independent save',
+      30000,
+    );
     await click('local-p1-ready');
     await click('local-p2-ready');
     await waitExpression('!document.getElementById("local-start").disabled', 'Guest P2 ready');
+    const beforeGuestStartEvent = await evaluate(
+      'document.querySelector("#event-log li")?.innerText || ""',
+    );
     await click('local-start');
-    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer?.active', 'Guest P2 start');
+    await waitExpression(
+      `window.__gbaPoc.diagnostics().localTwoPlayer?.active || ` +
+      `(document.querySelector('#event-log li')?.innerText || '') !== ${JSON.stringify(beforeGuestStartEvent)}`,
+      'Guest P2 start result',
+      30000,
+    );
+    const guestStartResult = await evaluate(`({
+      diagnostics: window.__gbaPoc.diagnostics(),
+      event: document.querySelector('#event-log li')?.innerText || ''
+    })`);
+    assert.equal(guestStartResult.diagnostics.localTwoPlayer?.active, true,
+      JSON.stringify(guestStartResult));
     const guestStart = await evaluate('window.__gbaPoc.diagnostics().players[1].emulationSteps');
     await new Promise((resolve) => setTimeout(resolve, 900));
     assert.ok(await evaluate(`window.__gbaPoc.diagnostics().players[1].emulationSteps > ${guestStart}`));
@@ -683,6 +1147,9 @@ async function main() {
     await cdp.send('Page.navigate', { url: origin });
     await loaded;
     await waitExpression('document.getElementById("event-log").innerText.includes("Catalog ready")', 'catalog after reload');
+    assert.equal(await evaluate(
+      `sessionStorage.getItem('gbc-standalone-battery-recovery')`,
+    ), null);
     await click('load-rom');
     await waitExpression('document.getElementById("event-log").innerText.includes("Account state loaded")', 'account save restore');
 
@@ -816,6 +1283,7 @@ async function main() {
         })),
         webSocketsCreated: localWebSocketsCreated,
         landscape: localLandscape,
+        compactLandscape: localCompactLandscape,
         portrait: localPortrait,
         landscapeRestored: localLandscapeRestored,
       },

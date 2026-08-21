@@ -447,7 +447,9 @@ async function handleRequest(context) {
     requirePermission(session, PLAY_PERMISSIONS);
     requireCsrf(request, session, config);
     const recovered = await localLinkService.recover(session, player2Session);
-    return json(response, 200, recovered ? publicLocalRecovery(recovered) : { session: null });
+    return json(response, 200, recovered
+      ? { ...publicLocalRecovery(recovered), debug: config.linkDebug }
+      : { session: null, debug: config.linkDebug });
   }
 
   if (request.method === 'POST' && url.pathname === '/api/local-2p') {
@@ -463,11 +465,14 @@ async function handleRequest(context) {
       player1RomId: body.player1RomId,
       player2RomId: body.player2RomId,
     });
-    return json(response, 201, { session: publicLocalSession(localSession) });
+    return json(response, 201, {
+      session: publicLocalSession(localSession),
+      debug: config.linkDebug,
+    });
   }
 
   const localMatch = url.pathname.match(
-    /^\/api\/local-2p\/([0-9a-f-]+)(?:\/(player1-ready|player2-ready|start|heartbeat|checkpoint|finish|abort))?$/i,
+    /^\/api\/local-2p\/([0-9a-f-]+)(?:\/(player1-ready|player2-ready|start|heartbeat|checkpoint|diagnostic|finish|abort))?$/i,
   );
   if (localMatch) {
     requirePermission(session, PLAY_PERMISSIONS);
@@ -509,6 +514,19 @@ async function handleRequest(context) {
         return json(response, 200, { session: publicLocalSession(await localLinkService.heartbeat({
           id: localSessionId, player1: session, player2: player2Session,
         })) });
+      }
+      if (action === 'diagnostic') {
+        await localLinkService.get({
+          id: localSessionId, player1: session, player2: player2Session,
+        });
+        const body = await readJsonRequest(request, 16 * 1024);
+        if (config.linkDebug) {
+          console.info('[local-link]', JSON.stringify({
+            sessionId: localSessionId,
+            ...localLinkDiagnostic(body),
+          }));
+        }
+        return json(response, 200, { ok: true });
       }
       if (action === 'checkpoint') {
         const body = await readJsonRequest(request, config.maxSaveBytes * 3);
@@ -723,6 +741,32 @@ function appendHeader(response, name, value) {
   const existing = response.getHeader(name);
   const values = existing ? (Array.isArray(existing) ? existing : [existing]) : [];
   response.setHeader(name, [...values, value]);
+}
+
+function localLinkDiagnostic(value) {
+  const result = {};
+  for (const key of [
+    'lastPairSequence', 'lastReleaseSequence', 'pairCount', 'pumpBurst',
+  ]) {
+    if (Number.isSafeInteger(value?.[key])) result[key] = value[key];
+  }
+  if (typeof value?.guestHandshakePending === 'boolean') {
+    result.guestHandshakePending = value.guestHandshakePending;
+  }
+  result.players = Array.isArray(value?.players) ? value.players.slice(0, 2).map((player) => {
+    const state = {};
+    for (const key of [
+      'slot', 'player', 'sequence', 'requestData', 'requestTicks', 'linkTime',
+      'siocnt', 'frameCount', 'emulationSteps', 'pumpBurst',
+    ]) {
+      if (Number.isSafeInteger(player?.[key])) state[key] = player[key];
+    }
+    for (const key of ['waiting', 'transferActive', 'requestPending', 'guestHeld']) {
+      if (typeof player?.[key] === 'boolean') state[key] = player[key];
+    }
+    return state;
+  }) : [];
+  return result;
 }
 
 async function readRequest(request, limit) {

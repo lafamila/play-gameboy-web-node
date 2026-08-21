@@ -574,6 +574,43 @@ async function main() {
     assert.deepEqual(dualLoaded.localTwoPlayer.ready, [false, false]);
     assert.equal(dualLoaded.localTwoPlayer.sessionId, null);
     assert.ok(dualLoaded.player2VisiblePixels > 1000, JSON.stringify(dualLoaded));
+    assert.equal(await evaluate(
+      `['quick-save', 'quick-load', 'speed-toggle', 'player2-quick-save',
+        'player2-quick-load', 'player2-speed-toggle'].every(id =>
+          getComputedStyle(document.getElementById(id)).display !== 'none')`,
+    ), true);
+    assert.equal(await evaluate('document.getElementById("player2-quick-save").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("player2-quick-load").disabled'), false);
+    assert.equal(await evaluate('document.getElementById("player2-speed-toggle").disabled'), false);
+    const runtimeStructure = await evaluate(`(() => {
+      const describe = panel => ({
+        runtimeView: panel.querySelectorAll('[data-player-runtime]').length,
+        playbackActions: panel.querySelectorAll('.playback-bar button').length,
+        controlGroups: [...panel.querySelector('.touch-controls').children]
+          .map(element => element.className),
+        compact: panel.querySelector('.touch-controls').classList.contains('compact-touch'),
+      });
+      return {
+        playerOne: describe(document.getElementById('player-one-panel')),
+        playerTwo: describe(document.getElementById('player-two-panel')),
+      };
+    })()`);
+    assert.deepEqual(runtimeStructure.playerOne, runtimeStructure.playerTwo,
+      JSON.stringify(runtimeStructure));
+    assert.equal(runtimeStructure.playerOne.runtimeView, 1);
+    assert.equal(runtimeStructure.playerOne.playbackActions, 3);
+    assert.equal(runtimeStructure.playerOne.compact, false);
+    await click('player2-pause');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().players[1].paused && ' +
+      '!window.__gbaPoc.diagnostics().players[0].paused',
+      'Player 2 independent pause',
+    );
+    await click('player2-pause');
+    await waitExpression(
+      '!window.__gbaPoc.diagnostics().players[1].paused',
+      'Player 2 independent resume',
+    );
     assert.equal(await evaluate(`fetch('/api/player2/account/saves/${localRomId}/battery')
       .then(response => response.arrayBuffer()).then(buffer => {
         let hash = 2166136261;
@@ -583,6 +620,21 @@ async function main() {
         }
         return hash.toString(16).padStart(8, '0');
       })`), seededPlayerTwoBatteryHash);
+    await click('player2-speed-toggle');
+    assert.equal(await evaluate(
+      'document.getElementById("player2-speed-toggle").getAttribute("aria-pressed")',
+    ), 'true');
+    await click('player2-speed-toggle');
+    await click('player2-quick-save');
+    await waitExpression(
+      'document.getElementById("event-log").innerText.includes("P2 quick state saved")',
+      'Player 2 quick state save',
+    );
+    await click('player2-quick-load');
+    await waitExpression(
+      'document.getElementById("event-log").innerText.includes("P2 quick state loaded")',
+      'Player 2 quick state load',
+    );
     await new Promise((resolve) => setTimeout(resolve, 900));
     const independentRunning = await evaluate('window.__gbaPoc.diagnostics()');
     assert.ok(independentRunning.players[0].emulationSteps > dualLoaded.players[0].emulationSteps,
@@ -834,6 +886,11 @@ async function main() {
       JSON.stringify(localStartEvents));
     assert.equal(dualStart.localTwoPlayer.hasPairedCheckpoint, true);
     assert.equal(dualStart.localTwoPlayer.checkpointSequence, 1);
+    assert.equal(await evaluate(
+      `['quick-save', 'quick-load', 'speed-toggle', 'player2-quick-save',
+        'player2-quick-load', 'player2-speed-toggle'].every(id =>
+          document.getElementById(id).disabled)`,
+    ), true);
     await new Promise((resolve) => setTimeout(resolve, 1800));
     const dualRunning = await evaluate('window.__gbaPoc.diagnostics()');
     assert.ok(dualRunning.players[0].emulationSteps > dualStart.players[0].emulationSteps,
@@ -905,8 +962,14 @@ async function main() {
       const second = document.getElementById('player-two-panel').getBoundingClientRect();
       const firstToolbar = document.querySelector('.rom-toolbar-player-one').getBoundingClientRect();
       const secondToolbar = document.getElementById('player2-toolbar').getBoundingClientRect();
+      const firstScreen = document.getElementById('screen-shell').getBoundingClientRect();
+      const secondScreen = document.getElementById('player2-screen-shell').getBoundingClientRect();
       const firstControls = document.querySelector('#player-one-panel .touch-controls').getBoundingClientRect();
       const secondControls = document.querySelector('#player-two-panel .touch-controls').getBoundingClientRect();
+      const firstCenter = document.querySelector('#player-one-panel .center-controls').getBoundingClientRect();
+      const secondCenter = document.querySelector('#player-two-panel .center-controls').getBoundingClientRect();
+      const firstAction = document.querySelector('#player-one-panel .action-controls').getBoundingClientRect();
+      const secondAction = document.querySelector('#player-two-panel .action-controls').getBoundingClientRect();
       const firstActions = document.querySelector('#player-one-panel .local-link-actions').getBoundingClientRect();
       const secondActions = document.querySelector('#player-two-panel .local-link-actions').getBoundingClientRect();
       return {firstLeft: first.left, firstRight: first.right, secondLeft: second.left,
@@ -914,6 +977,14 @@ async function main() {
         firstToolbarRight: firstToolbar.right, firstToolbarTop: firstToolbar.top,
         secondToolbarLeft: secondToolbar.left, secondToolbarRight: secondToolbar.right,
         secondToolbarTop: secondToolbar.top, firstControlsBottom: firstControls.bottom,
+        firstScreenWidth: firstScreen.width, secondScreenWidth: secondScreen.width,
+        firstScreenHeight: firstScreen.height, secondScreenHeight: secondScreen.height,
+        firstControlsOffset: firstControls.top - firstScreen.bottom,
+        secondControlsOffset: secondControls.top - secondScreen.bottom,
+        firstCenterOffset: firstCenter.top - firstControls.top,
+        secondCenterOffset: secondCenter.top - secondControls.top,
+        firstActionOffset: firstAction.top - firstControls.top,
+        secondActionOffset: secondAction.top - secondControls.top,
         firstActionsTop: firstActions.top, secondControlsBottom: secondControls.bottom,
         secondActionsTop: secondActions.top, scrollWidth: document.documentElement.scrollWidth,
         innerWidth, hasPlayerHeading: Boolean(document.querySelector('.player-heading')),
@@ -923,6 +994,16 @@ async function main() {
     assert.ok(localLandscape.firstToolbarRight <= localLandscape.secondToolbarLeft + 1,
       JSON.stringify(localLandscape));
     assert.ok(Math.abs(localLandscape.firstToolbarTop - localLandscape.secondToolbarTop) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstScreenWidth - localLandscape.secondScreenWidth) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstScreenHeight - localLandscape.secondScreenHeight) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstControlsOffset - localLandscape.secondControlsOffset) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstCenterOffset - localLandscape.secondCenterOffset) <= 1,
+      JSON.stringify(localLandscape));
+    assert.ok(Math.abs(localLandscape.firstActionOffset - localLandscape.secondActionOffset) <= 1,
       JSON.stringify(localLandscape));
     assert.ok(localLandscape.firstControlsBottom <= localLandscape.firstActionsTop + 1,
       JSON.stringify(localLandscape));
@@ -1173,8 +1254,8 @@ async function main() {
     const speedStart = (await evaluate('window.__gbaPoc.diagnostics()')).emulationSteps;
     await new Promise((resolve) => setTimeout(resolve, 1200));
     const speedSteps = (await evaluate('window.__gbaPoc.diagnostics()')).emulationSteps - speedStart;
-    assert.ok(speedSteps > normalSteps * 1.05, `normal=${normalSteps}, speed=${speedSteps}`);
-    assert.ok(speedSteps < normalSteps * 1.3, `normal=${normalSteps}, speed=${speedSteps}`);
+    assert.ok(speedSteps > normalSteps * 1.6, `normal=${normalSteps}, speed=${speedSteps}`);
+    assert.ok(speedSteps < normalSteps * 2.4, `normal=${normalSteps}, speed=${speedSteps}`);
     await click('speed-toggle');
 
     await click('quick-save');

@@ -178,10 +178,6 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   min-width: 0;
   padding: 0;
 }
-.workspace.local-2p:not(.local-portrait) .player-two-panel {
-  padding-left: 14px;
-  border-left: 1px solid var(--line);
-}
 .workspace.local-2p .screen-shell {
   min-height: 0;
   max-height: none;
@@ -194,8 +190,6 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
 }
 .workspace.local-2p .action-controls { width: 150px; }
 .workspace.local-2p .center-controls { width: min(180px, 100%); }
-.workspace.local-2p .quick-controls { display: none; }
-.workspace.local-2p .action-controls .speed-toggle { display: none; }
 .workspace.local-2p .action-controls .round { width: 52px; height: 52px; }
 .workspace.local-2p .face-buttons button,
 .workspace.local-2p .shoulder-buttons button { width: 52px; }
@@ -215,7 +209,6 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
 }
 .player2-choice .meta { text-align: center; overflow-wrap: anywhere; }
 .player-two-panel .status { margin-left: auto; }
-.compact-touch .center-controls { align-self: center; }
 .local-link-actions {
   min-height: 43px;
   display: none;

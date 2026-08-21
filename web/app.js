@@ -3,17 +3,53 @@ import { hostTransferData, isSlaveHandshake, LinkMessageQueue } from '/link-mess
 import {
   applyDirectCablePair,
   directCableIdle,
+  guestCableResponsePending,
   releaseDirectCableGuest,
 } from '/local-link-transport.js';
+import { pumpLinkRuntime } from '/link-runtime-pump.js';
 import { gamepadMaskForSlot } from '/player-input.js';
+import { mountPlayerRuntime } from '/player-runtime-view.js';
 
 const FRAME_RATE = 59.7275;
 const CORE_SAMPLE_RATE = 44100;
-const SPEED_MODE_MULTIPLIER = 1.125;
+const SPEED_MODE_MULTIPLIER = 2;
 const LINK_CHECKPOINT_INTERVAL = 30_000;
 const LINK_ROOM_POLL_INTERVAL = 3_000;
 const LINK_DIAGNOSTIC_INTERVAL = 1_000;
 const STANDALONE_BATTERY_RECOVERY_KEY = 'gbc-standalone-battery-recovery';
+
+const playerRuntimeTemplate = document.getElementById('player-runtime-template');
+mountPlayerRuntime({
+  template: playerRuntimeTemplate,
+  target: document.getElementById('player1-runtime'),
+  player: 1,
+  ids: {
+    'screen-shell': 'screen-shell', screen: 'screen', 'screen-empty': 'screen-empty',
+    pause: 'pause', mute: 'mute', fullscreen: 'fullscreen', status: 'runtime-status',
+    speed: 'speed-toggle', 'quick-save': 'quick-save', 'quick-load': 'quick-load',
+    ready: 'local-p1-ready', 'cable-start': 'local-start',
+  },
+  keymap: [
+    'Move: arrows', 'A: X', 'B: Z', 'L: A', 'R: S', 'Start: Enter', 'Select: Backspace',
+  ],
+  cableStart: true,
+});
+mountPlayerRuntime({
+  template: playerRuntimeTemplate,
+  target: document.getElementById('player2-runtime'),
+  player: 2,
+  ids: {
+    'screen-shell': 'player2-screen-shell', screen: 'player2-screen',
+    'screen-empty': 'player2-screen-empty', pause: 'player2-pause', mute: 'player2-mute',
+    fullscreen: 'player2-fullscreen', status: 'player2-runtime-status',
+    speed: 'player2-speed-toggle', 'quick-save': 'player2-quick-save',
+    'quick-load': 'player2-quick-load', ready: 'local-p2-ready',
+  },
+  keymap: [
+    'Move: I/J/K/L', 'A: M', 'B: N', 'L: U', 'R: O', 'Start: P', 'Select: H',
+  ],
+  muted: true,
+});
 
 function stalePlayerTwoLoadError() {
   const error = new Error('Player 2 load was superseded');
@@ -55,7 +91,9 @@ const elements = Object.fromEntries([
   'player2-visitor-status', 'player2-request-access', 'player2-visitor-back', 'player2-runtime',
   'player2-toolbar',
   'player2-rom-select', 'player2-load', 'player2-screen', 'player2-screen-shell',
-  'player2-screen-empty', 'player2-mute', 'player2-runtime-status',
+  'player2-screen-empty', 'player2-pause', 'player2-mute', 'player2-fullscreen',
+  'player2-runtime-status',
+  'player2-quick-save', 'player2-quick-load', 'player2-speed-toggle',
 ].map((id) => [id, document.getElementById(id)]));
 
 let wasmBinaryPromise;
@@ -164,7 +202,17 @@ class PlayerRuntime {
   renderAudio(event) {
     const left = event.outputBuffer.getChannelData(0);
     const right = event.outputBuffer.getChannelData(1);
-    if (!this.core || !this.running || this.paused || this.muted) {
+    if (!this.core || !this.running || this.paused || this.muted || this.speedMode) {
+      if (this.core && this.speedMode && this.audioPointer) {
+        while (this.core._vba_audio_available() > 0) {
+          this.core._vba_audio_read(
+            this.audioPointer,
+            Math.min(this.core._vba_audio_available(), 16384),
+          );
+        }
+        this.audioQueue = [];
+        this.audioPosition = 0;
+      }
       left.fill(0); right.fill(0); return;
     }
     while (this.audioQueue.length < left.length * 4) {
@@ -224,6 +272,7 @@ class PlayerRuntime {
     this.imageData = this.canvasContext.createImageData(this.frameWidth, this.frameHeight);
     this.running = true;
     this.paused = false;
+    this.speedMode = false;
     this.lastFrameTime = 0;
     this.frameDebt = 1000 / FRAME_RATE;
     this.setStatus('Ready', 'running');
@@ -284,6 +333,8 @@ class PlayerRuntime {
     this.audioPointer = 0;
     this.audioPosition = 0;
     this.muted = this.defaultMuted;
+    this.speedMode = false;
+    this.hasStoredQuickState = false;
     this.setStatus('Idle', 'idle');
   }
 }
@@ -497,6 +548,14 @@ function applyControlState() {
   elements['player2-rom-select'].disabled = playerTwoLoadBlocked;
   elements['player2-load'].disabled = playerTwoLoadBlocked || !localTwoPlayer?.mode ||
     !elements['player2-rom-select'].value;
+  const playerTwoControlsEnabled = localOpen && playerTwo.running && Boolean(playerTwo.activeRom);
+  for (const id of ['player2-pause', 'player2-mute', 'player2-fullscreen']) {
+    elements[id].disabled = !playerTwoControlsEnabled;
+  }
+  elements['player2-speed-toggle'].disabled = !playerTwoControlsEnabled || localCableOpen;
+  elements['player2-quick-save'].disabled = !playerTwoControlsEnabled || localCableOpen;
+  elements['player2-quick-load'].disabled = !playerTwoControlsEnabled || localCableOpen ||
+    !playerTwo.hasStoredQuickState;
 
   const canEnterRoom = activeGbaSelected() && !linkRoom && !localOpen;
   elements['link-create'].disabled = !canEnterRoom;
@@ -547,6 +606,21 @@ async function updateStoredStateControls() {
   elements['battery-meta'].textContent = battery
     ? `Account battery / ${new Date(Number(battery.updatedAt)).toLocaleString()}`
     : 'No account battery save';
+  applyControlState();
+}
+
+async function updatePlayerTwoStoredStateControls() {
+  if (!localTwoPlayer?.mode || !playerTwo.activeRom || !playerTwo.core) {
+    playerTwo.hasStoredQuickState = false;
+    applyControlState();
+    return;
+  }
+  const response = await apiFetch(
+    `/api/player2/${localTwoPlayer.mode}/saves/${playerTwo.activeRom.id}/meta`,
+  );
+  if (!response.ok) throw new Error('Player 2 save metadata request failed');
+  const metadata = await response.json();
+  playerTwo.hasStoredQuickState = metadata.saves.some((save) => save.kind === 'state');
   applyControlState();
 }
 
@@ -697,8 +771,13 @@ class LocalTwoPlayerController {
     this.lastCheckpoint = null;
     this.heartbeatTimer = 0;
     this.checkpointTimer = 0;
+    this.diagnosticTimer = 0;
     this.exiting = false;
     this.rollbackCount = 0;
+    this.debug = false;
+    this.pairCount = 0;
+    this.pumpScheduled = [false, false];
+    this.pumpBurst = [0, 0];
     this.boundUpdateLayout = () => this.updateLayout();
     this.resizeObserver = new ResizeObserver(() => this.updateLayout());
   }
@@ -810,6 +889,9 @@ class LocalTwoPlayerController {
     this.checkpointSequence = 0;
     this.pendingCheckpoint = null;
     this.lastCheckpoint = null;
+    this.pairCount = 0;
+    this.pumpScheduled = [false, false];
+    this.pumpBurst = [0, 0];
   }
 
   bothRuntimesLoaded() {
@@ -872,6 +954,10 @@ class LocalTwoPlayerController {
       assertCurrentLoad(isCurrent);
       mutationStarted = true;
       await this.applyRuntimeLoad(playerTwo, selected, loadData, isCurrent);
+      elements['player2-pause'].textContent = 'Pause';
+      elements['player2-speed-toggle'].setAttribute('aria-pressed', 'false');
+      elements['player2-speed-toggle'].textContent = 'Speed off';
+      await updatePlayerTwoStoredStateControls();
       elements['player2-screen-empty'].hidden = true;
       elements['player2-mute'].disabled = false;
       return true;
@@ -996,6 +1082,7 @@ class LocalTwoPlayerController {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || 'Local 2P setup failed');
       this.session = body.session;
+      this.debug = Boolean(body.debug);
       this.resetCableMetadata();
       await this.setServerReady(0);
       await this.setServerReady(1);
@@ -1017,8 +1104,13 @@ class LocalTwoPlayerController {
       playerTwo.paused = false;
       playerTwo.running = true;
       speedMode = false;
+      playerTwo.speedMode = false;
       elements['speed-toggle'].setAttribute('aria-pressed', 'false');
       elements['speed-toggle'].textContent = 'Speed off';
+      elements['player2-speed-toggle'].setAttribute('aria-pressed', 'false');
+      elements['player2-speed-toggle'].textContent = 'Speed off';
+      elements.pause.textContent = 'Pause';
+      elements['player2-pause'].textContent = 'Pause';
       this.lastPairSequence = -1;
       this.lastReleaseSequence = -1;
       this.rollbackCount = 0;
@@ -1026,6 +1118,8 @@ class LocalTwoPlayerController {
       setStatus('Running / P1', 'running');
       playerTwo.setStatus('Running / P2', 'running');
       this.startTimers();
+      this.schedulePump(0);
+      this.schedulePump(1);
       applyControlState();
     } catch (error) {
       let failure = error;
@@ -1073,8 +1167,14 @@ class LocalTwoPlayerController {
   startTimers() {
     clearInterval(this.heartbeatTimer);
     clearInterval(this.checkpointTimer);
+    clearInterval(this.diagnosticTimer);
     this.heartbeatTimer = setInterval(() => runAction(() => this.heartbeat()), 30_000);
     this.checkpointTimer = setInterval(() => runAction(() => this.checkpoint()), LINK_CHECKPOINT_INTERVAL);
+    if (this.debug) {
+      this.diagnosticTimer = setInterval(() => this.sendDiagnostic().catch(() => {}),
+        LINK_DIAGNOSTIC_INTERVAL);
+      void this.sendDiagnostic().catch(() => {});
+    }
   }
 
   async heartbeat() {
@@ -1085,6 +1185,37 @@ class LocalTwoPlayerController {
       throw new Error('Local 2P session expired');
     }
     this.session = (await response.json()).session;
+  }
+
+  async sendDiagnostic() {
+    if (!this.session || !this.active || !this.debug) return;
+    await apiFetch(`/api/local-2p/${this.session.id}/diagnostic`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lastPairSequence: this.lastPairSequence,
+        lastReleaseSequence: this.lastReleaseSequence,
+        guestHandshakePending: this.guestHandshakePending,
+        pairCount: this.pairCount,
+        pumpBurst: this.pumpBurst[0] + this.pumpBurst[1],
+        players: [playerOne, playerTwo].map((runtime) => ({
+          slot: runtime.slot,
+          player: Number(runtime.core._vba_link_player()),
+          sequence: Number(runtime.core._vba_link_request_sequence()),
+          waiting: Boolean(runtime.core._vba_link_waiting()),
+          transferActive: Boolean(runtime.core._vba_link_transfer_active()),
+          requestPending: Boolean(runtime.core._vba_link_request_pending()),
+          guestHeld: Boolean(runtime.core._vba_link_guest_held()),
+          requestData: Number(runtime.core._vba_link_request_data()),
+          requestTicks: Number(runtime.core._vba_link_request_ticks()),
+          linkTime: Number(runtime.core._vba_link_time()),
+          siocnt: Number(runtime.core._vba_link_siocnt()),
+          frameCount: Number(runtime.core._vba_frame_counter()),
+          emulationSteps: Number(runtime.core._vba_emulation_steps()),
+          pumpBurst: this.pumpBurst[runtime.slot],
+        })),
+      }),
+    });
   }
 
   step(timestamp) {
@@ -1100,16 +1231,18 @@ class LocalTwoPlayerController {
       this.releaseGuestIfIdle();
       if (playerOne.frameDebt >= frameDuration && !playerOne.paused &&
           !core._vba_link_waiting() && !core._vba_link_guest_held()) {
-        playerOne.runFrame();
+        const result = playerOne.runFrame();
         playerOne.frameDebt -= frameDuration;
+        if (result === 0) this.schedulePump(0);
       }
-      this.exchangeCable();
+      this.exchangeCable(0);
       if (playerTwo.frameDebt >= frameDuration && !playerTwo.paused &&
           !playerTwo.core._vba_link_waiting() && !playerTwo.core._vba_link_guest_held()) {
-        playerTwo.runFrame();
+        const result = playerTwo.runFrame();
         playerTwo.frameDebt -= frameDuration;
+        if (result === 0) this.schedulePump(1);
       }
-      this.exchangeCable();
+      this.exchangeCable(1);
       ++cycles;
     }
     playerOne.frameDebt = Math.min(playerOne.frameDebt, frameDuration * 2);
@@ -1120,7 +1253,7 @@ class LocalTwoPlayerController {
     if (!this.enabled || this.active || this.preparing || !playerTwo.running || !playerTwo.core) return;
     const elapsed = playerTwo.lastFrameTime ? Math.min(timestamp - playerTwo.lastFrameTime, 100) : 0;
     playerTwo.lastFrameTime = timestamp;
-    playerTwo.frameDebt += elapsed;
+    playerTwo.frameDebt += elapsed * (playerTwo.speedMode ? SPEED_MODE_MULTIPLIER : 1);
     const frameDuration = 1000 / FRAME_RATE;
     let frames = 0;
     while (!playerTwo.paused && playerTwo.frameDebt >= frameDuration && frames < 3) {
@@ -1131,15 +1264,21 @@ class LocalTwoPlayerController {
     playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
   }
 
-  exchangeCable() {
+  exchangeCable(sourceSlot = null) {
     const result = applyDirectCablePair(playerOne.core, playerTwo.core, {
       lastPairSequence: this.lastPairSequence,
       guestHandshakePending: this.guestHandshakePending,
     });
-    if (!result.applied) return;
+    if (!result.applied) {
+      if (guestCableResponsePending(playerOne.core, playerTwo.core)) this.schedulePump(1);
+      return false;
+    }
     this.guestHandshakePending = result.guestHandshakePending;
     this.lastPairSequence = result.lastPairSequence;
+    this.pairCount += 1;
     logCableSequence('Local cable pair', result.sequence);
+    if (sourceSlot !== null) this.schedulePump(sourceSlot === 0 ? 1 : 0);
+    return true;
   }
 
   releaseGuestIfIdle() {
@@ -1147,6 +1286,46 @@ class LocalTwoPlayerController {
       playerOne.core, playerTwo.core, this.lastReleaseSequence,
     );
     this.lastReleaseSequence = result.lastReleaseSequence;
+    if (result.released) this.schedulePump(1);
+  }
+
+  schedulePump(slot) {
+    if (!this.active || this.pumpScheduled[slot]) return;
+    this.pumpScheduled[slot] = true;
+    const run = () => {
+      this.pumpScheduled[slot] = false;
+      this.pumpRuntime(slot);
+    };
+    this.pumpBurst[slot] += 1;
+    if (this.pumpBurst[slot] % 64 === 0) setTimeout(run, 0);
+    else queueMicrotask(run);
+  }
+
+  pumpRuntime(slot) {
+    if (!this.active) return;
+    const runtime = slot === 0 ? playerOne : playerTwo;
+    if (!runtime.core || !runtime.running || runtime.paused) return;
+    const result = pumpLinkRuntime({
+      drain: () => this.exchangeCable(slot),
+      waiting: () => Boolean(runtime.core._vba_link_waiting()),
+      guestHeld: () => Boolean(runtime.core._vba_link_guest_held()),
+      run: () => {
+        runtime.core._vba_set_joypad(
+          runtime.keyMask | runtime.touchMask | gamepadMask(runtime.slot),
+        );
+        const previousFrame = Number(runtime.core._vba_frame_counter());
+        const value = runtime.core._vba_run_frame();
+        if (Number(runtime.core._vba_frame_counter()) !== previousFrame) runtime.renderFrame();
+        return value;
+      },
+      offer: () => this.exchangeCable(slot),
+      release: () => this.releaseGuestIfIdle(),
+    });
+    runtime.lastFrameTime = performance.now();
+    runtime.frameDebt = 0;
+    if (result === 0 || (slot === 1 && guestCableResponsePending(playerOne.core, playerTwo.core))) {
+      this.schedulePump(slot);
+    }
   }
 
   runDirectCableProbe() {
@@ -1226,6 +1405,7 @@ class LocalTwoPlayerController {
     try {
       clearInterval(this.heartbeatTimer);
       clearInterval(this.checkpointTimer);
+      clearInterval(this.diagnosticTimer);
       if (this.session && this.active) {
         playerOne.paused = true;
         playerTwo.paused = true;
@@ -1318,12 +1498,16 @@ class LocalTwoPlayerController {
   restoreSinglePlayer() {
     clearInterval(this.heartbeatTimer);
     clearInterval(this.checkpointTimer);
+    clearInterval(this.diagnosticTimer);
     if (playerOne.core) {
       playerOne.core._vba_link_cancel_wait();
       playerOne.core._vba_link_set_player(-1);
     }
     playerTwo.shutdown();
     elements['player2-mute'].textContent = 'Unmute';
+    elements['player2-pause'].textContent = 'Pause';
+    elements['player2-speed-toggle'].setAttribute('aria-pressed', 'false');
+    elements['player2-speed-toggle'].textContent = 'Speed off';
     this.active = false;
     this.preparing = false;
     ++this.playerTwoLoadGeneration;
@@ -1355,6 +1539,7 @@ class LocalTwoPlayerController {
     const response = await apiFetch('/api/local-2p/recover', { method: 'POST' });
     if (!response.ok) return;
     const recovered = await response.json();
+    this.debug = Boolean(recovered.debug);
     if (!recovered.session) return;
     this.session = recovered.session;
     await this.enter();
@@ -1393,6 +1578,8 @@ class LocalTwoPlayerController {
     elements['player2-mute'].disabled = false;
     this.startTimers();
     startLoop();
+    this.schedulePump(0);
+    this.schedulePump(1);
     setStatus('Running / P1', 'running');
     playerTwo.setStatus('Running / P2', 'running');
     this.renderReadyControls();
@@ -1617,20 +1804,20 @@ function pumpLinkCore() {
   if (!core || !running || paused || linkRoom?.status !== 'active' || linkRoom.paused ||
       linkCheckpointing || linkCorePlayer < 0) return;
 
-  drainLinkMessages();
-  if (core._vba_link_waiting()) {
-    maybeSendLinkOffer();
-    return;
-  }
-  if (core._vba_link_guest_held()) return;
-
-  core._vba_set_joypad(keyMask | touchMask | gamepadMask());
-  const previousFrame = Number(core._vba_frame_counter());
-  const result = core._vba_run_frame();
-  if (Number(core._vba_frame_counter()) !== previousFrame) renderFrame();
-  if (result === 2) maybeSendLinkOffer();
-  drainLinkMessages();
-  maybeSendLinkRelease();
+  const result = pumpLinkRuntime({
+    drain: drainLinkMessages,
+    waiting: () => Boolean(core._vba_link_waiting()),
+    guestHeld: () => Boolean(core._vba_link_guest_held()),
+    run: () => {
+      core._vba_set_joypad(keyMask | touchMask | gamepadMask());
+      const previousFrame = Number(core._vba_frame_counter());
+      const value = core._vba_run_frame();
+      if (Number(core._vba_frame_counter()) !== previousFrame) renderFrame();
+      return value;
+    },
+    offer: maybeSendLinkOffer,
+    release: maybeSendLinkRelease,
+  });
   lastFrameTime = performance.now();
   frameDebt = 0;
   if (result === 0) scheduleLinkPump();
@@ -2266,6 +2453,43 @@ async function loadQuickState() {
   await loadStateBytes(new Uint8Array(await response.arrayBuffer()), 'Account state');
 }
 
+async function putPlayerTwoState(bytes) {
+  const headers = { 'Content-Type': 'application/octet-stream' };
+  if (localTwoPlayer.mode === 'account') {
+    headers['X-Player2-CSRF-Token'] = currentPlayer2Session.csrfToken;
+  }
+  const response = await apiFetch(
+    `/api/player2/${localTwoPlayer.mode}/saves/${playerTwo.activeRom.id}/state`,
+    { method: 'PUT', headers, body: bytes },
+  );
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error || 'Player 2 state save failed');
+  }
+}
+
+async function savePlayerTwoQuickState() {
+  if (!playerTwo.running || !playerTwo.activeRom) throw new Error('Player 2 ROM is not loaded');
+  const bytes = playerTwo.exportState();
+  await putPlayerTwoState(bytes);
+  await persistStandaloneBattery(playerTwo, localTwoPlayer.mode);
+  await updatePlayerTwoStoredStateControls();
+  logEvent(`P2 quick state saved (${bytes.byteLength} bytes)`);
+}
+
+async function loadPlayerTwoQuickState() {
+  if (!playerTwo.running || !playerTwo.activeRom) throw new Error('Player 2 ROM is not loaded');
+  const response = await apiFetch(
+    `/api/player2/${localTwoPlayer.mode}/saves/${playerTwo.activeRom.id}/state`,
+  );
+  if (!response.ok) {
+    throw new Error(response.status === 404 ? 'No Player 2 quick state' : 'Player 2 state request failed');
+  }
+  playerTwo.loadState(new Uint8Array(await response.arrayBuffer()));
+  playerTwo.setStatus('Running', 'running');
+  logEvent('P2 quick state loaded');
+}
+
 async function saveBattery(showLog = true) {
   const size = await persistStandaloneBattery(playerOne, 'account');
   if (!size) return false;
@@ -2641,14 +2865,35 @@ elements['rom-upload'].addEventListener('change', () => runAction(async () => {
   logEvent(`ROM uploaded / ${result.gameCode}`);
 }));
 
-elements.pause.addEventListener('click', () => {
-  paused = !paused;
-  if (localTwoPlayer.active) playerTwo.paused = paused;
-  elements.pause.textContent = paused ? 'Resume' : 'Pause';
+function toggleRuntimePause(slot) {
+  if (localTwoPlayer.active) {
+    const next = !playerOne.paused;
+    playerOne.paused = next;
+    playerTwo.paused = next;
+    elements.pause.textContent = next ? 'Resume' : 'Pause';
+    elements['player2-pause'].textContent = next ? 'Resume' : 'Pause';
+    setStatus(next ? 'Paused' : 'Running / P1', next ? 'idle' : 'running');
+    playerTwo.setStatus(next ? 'Paused' : 'Running / P2', next ? 'idle' : 'running');
+    if (!next) {
+      localTwoPlayer.schedulePump(0);
+      localTwoPlayer.schedulePump(1);
+    }
+    return;
+  }
+  const runtime = slot === 0 ? playerOne : playerTwo;
+  runtime.paused = !runtime.paused;
+  elements[slot === 0 ? 'pause' : 'player2-pause'].textContent =
+    runtime.paused ? 'Resume' : 'Pause';
+  if (slot === 1) {
+    playerTwo.setStatus(runtime.paused ? 'Paused' : 'Running', runtime.paused ? 'idle' : 'running');
+    return;
+  }
   const linkPaused = isLinkRoomOpen() && (linkRoom.paused || linkRoom.status === 'finishing');
-  setStatus(paused ? 'Paused' : linkPaused ? 'Link paused' : 'Running',
-    paused ? 'idle' : linkPaused ? 'loading' : 'running');
-});
+  setStatus(runtime.paused ? 'Paused' : linkPaused ? 'Link paused' : 'Running',
+    runtime.paused ? 'idle' : linkPaused ? 'loading' : 'running');
+}
+
+elements.pause.addEventListener('click', () => toggleRuntimePause(0));
 elements.mute.addEventListener('click', () => {
   muted = !muted;
   elements.mute.textContent = muted ? 'Unmute' : 'Mute';
@@ -2660,12 +2905,22 @@ elements['speed-toggle'].addEventListener('click', () => {
 });
 elements.fullscreen.addEventListener('click', () =>
   (localTwoPlayer.enabled ? elements.workspace : elements['screen-shell']).requestFullscreen());
+elements['player2-pause'].addEventListener('click', () => toggleRuntimePause(1));
 elements['player2-mute'].addEventListener('click', () => {
   playerTwo.muted = !playerTwo.muted;
   elements['player2-mute'].textContent = playerTwo.muted ? 'Unmute' : 'Mute';
 });
+elements['player2-fullscreen'].addEventListener('click', () =>
+  elements.workspace.requestFullscreen());
+elements['player2-speed-toggle'].addEventListener('click', () => {
+  playerTwo.speedMode = !playerTwo.speedMode;
+  elements['player2-speed-toggle'].setAttribute('aria-pressed', String(playerTwo.speedMode));
+  elements['player2-speed-toggle'].textContent = playerTwo.speedMode ? 'Speed on' : 'Speed off';
+});
 elements['quick-save'].addEventListener('click', () => runAction(saveQuickState));
 elements['quick-load'].addEventListener('click', () => runAction(loadQuickState));
+elements['player2-quick-save'].addEventListener('click', () => runAction(savePlayerTwoQuickState));
+elements['player2-quick-load'].addEventListener('click', () => runAction(loadPlayerTwoQuickState));
 elements['export-state'].addEventListener('click', () => runAction(async () => {
   const bytes = await saveQuickState();
   download(bytes, exportName('.sg1'), 'application/gzip');
@@ -2866,6 +3121,15 @@ window.__gbaPoc = {
         muted: runtime.muted,
         memoryBytes: runtime.core?.HEAPU8?.byteLength || 0,
         linkPlayer: runtime.core ? Number(runtime.core._vba_link_player()) : -1,
+        linkSequence: runtime.core ? Number(runtime.core._vba_link_request_sequence()) : null,
+        linkWaiting: runtime.core ? Boolean(runtime.core._vba_link_waiting()) : null,
+        linkTransferActive: runtime.core ? Boolean(runtime.core._vba_link_transfer_active()) : null,
+        linkRequestPending: runtime.core ? Boolean(runtime.core._vba_link_request_pending()) : null,
+        linkGuestHeld: runtime.core ? Boolean(runtime.core._vba_link_guest_held()) : null,
+        linkRequestData: runtime.core ? Number(runtime.core._vba_link_request_data()) : null,
+        linkRequestTicks: runtime.core ? Number(runtime.core._vba_link_request_ticks()) : null,
+        linkTime: runtime.core ? Number(runtime.core._vba_link_time()) : null,
+        linkSiocnt: runtime.core ? Number(runtime.core._vba_link_siocnt()) : null,
         generation: runtime.generation,
         audioPointer: runtime.audioPointer,
         audioContextState: runtime.audioContext?.state || 'closed',
@@ -2883,6 +3147,11 @@ window.__gbaPoc = {
         status: localTwoPlayer.session?.status || null,
         sessionId: localTwoPlayer.session?.id || null,
         lastPairSequence: localTwoPlayer.lastPairSequence,
+        lastReleaseSequence: localTwoPlayer.lastReleaseSequence,
+        guestHandshakePending: localTwoPlayer.guestHandshakePending,
+        pumpScheduled: [...localTwoPlayer.pumpScheduled],
+        pumpBurst: [...localTwoPlayer.pumpBurst],
+        pairCount: localTwoPlayer.pairCount,
         checkpointSequence: localTwoPlayer.checkpointSequence,
         checkpointPending: Boolean(localTwoPlayer.pendingCheckpoint),
         hasPairedCheckpoint: Boolean(localTwoPlayer.lastCheckpoint),

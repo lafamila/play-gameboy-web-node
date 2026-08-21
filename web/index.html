@@ -88,56 +88,7 @@
 
       <section id="workspace" class="workspace">
         <div id="player-one-panel" class="player-column player-panel" data-player="1">
-          <div class="screen-shell" id="screen-shell">
-            <canvas id="screen" width="240" height="160" aria-label="Game screen"></canvas>
-            <div id="screen-empty" class="screen-empty">Select ROM</div>
-          </div>
-
-          <div class="playback-bar">
-            <button id="pause" type="button" disabled>Pause</button>
-            <button id="mute" type="button" disabled>Mute</button>
-            <button id="fullscreen" type="button" disabled>Fullscreen</button>
-            <span id="runtime-status" class="status idle">Idle</span>
-          </div>
-
-          <div class="touch-controls" aria-label="Game controls">
-            <div class="dpad">
-              <button data-button="64" class="up direction" aria-label="Up">▲</button>
-              <button data-button="32" class="left direction" aria-label="Left">◀</button>
-              <button data-button="16" class="right direction" aria-label="Right">▶</button>
-              <button data-button="128" class="down direction" aria-label="Down">▼</button>
-            </div>
-            <div class="center-controls">
-              <div class="system-controls">
-                <button data-button="4">Select</button>
-                <button data-button="8">Start</button>
-              </div>
-              <div class="quick-controls">
-                <button id="quick-save" type="button" disabled>Quick Save</button>
-                <button id="quick-load" type="button" disabled>Quick Load</button>
-              </div>
-            </div>
-            <div class="action-controls">
-              <button id="speed-toggle" class="speed-toggle" type="button" aria-pressed="false">Speed off</button>
-              <div class="face-buttons">
-                <button data-button="2" class="round">B</button>
-                <button data-button="1" class="round accent">A</button>
-              </div>
-              <div class="shoulder-buttons">
-                <button data-button="512">L</button>
-                <button data-button="256">R</button>
-              </div>
-            </div>
-          </div>
-
-          <div class="keymap">
-            <span>Move: arrows</span><span>A: X</span><span>B: Z</span>
-            <span>L: A</span><span>R: S</span><span>Start: Enter</span><span>Select: Backspace</span>
-          </div>
-          <div class="local-link-actions" aria-label="Player 1 cable actions">
-            <button id="local-p1-ready" type="button" disabled>P1 Ready</button>
-            <button id="local-start" class="primary" type="button" disabled>Start</button>
-          </div>
+          <div id="player1-runtime"></div>
         </div>
 
         <div id="player-two-panel" class="player-column player-panel player-two-panel" data-player="2" hidden>
@@ -154,47 +105,7 @@
             <button id="player2-visitor-back" type="button">Use another account</button>
           </div>
 
-          <div id="player2-runtime" hidden>
-            <div class="screen-shell" id="player2-screen-shell">
-              <canvas id="player2-screen" width="240" height="160" aria-label="Player 2 game screen"></canvas>
-              <div id="player2-screen-empty" class="screen-empty">Select ROM</div>
-            </div>
-            <div class="playback-bar">
-              <button id="player2-mute" type="button" disabled>Unmute</button>
-              <span id="player2-runtime-status" class="status idle">Idle</span>
-            </div>
-            <div class="touch-controls compact-touch" aria-label="Player 2 game controls">
-              <div class="dpad">
-                <button data-player="2" data-button="64" class="up direction" aria-label="Player 2 up">▲</button>
-                <button data-player="2" data-button="32" class="left direction" aria-label="Player 2 left">◀</button>
-                <button data-player="2" data-button="16" class="right direction" aria-label="Player 2 right">▶</button>
-                <button data-player="2" data-button="128" class="down direction" aria-label="Player 2 down">▼</button>
-              </div>
-              <div class="center-controls">
-                <div class="system-controls">
-                  <button data-player="2" data-button="4">Select</button>
-                  <button data-player="2" data-button="8">Start</button>
-                </div>
-              </div>
-              <div class="action-controls">
-                <div class="face-buttons">
-                  <button data-player="2" data-button="2" class="round">B</button>
-                  <button data-player="2" data-button="1" class="round accent">A</button>
-                </div>
-                <div class="shoulder-buttons">
-                  <button data-player="2" data-button="512">L</button>
-                  <button data-player="2" data-button="256">R</button>
-                </div>
-              </div>
-            </div>
-            <div class="keymap">
-              <span>Move: I/J/K/L</span><span>A: M</span><span>B: N</span>
-              <span>L: U</span><span>R: O</span><span>Start: P</span><span>Select: H</span>
-            </div>
-            <div class="local-link-actions local-link-actions-player-two" aria-label="Player 2 cable actions">
-              <button id="local-p2-ready" type="button" disabled>P2 Ready</button>
-            </div>
-          </div>
+          <div id="player2-runtime" hidden></div>
         </div>
 
         <aside id="save-column" class="save-column">
@@ -247,6 +158,56 @@
       </section>
     </main>
     </div>
+
+    <template id="player-runtime-template">
+      <div class="player-runtime" data-player-runtime>
+        <div class="screen-shell" data-runtime-role="screen-shell">
+          <canvas width="240" height="160" data-runtime-role="screen"></canvas>
+          <div class="screen-empty" data-runtime-role="screen-empty">Select ROM</div>
+        </div>
+        <div class="playback-bar">
+          <button type="button" data-runtime-role="pause" disabled>Pause</button>
+          <button type="button" data-runtime-role="mute" disabled>Mute</button>
+          <button type="button" data-runtime-role="fullscreen" disabled>Fullscreen</button>
+          <span class="status idle" data-runtime-role="status">Idle</span>
+        </div>
+        <div class="touch-controls" data-runtime-role="touch-controls">
+          <div class="dpad">
+            <button data-button="64" class="up direction">▲</button>
+            <button data-button="32" class="left direction">◀</button>
+            <button data-button="16" class="right direction">▶</button>
+            <button data-button="128" class="down direction">▼</button>
+          </div>
+          <div class="center-controls">
+            <div class="system-controls">
+              <button data-button="4">Select</button>
+              <button data-button="8">Start</button>
+            </div>
+            <div class="quick-controls">
+              <button type="button" data-runtime-role="quick-save" disabled>Quick Save</button>
+              <button type="button" data-runtime-role="quick-load" disabled>Quick Load</button>
+            </div>
+          </div>
+          <div class="action-controls">
+            <button class="speed-toggle" type="button" aria-pressed="false"
+              data-runtime-role="speed" disabled>Speed off</button>
+            <div class="face-buttons">
+              <button data-button="2" class="round">B</button>
+              <button data-button="1" class="round accent">A</button>
+            </div>
+            <div class="shoulder-buttons">
+              <button data-button="512">L</button>
+              <button data-button="256">R</button>
+            </div>
+          </div>
+        </div>
+        <div class="keymap" data-runtime-role="keymap"></div>
+        <div class="local-link-actions" data-runtime-role="local-actions">
+          <button type="button" data-runtime-role="ready" disabled>Ready</button>
+          <button class="primary" type="button" data-runtime-role="cable-start" disabled>Start</button>
+        </div>
+      </div>
+    </template>
 
     <script type="module" src="/app.js"></script>
   </body>

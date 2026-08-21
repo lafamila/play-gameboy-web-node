@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   applyDirectCablePair,
   directCableIdle,
+  guestCableResponsePending,
   releaseDirectCableGuest,
 } from '../web/local-link-transport.js';
 
@@ -65,4 +66,23 @@ test('direct transport releases a held guest once and reports pair-wide idle sta
   assert.deepEqual(released, { released: true, lastReleaseSequence: 7 });
   assert.equal(pair.guestHeld(), false);
   assert.equal(directCableIdle([{ core: pair.host }, { core: pair.guest }]), true);
+});
+
+test('guest response timing keeps its pump alive across a completed video frame', () => {
+  const host = {
+    _vba_link_request_pending: () => true,
+    _vba_link_request_sequence: () => 5172,
+  };
+  const guest = {
+    _vba_link_request_sequence: () => 5172,
+    _vba_link_waiting: () => false,
+    _vba_link_transfer_active: () => false,
+    _vba_link_guest_held: () => false,
+  };
+  assert.equal(guestCableResponsePending(host, guest), true);
+  guest._vba_link_waiting = () => true;
+  assert.equal(guestCableResponsePending(host, guest), false);
+  guest._vba_link_waiting = () => false;
+  guest._vba_link_request_sequence = () => 5171;
+  assert.equal(guestCableResponsePending(host, guest), false);
 });

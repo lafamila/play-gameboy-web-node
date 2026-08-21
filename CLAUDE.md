@@ -75,8 +75,11 @@ Single Play page
 - remote Ready/Start도 persisted expected status를 row lock에서 검증하며 abort 이후 terminal room을 되살릴 수 없다. 동일 checkpoint retry는 저장된 pair/metadata와 완전히 같을 때만 idempotent하다.
 - real-core cable probe export는 `VBA_LINK_TEST_PROBE` browser test build에만 포함하고 `.build/core-probe`에서 실행 후 삭제한다. production `core/dist`에는 probe surface가 없다.
 - local 2P와 remote Room은 server/UI 양쪽에서 상호 배타다. direct local cable은 두 독립 WASM memory 사이에서만 교환하며 WebSocket을 만들지 않는다.
+- remote Room과 local 2P는 `pumpLinkRuntime`의 동일한 코어 진행 순서(`drain → offer/run → drain → release`)를 공유한다. transport만 각각 WebSocket barrier와 in-memory pair로 분리한다.
 - local split 진입/P2 Load만으로 session/lock을 만들거나 P1을 pause하지 않는다. 두 runtime은 독립 실행·autosave하고 Ready는 local UI state만 바꾼다. P1 Start 시에만 양쪽 battery flush 후 session/lock → server Ready → initial paired checkpoint → cable attach 순서로 전환한다.
 - cable preparing/active 중에만 speed와 개별 quick load/import/export를 막고, P2 audio는 기본 mute다. P1/P2 gamepad는 index 0/1로 고정한다.
+- local 2P 독립 실행 중에는 P1/P2 각각 quick save/load와 `2x` speed를 사용할 수 있다. cable preparing/active에서는 두 runtime 모두 해당 제어를 표시하되 비활성화하고, cable 자체는 화면 프레임 기준 정상 속도로 유지한다.
+- P1/P2의 screen, playback bar, touch controller, keymap은 `player-runtime-template`과 `mountPlayerRuntime`을 공유한다. 플레이어별로는 element ID, keymap, 초기 mute, cable Start 소유권만 설정한다.
 
 ## Commands
 

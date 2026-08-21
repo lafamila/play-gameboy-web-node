@@ -41,3 +41,10 @@ export function directCableIdle(runtimes) {
     !runtime.core._vba_link_waiting() && !runtime.core._vba_link_transfer_active() &&
     !runtime.core._vba_link_request_pending());
 }
+
+export function guestCableResponsePending(host, guest) {
+  return Boolean(host?._vba_link_request_pending() && guest &&
+    Number(host._vba_link_request_sequence()) === Number(guest._vba_link_request_sequence()) &&
+    !guest._vba_link_waiting() && !guest._vba_link_transfer_active() &&
+    !guest._vba_link_guest_held());
+}

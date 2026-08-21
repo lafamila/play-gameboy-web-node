@@ -1005,9 +1005,11 @@ class LocalTwoPlayerController {
       const startBody = await startResponse.json().catch(() => ({}));
       if (!startResponse.ok) throw new Error(startBody.error || 'Local 2P start failed');
       this.session = startBody.session;
-      if (!cableIdle() || !core._vba_link_set_player(0) ||
+      core._vba_link_cancel_wait();
+      playerTwo.core?._vba_link_cancel_wait();
+      if (!core._vba_link_set_player(0) ||
           !playerTwo.core?._vba_link_set_player(1)) {
-        throw new Error('Both cable cores must be idle before Start');
+        throw new Error('Both cable cores could not attach at Start');
       }
       this.active = true;
       this.preparing = false;

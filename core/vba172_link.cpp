@@ -199,7 +199,11 @@ void vbaLinkReset() {
 }
 
 int vbaLinkSetPlayer(int playerId) {
-  if (playerId < -1 || playerId > 1 || g_transferPhase || g_waiting) return 0;
+  if (playerId < -1 || playerId > 1 || g_transferPhase) return 0;
+  g_waiting = false;
+  g_requestPending = false;
+  g_remoteSequence = -1;
+  g_remoteTicks = 0;
   g_player = playerId;
   g_sequence = 0;
   g_requestTicks = 0;

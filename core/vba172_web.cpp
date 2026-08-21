@@ -526,6 +526,18 @@ bool RunNativeLinkProbe() {
     return false;
   }
   vba_link_cancel_wait();
+  if (!vba_link_set_player(0)) return false;
+  WRITE16LE(&ioMem[0x12a], 0x4321);
+  StartLink(0x6083);
+  if (!vba_link_waiting() || !vba_link_request_pending()) {
+    fprintf(stderr, "LINK probe stale wait setup failed\n");
+    return false;
+  }
+  if (!vba_link_set_player(0) || vba_link_waiting() ||
+      vba_link_request_pending()) {
+    fprintf(stderr, "LINK probe waiting reattach failed\n");
+    return false;
+  }
   return vba_link_set_player(-1);
 }
 

@@ -3,7 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-    <title>GBC Porting</title>
+    <meta name="theme-color" content="#0d0f12" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="V" />
+    <meta name="format-detection" content="telephone=no" />
+    <title>V · Play Game Boy</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" href="/icons/favicon.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -12,12 +21,12 @@
     </section>
 
     <section id="login-view" class="gate-view" hidden>
-      <h1>GBC Porting</h1>
+      <div class="gate-brand"><img src="/icons/icon-192.png" alt="" /><h1>V</h1></div>
       <a id="login-link" class="primary-link" href="/auth/login">Login</a>
     </section>
 
     <section id="visitor-view" class="gate-view" hidden>
-      <h1>GBC Porting</h1>
+      <div class="gate-brand"><img src="/icons/icon-192.png" alt="" /><h1>V</h1></div>
       <span id="visitor-account" class="gate-status"></span>
       <button id="request-access" class="primary" type="button">Request user access</button>
       <span id="access-request-status" class="gate-status"></span>
@@ -26,6 +35,11 @@
 
     <div id="app-view" hidden>
     <main>
+      <header class="app-header">
+        <div class="app-brand" aria-label="V">
+          <img src="/icons/icon-192.png" alt="" />
+          <span>V</span>
+        </div>
       <section class="rom-toolbar" aria-label="ROM selection">
         <div class="rom-toolbar-player rom-toolbar-player-one">
           <select id="rom-select" aria-label="Player 1 ROM"></select>
@@ -80,6 +94,7 @@
           <button id="player2-logout" type="button" hidden>Logout P2</button>
         </div>
       </section>
+      </header>
 
       <section id="local-2p-bar" class="local-2p-bar" hidden aria-label="Local two player controls">
         <span id="local-2p-status" class="status idle">Player 2 setup</span>
@@ -87,6 +102,8 @@
       </section>
 
       <section id="workspace" class="workspace">
+        <button id="fullscreen-exit" class="fullscreen-exit" type="button"
+          aria-label="Exit fullscreen" title="Exit fullscreen" hidden>×</button>
         <div id="player-one-panel" class="player-column player-panel" data-player="1">
           <div id="player1-runtime"></div>
         </div>

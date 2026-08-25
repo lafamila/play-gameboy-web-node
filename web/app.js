@@ -84,7 +84,7 @@ const elements = Object.fromEntries([
   'link-room-id', 'link-invite-row', 'link-invite-code', 'link-room-status',
   'link-room-copy-feedback', 'link-pw-copy-feedback',
   'link-participants', 'link-ready', 'link-start', 'link-finish', 'link-abort', 'link-close',
-  'workspace', 'save-column', 'local-2p-toggle', 'local-2p-bar', 'local-2p-status',
+  'workspace', 'save-column', 'fullscreen-exit', 'local-2p-toggle', 'local-2p-bar', 'local-2p-status',
   'local-p1-ready', 'local-p2-ready', 'local-start', 'local-exit', 'player-one-panel',
   'player-two-panel', 'player2-account', 'player2-logout', 'player2-choice', 'player2-login',
   'player2-guest', 'player2-close', 'player2-auth-status', 'player2-visitor',
@@ -397,6 +397,7 @@ let linkIdleSince = 0;
 let linkFinishIdle = false;
 let linkDebugEnabled = false;
 let localTwoPlayer;
+let immersiveFullscreen = false;
 const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
@@ -418,6 +419,7 @@ async function apiFetch(url, options = {}) {
 }
 
 function stopEmulation() {
+  if (immersiveFullscreen) void exitImmersiveFullscreen();
   running = false;
   clearInterval(batteryTimer);
   cancelAnimationFrame(animationHandle);
@@ -529,7 +531,8 @@ function applyControlState() {
   const roomOpen = isLinkRoomOpen();
   const localOpen = Boolean(localTwoPlayer?.enabled);
   const localCableOpen = Boolean(localTwoPlayer?.preparing || localTwoPlayer?.active);
-  for (const id of ['pause', 'mute', 'fullscreen']) elements[id].disabled = !emulatorControlsEnabled;
+  for (const id of ['pause', 'mute']) elements[id].disabled = !emulatorControlsEnabled;
+  elements.fullscreen.disabled = !emulatorControlsEnabled || (localOpen && !playerTwo.running);
   elements['speed-toggle'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen;
   elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen;
   elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen || !hasStoredQuickState;
@@ -552,6 +555,7 @@ function applyControlState() {
   for (const id of ['player2-pause', 'player2-mute', 'player2-fullscreen']) {
     elements[id].disabled = !playerTwoControlsEnabled;
   }
+  elements['player2-fullscreen'].hidden = localOpen;
   elements['player2-speed-toggle'].disabled = !playerTwoControlsEnabled || localCableOpen;
   elements['player2-quick-save'].disabled = !playerTwoControlsEnabled || localCableOpen;
   elements['player2-quick-load'].disabled = !playerTwoControlsEnabled || localCableOpen ||
@@ -751,6 +755,55 @@ function renderFrame() {
 
 function gamepadMask(slot = 0) {
   return gamepadMaskForSlot(navigator.getGamepads?.(), slot);
+}
+
+function renderImmersiveFullscreen() {
+  document.documentElement.classList.toggle('immersive-play', immersiveFullscreen);
+  elements.workspace.classList.toggle('immersive-stage', immersiveFullscreen);
+  elements['fullscreen-exit'].hidden = !immersiveFullscreen;
+}
+
+async function lockLandscape() {
+  try {
+    await screen.orientation?.lock?.('landscape');
+  } catch {
+    // Orientation locking is optional and commonly unavailable outside installed PWAs.
+  }
+}
+
+async function enterImmersiveFullscreen() {
+  if (!playerOne.running || !playerOne.activeRom) throw new Error('Load Player 1 first');
+  if (localTwoPlayer.enabled && (!playerTwo.running || !playerTwo.activeRom)) {
+    throw new Error('Load Player 2 before fullscreen');
+  }
+  immersiveFullscreen = true;
+  renderImmersiveFullscreen();
+  if (!document.fullscreenElement && elements.workspace.requestFullscreen) {
+    try {
+      await elements.workspace.requestFullscreen({ navigationUI: 'hide' });
+    } catch {
+      // CSS immersive mode remains available when Fullscreen API is restricted.
+    }
+  }
+  await lockLandscape();
+}
+
+async function exitImmersiveFullscreen({ browserAlreadyExited = false } = {}) {
+  immersiveFullscreen = false;
+  renderImmersiveFullscreen();
+  try {
+    screen.orientation?.unlock?.();
+  } catch {
+    // Orientation unlock is best effort.
+  }
+  if (!browserAlreadyExited && document.fullscreenElement && document.exitFullscreen) {
+    await document.exitFullscreen().catch(() => {});
+  }
+}
+
+async function toggleImmersiveFullscreen() {
+  if (immersiveFullscreen) await exitImmersiveFullscreen();
+  else await enterImmersiveFullscreen();
 }
 
 class LocalTwoPlayerController {
@@ -2903,15 +2956,22 @@ elements['speed-toggle'].addEventListener('click', () => {
   elements['speed-toggle'].setAttribute('aria-pressed', String(speedMode));
   elements['speed-toggle'].textContent = speedMode ? 'Speed on' : 'Speed off';
 });
-elements.fullscreen.addEventListener('click', () =>
-  (localTwoPlayer.enabled ? elements.workspace : elements['screen-shell']).requestFullscreen());
+elements.fullscreen.addEventListener('click', () => runAction(toggleImmersiveFullscreen));
 elements['player2-pause'].addEventListener('click', () => toggleRuntimePause(1));
 elements['player2-mute'].addEventListener('click', () => {
   playerTwo.muted = !playerTwo.muted;
   elements['player2-mute'].textContent = playerTwo.muted ? 'Unmute' : 'Mute';
 });
-elements['player2-fullscreen'].addEventListener('click', () =>
-  elements.workspace.requestFullscreen());
+elements['player2-fullscreen'].addEventListener('click', () => runAction(toggleImmersiveFullscreen));
+elements['fullscreen-exit'].addEventListener('click', () => runAction(exitImmersiveFullscreen));
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement === elements.workspace) {
+    immersiveFullscreen = true;
+    renderImmersiveFullscreen();
+  } else if (immersiveFullscreen) {
+    void exitImmersiveFullscreen({ browserAlreadyExited: true });
+  }
+});
 elements['player2-speed-toggle'].addEventListener('click', () => {
   playerTwo.speedMode = !playerTwo.speedMode;
   elements['player2-speed-toggle'].setAttribute('aria-pressed', String(playerTwo.speedMode));
@@ -3020,6 +3080,7 @@ for (const button of document.querySelectorAll('[data-button]')) {
 }
 
 window.addEventListener('pagehide', () => {
+  try { screen.orientation?.unlock?.(); } catch {}
   player2AuthChannel.close();
   if (activeRom && !isLinkRoomOpen() && !localTwoPlayer.preparing && !localTwoPlayer.active) {
     stashStandaloneBatteries();
@@ -3083,6 +3144,8 @@ window.__gbaPoc = {
       inputMask: keyMask | touchMask,
       speedMode,
       speedMultiplier: speedMode ? SPEED_MODE_MULTIPLIER : 1,
+      immersiveFullscreen,
+      browserFullscreen: document.fullscreenElement === elements.workspace,
       linkRoom: linkRoom ? {
         id: linkRoom.id,
         status: linkRoom.status,
@@ -3161,5 +3224,13 @@ window.__gbaPoc = {
     };
   },
 };
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').catch((error) => {
+      console.warn('PWA service worker registration failed', error);
+    });
+  }, { once: true });
+}
 
 runAction(bootstrap);

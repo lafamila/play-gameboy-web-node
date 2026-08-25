@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .omc/
+.omx/
 .build/
 node_modules/
 core/dist/

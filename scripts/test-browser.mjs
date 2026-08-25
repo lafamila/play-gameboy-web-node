@@ -191,6 +191,10 @@ async function main() {
       const node = await cdp.send('DOM.querySelector', { nodeId: document.root.nodeId, selector });
       await cdp.send('DOM.setFileInputFiles', { nodeId: node.nodeId, files: [filename] });
     };
+    const captureScreenshot = async (filename) => {
+      const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png', fromSurface: true });
+      await writeFile(path.join(buildDirectory, filename), Buffer.from(screenshot.data, 'base64'));
+    };
 
     await waitExpression('!document.getElementById("login-view").hidden', 'login view');
     await evaluate(`fetch('/__test/session', {
@@ -240,6 +244,28 @@ async function main() {
     await cdp.send('Page.navigate', { url: origin });
     await loaded;
     await waitExpression('document.getElementById("event-log").innerText.includes("Catalog ready")', 'catalog');
+    await waitExpression(
+      `navigator.serviceWorker.getRegistration().then(registration =>
+        Boolean(registration?.active))`,
+      'PWA service worker activation',
+    );
+    const pwaContract = await evaluate(`Promise.all([
+      fetch('/manifest.webmanifest').then(async response => ({
+        contentType: response.headers.get('content-type'),
+        manifest: await response.json()
+      })),
+      fetch('/icons/icon-192.png').then(response => response.blob())
+        .then(blob => createImageBitmap(blob)).then(image => ({width: image.width, height: image.height})),
+      fetch('/icons/icon-512.png').then(response => response.blob())
+        .then(blob => createImageBitmap(blob)).then(image => ({width: image.width, height: image.height}))
+    ]).then(([manifest, smallIcon, largeIcon]) => ({manifest, smallIcon, largeIcon,
+      hasController: Boolean(navigator.serviceWorker.controller)}))`);
+    assert.match(pwaContract.manifest.contentType, /^application\/manifest\+json/);
+    assert.equal(pwaContract.manifest.manifest.short_name, 'V');
+    assert.equal(pwaContract.manifest.manifest.display, 'standalone');
+    assert.deepEqual(pwaContract.smallIcon, { width: 192, height: 192 });
+    assert.deepEqual(pwaContract.largeIcon, { width: 512, height: 512 });
+    assert.equal(pwaContract.hasController, true);
     await click('menu-toggle');
     assert.equal(await evaluate('document.getElementById("account-name").innerText'), 'Browser Admin');
     assert.equal(await evaluate('document.querySelector("label[for=rom-upload]").hidden'), false);
@@ -258,6 +284,41 @@ async function main() {
     assert.ok(startup.frameCount >= 20, JSON.stringify(startup));
     assert.ok(startup.audioSamples >= 1000, JSON.stringify(startup));
     assert.ok(startup.visiblePixels >= 1000, JSON.stringify(startup));
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1280, height: 720, deviceScaleFactor: 1, mobile: false,
+    });
+    await click('fullscreen');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().immersiveFullscreen',
+      'Player 1 immersive fullscreen',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const singleFullscreen = await evaluate(`(() => {
+      const stage = document.getElementById('workspace').getBoundingClientRect();
+      const screen = document.getElementById('screen-shell').getBoundingClientRect();
+      const dpad = document.querySelector('#player-one-panel .dpad').getBoundingClientRect();
+      const actions = document.querySelector('#player-one-panel .action-controls').getBoundingClientRect();
+      const button = document.querySelector('#player-one-panel .dpad button');
+      return {stage: {left: stage.left, top: stage.top, width: stage.width, height: stage.height},
+        screen: {left: screen.left, top: screen.top, width: screen.width, height: screen.height},
+        dpadBottom: dpad.bottom, actionsRight: actions.right,
+        overlayBackground: getComputedStyle(button).backgroundColor,
+        playbackHidden: getComputedStyle(document.querySelector('#player-one-panel .playback-bar')).display,
+        exitVisible: !document.getElementById('fullscreen-exit').hidden};
+    })()`);
+    assert.deepEqual(singleFullscreen.stage, { left: 0, top: 0, width: 1280, height: 720 });
+    assert.deepEqual(singleFullscreen.screen, { left: 0, top: 0, width: 1280, height: 720 });
+    assert.ok(singleFullscreen.dpadBottom <= 720 && singleFullscreen.actionsRight <= 1280,
+      JSON.stringify(singleFullscreen));
+    assert.match(singleFullscreen.overlayBackground, /0\.18\)/);
+    assert.equal(singleFullscreen.playbackHidden, 'none');
+    assert.equal(singleFullscreen.exitVisible, true);
+    await captureScreenshot('fullscreen-player-one.png');
+    await click('fullscreen-exit');
+    await waitExpression(
+      '!window.__gbaPoc.diagnostics().immersiveFullscreen',
+      'Player 1 fullscreen exit',
+    );
     assert.equal(await evaluate('document.getElementById("link-create").disabled'), false);
     await click('link-create');
     await waitExpression(
@@ -600,6 +661,7 @@ async function main() {
     assert.equal(runtimeStructure.playerOne.runtimeView, 1);
     assert.equal(runtimeStructure.playerOne.playbackActions, 3);
     assert.equal(runtimeStructure.playerOne.compact, false);
+    assert.equal(await evaluate('document.getElementById("player2-fullscreen").hidden'), true);
     await click('player2-pause');
     await waitExpression(
       'window.__gbaPoc.diagnostics().players[1].paused && ' +
@@ -635,6 +697,60 @@ async function main() {
       'document.getElementById("event-log").innerText.includes("P2 quick state loaded")',
       'Player 2 quick state load',
     );
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1280, height: 720, deviceScaleFactor: 1, mobile: false,
+    });
+    await click('fullscreen');
+    await waitExpression(
+      'window.__gbaPoc.diagnostics().immersiveFullscreen',
+      'local 2P immersive fullscreen',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const splitFullscreen = await evaluate(`(() => {
+      const first = document.getElementById('player-one-panel').getBoundingClientRect();
+      const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      const firstScreen = document.getElementById('screen-shell').getBoundingClientRect();
+      const secondScreen = document.getElementById('player2-screen-shell').getBoundingClientRect();
+      return {first: {left: first.left, width: first.width, height: first.height},
+        second: {left: second.left, width: second.width, height: second.height},
+        firstScreen: {left: firstScreen.left, width: firstScreen.width, height: firstScreen.height},
+        secondScreen: {left: secondScreen.left, width: secondScreen.width, height: secondScreen.height}};
+    })()`);
+    assert.deepEqual(splitFullscreen.first, { left: 0, width: 640, height: 720 });
+    assert.deepEqual(splitFullscreen.second, { left: 640, width: 640, height: 720 });
+    assert.deepEqual(splitFullscreen.firstScreen, { left: 0, width: 640, height: 720 });
+    assert.deepEqual(splitFullscreen.secondScreen, { left: 640, width: 640, height: 720 });
+    await captureScreenshot('fullscreen-local-2p-desktop.png');
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 844, height: 390, deviceScaleFactor: 1, mobile: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const mobileSplit = await evaluate(`(() => {
+      const first = document.getElementById('player-one-panel').getBoundingClientRect();
+      const second = document.getElementById('player-two-panel').getBoundingClientRect();
+      const firstDpad = document.querySelector('#player-one-panel .dpad').getBoundingClientRect();
+      const firstActions = document.querySelector('#player-one-panel .action-controls').getBoundingClientRect();
+      const secondDpad = document.querySelector('#player-two-panel .dpad').getBoundingClientRect();
+      const secondActions = document.querySelector('#player-two-panel .action-controls').getBoundingClientRect();
+      return {first: {left: first.left, width: first.width}, second: {left: second.left, width: second.width},
+        firstNoOverlap: firstDpad.right < firstActions.left,
+        secondNoOverlap: secondDpad.right < secondActions.left,
+        scrollWidth: document.documentElement.scrollWidth, innerWidth};
+    })()`);
+    assert.deepEqual(mobileSplit.first, { left: 0, width: 422 });
+    assert.deepEqual(mobileSplit.second, { left: 422, width: 422 });
+    assert.equal(mobileSplit.firstNoOverlap, true, JSON.stringify(mobileSplit));
+    assert.equal(mobileSplit.secondNoOverlap, true, JSON.stringify(mobileSplit));
+    assert.ok(mobileSplit.scrollWidth <= mobileSplit.innerWidth, JSON.stringify(mobileSplit));
+    await captureScreenshot('fullscreen-local-2p-mobile.png');
+    await click('fullscreen-exit');
+    await waitExpression(
+      '!window.__gbaPoc.diagnostics().immersiveFullscreen',
+      'local 2P fullscreen exit',
+    );
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1280, height: 720, deviceScaleFactor: 1, mobile: false,
+    });
     await new Promise((resolve) => setTimeout(resolve, 900));
     const independentRunning = await evaluate('window.__gbaPoc.diagnostics()');
     assert.ok(independentRunning.players[0].emulationSteps > dualLoaded.players[0].emulationSteps,

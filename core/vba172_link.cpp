@@ -51,10 +51,24 @@ bool PrepareScheduledGuestResponse(bool interruptCpu) {
 }
 
 void WriteRoleBits(u16 value) {
-  value &= 0xffbb;
+  value &= 0xff8b;
   value |= g_player == 0 ? 8 : 0x0c;
   value |= (std::max(g_player, 0) << 4);
   UPDATE_REG(0x128, value);
+}
+
+void WriteCableLines(bool transferActive) {
+  if (!ioMem || g_player < 0) return;
+  u16 value = READ16LE(&ioMem[0x134]);
+  if (value & 0x8000) return;
+
+  // Multiplayer cable input lines are read-only from the game's perspective.
+  // Nintendo's Mario Bros. link code requires SC to be high while idle.
+  value &= 0xfff0;
+  value |= 0x02;  // SD: every attached player is in multiplayer mode.
+  if (g_player != 0) value |= 0x04;  // SI: this core is a child.
+  if (!transferActive) value |= 0x01;  // SC: clock is high until transfer starts.
+  UPDATE_REG(0x134, value);
 }
 
 void WriteDisconnectedSio(u16 value) {
@@ -84,6 +98,7 @@ void StartPairedTransfer(int sequence, int speed, int masterData, int slaveData)
   g_remoteTicks = 0;
   WRITE32LE(&ioMem[0x120], 0xffffffff);
   WRITE32LE(&ioMem[0x124], 0xffffffff);
+  WriteCableLines(true);
   UPDATE_REG(0x128, READ16LE(&ioMem[0x128]) | 0x80);
 }
 
@@ -118,16 +133,13 @@ void StartLink(u16 value) {
 
 void StartGPLink(u16 value) {
   if (!ioMem) return;
-  if (!value) {
-    UPDATE_REG(0x134, 0);
-    return;
-  }
+  UPDATE_REG(0x134, value);
   if (g_player >= 0 && !(value & 0x8000) &&
       (READ16LE(&ioMem[0x128]) & 0x3000) == 0x2000) {
     WriteRoleBits(READ16LE(&ioMem[0x128]));
+    WriteCableLines(g_transferPhase != 0);
     return;
   }
-  UPDATE_REG(0x134, value);
 }
 
 void StartJOYLink(u16 value) {
@@ -174,6 +186,7 @@ void LinkUpdate() {
                (READ16LE(&ioMem[0x128]) & 0xff0f) |
                    (std::max(g_player, 0) << 4));
     ++g_sequence;
+    WriteCableLines(false);
     if (g_player == 1) {
       g_guestHoldPending = true;
     }
@@ -210,7 +223,12 @@ int vbaLinkSetPlayer(int playerId) {
   linktime = 0;
   g_guestHeld = false;
   g_guestHoldPending = false;
-  if (ioMem && playerId >= 0) WriteRoleBits(READ16LE(&ioMem[0x128]));
+  if (ioMem && playerId >= 0) {
+    WriteRoleBits(READ16LE(&ioMem[0x128]));
+    WriteCableLines(false);
+  } else if (ioMem) {
+    UPDATE_REG(0x134, READ16LE(&ioMem[0x134]) & 0xfff0);
+  }
   return 1;
 }
 

@@ -299,10 +299,13 @@ async function main() {
       const dpad = document.querySelector('#player-one-panel .dpad').getBoundingClientRect();
       const actions = document.querySelector('#player-one-panel .action-controls').getBoundingClientRect();
       const button = document.querySelector('#player-one-panel .dpad button');
+      const doubleClick = new MouseEvent('dblclick', {bubbles: true, cancelable: true});
       return {stage: {left: stage.left, top: stage.top, width: stage.width, height: stage.height},
         screen: {left: screen.left, top: screen.top, width: screen.width, height: screen.height},
         dpadBottom: dpad.bottom, actionsRight: actions.right,
         overlayBackground: getComputedStyle(button).backgroundColor,
+        buttonTouchAction: getComputedStyle(button).touchAction,
+        doubleClickPrevented: !button.dispatchEvent(doubleClick),
         playbackHidden: getComputedStyle(document.querySelector('#player-one-panel .playback-bar')).display,
         exitVisible: !document.getElementById('fullscreen-exit').hidden};
     })()`);
@@ -311,6 +314,8 @@ async function main() {
     assert.ok(singleFullscreen.dpadBottom <= 720 && singleFullscreen.actionsRight <= 1280,
       JSON.stringify(singleFullscreen));
     assert.match(singleFullscreen.overlayBackground, /0\.18\)/);
+    assert.equal(singleFullscreen.buttonTouchAction, 'none');
+    assert.equal(singleFullscreen.doubleClickPrevented, true);
     assert.equal(singleFullscreen.playbackHidden, 'none');
     assert.equal(singleFullscreen.exitVisible, true);
     await captureScreenshot('fullscreen-player-one.png');
@@ -732,15 +737,21 @@ async function main() {
       const firstActions = document.querySelector('#player-one-panel .action-controls').getBoundingClientRect();
       const secondDpad = document.querySelector('#player-two-panel .dpad').getBoundingClientRect();
       const secondActions = document.querySelector('#player-two-panel .action-controls').getBoundingClientRect();
+      const stage = document.getElementById('workspace').getBoundingClientRect();
+      const viewport = window.visualViewport;
       return {first: {left: first.left, width: first.width}, second: {left: second.left, width: second.width},
         firstNoOverlap: firstDpad.right < firstActions.left,
         secondNoOverlap: secondDpad.right < secondActions.left,
+        stage: {left: stage.left, top: stage.top, width: stage.width, height: stage.height},
+        viewport: {left: viewport?.offsetLeft ?? 0, top: viewport?.offsetTop ?? 0,
+          width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight},
         scrollWidth: document.documentElement.scrollWidth, innerWidth};
     })()`);
     assert.deepEqual(mobileSplit.first, { left: 0, width: 422 });
     assert.deepEqual(mobileSplit.second, { left: 422, width: 422 });
     assert.equal(mobileSplit.firstNoOverlap, true, JSON.stringify(mobileSplit));
     assert.equal(mobileSplit.secondNoOverlap, true, JSON.stringify(mobileSplit));
+    assert.deepEqual(mobileSplit.stage, mobileSplit.viewport);
     assert.ok(mobileSplit.scrollWidth <= mobileSplit.innerWidth, JSON.stringify(mobileSplit));
     await captureScreenshot('fullscreen-local-2p-mobile.png');
     await click('fullscreen-exit');

@@ -759,7 +759,7 @@ function localLinkDiagnostic(value) {
     const state = {};
     for (const key of [
       'slot', 'player', 'sequence', 'requestData', 'requestTicks', 'linkTime',
-      'siocnt', 'frameCount', 'emulationSteps', 'pumpBurst',
+      'siocnt', 'rcnt', 'frameCount', 'emulationSteps', 'pumpBurst',
     ]) {
       if (Number.isSafeInteger(player?.[key])) state[key] = player[key];
     }
@@ -809,7 +809,7 @@ function attachLinkWebSockets({ server, config, database, auth, linkService }) {
     const fields = {};
     for (const key of [
       'slot', 'corePlayer', 'sequence', 'requestData', 'requestTicks', 'linkTime',
-      'siocnt', 'siodata8', 'lastOfferSequence', 'pendingOffers', 'pendingPairs',
+      'siocnt', 'rcnt', 'siodata8', 'lastOfferSequence', 'pendingOffers', 'pendingPairs',
       'preparedResponses', 'frameCount',
     ]) {
       if (Number.isSafeInteger(state[key])) fields[key] = state[key];

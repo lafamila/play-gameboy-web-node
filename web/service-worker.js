@@ -1,4 +1,4 @@
-const CACHE_NAME = 'v-play-shell-v1';
+const CACHE_NAME = 'v-play-shell-v2';
 const APP_SHELL = [
   '/',
   '/styles.css',
@@ -61,6 +61,10 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin || isPrivateRequest(url)) return;
   if (event.request.mode === 'navigate') {
+    event.respondWith(networkFirst(event.request));
+    return;
+  }
+  if (url.pathname.startsWith('/core/')) {
     event.respondWith(networkFirst(event.request));
     return;
   }

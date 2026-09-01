@@ -406,6 +406,9 @@ VBA_EXPORT int vba_link_time() { return linktime; }
 VBA_EXPORT int vba_link_siocnt() {
   return ioMem ? READ16LE(&ioMem[0x128]) : -1;
 }
+VBA_EXPORT int vba_link_rcnt() {
+  return ioMem ? READ16LE(&ioMem[0x134]) : -1;
+}
 VBA_EXPORT int vba_link_siodata8() {
   return ioMem ? READ16LE(&ioMem[0x12a]) : -1;
 }
@@ -431,7 +434,7 @@ VBA_EXPORT int vba_link_test_begin_request(int data, int speed) {
   if (!ioMem || vbaLinkPlayer() != 0 || data < 0 || data > 0xffff || speed < 0 || speed > 3) {
     return 0;
   }
-  WRITE16LE(&ioMem[0x134], 0);
+  StartGPLink(0);
   WRITE16LE(&ioMem[0x12a], data);
   StartLink(0x6080 | speed);
   return vbaLinkRequestPending() ? 1 : 0;
@@ -453,11 +456,22 @@ VBA_EXPORT void vba_shutdown() {
 
 #ifdef VBA_NATIVE_TEST
 bool RunNativeLinkProbe() {
+  StartGPLink(0);
   if (!vba_link_set_player(0)) {
     fprintf(stderr, "LINK probe configure failed\n");
     return false;
   }
-  WRITE16LE(&ioMem[0x134], 0);
+  if ((READ16LE(&ioMem[0x128]) & 0x3c) != 0x08) {
+    fprintf(stderr, "LINK parent pre-transfer role bits invalid: %04x\n",
+            READ16LE(&ioMem[0x128]));
+    return false;
+  }
+  if ((READ16LE(&ioMem[0x134]) & 0x07) != 0x03) {
+    fprintf(stderr, "LINK parent idle cable lines invalid: %04x\n",
+            READ16LE(&ioMem[0x134]));
+    return false;
+  }
+  StartGPLink(0);
   WRITE16LE(&ioMem[0x12a], 0x1234);
   StartLink(0x6083);
   if (!vba_link_request_pending() || !vba_link_waiting() ||
@@ -473,17 +487,34 @@ bool RunNativeLinkProbe() {
     fprintf(stderr, "LINK probe pair failed\n");
     return false;
   }
+  if (READ16LE(&ioMem[0x134]) & 0x01) {
+    fprintf(stderr, "LINK parent transfer clock stayed high: %04x\n",
+            READ16LE(&ioMem[0x134]));
+    return false;
+  }
   linktime = 100000;
   LinkUpdate();
   const bool passed = !vba_link_transfer_active() && !vba_link_waiting() &&
                       READ16LE(&ioMem[0x120]) == 0x1234 &&
-                      READ16LE(&ioMem[0x122]) == 0xabcd;
+                      READ16LE(&ioMem[0x122]) == 0xabcd &&
+                      (READ16LE(&ioMem[0x134]) & 0x07) == 0x03;
   if (!passed) {
     fprintf(stderr, "LINK probe active=%d wait=%d data=%04x/%04x\n",
             vba_link_transfer_active(), vba_link_waiting(),
             READ16LE(&ioMem[0x120]), READ16LE(&ioMem[0x122]));
   }
   if (!passed || !vba_link_set_player(-1) || !vba_link_set_player(1)) return false;
+
+  if ((READ16LE(&ioMem[0x128]) & 0x3c) != 0x1c) {
+    fprintf(stderr, "LINK child pre-transfer role bits invalid: %04x\n",
+            READ16LE(&ioMem[0x128]));
+    return false;
+  }
+  if ((READ16LE(&ioMem[0x134]) & 0x07) != 0x07) {
+    fprintf(stderr, "LINK child idle cable lines invalid: %04x\n",
+            READ16LE(&ioMem[0x134]));
+    return false;
+  }
 
   WRITE16LE(&ioMem[0x12a], 0xabcd);
   if (vba_link_prepare_remote(0, 3, 0x1234, 0) != 0xabcd) {
@@ -498,6 +529,11 @@ bool RunNativeLinkProbe() {
   }
   linktime = 100000;
   LinkUpdate();
+  if ((READ16LE(&ioMem[0x128]) & 0x30) != 0x10) {
+    fprintf(stderr, "LINK child post-transfer ID bits invalid: %04x\n",
+            READ16LE(&ioMem[0x128]));
+    return false;
+  }
   if (vba_link_guest_held()) {
     fprintf(stderr, "LINK guest held before serial response write\n");
     return false;

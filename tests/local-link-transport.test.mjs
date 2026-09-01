@@ -6,6 +6,7 @@ import {
   directCableIdle,
   guestCableResponsePending,
   releaseDirectCableGuest,
+  requiresIrqReleaseGate,
 } from '../web/local-link-transport.js';
 
 function corePair() {
@@ -66,6 +67,23 @@ test('direct transport releases a held guest once and reports pair-wide idle sta
   assert.deepEqual(released, { released: true, lastReleaseSequence: 7 });
   assert.equal(pair.guestHeld(), false);
   assert.equal(directCableIdle([{ core: pair.host }, { core: pair.guest }]), true);
+});
+
+test('only Pokemon Gen 3 retains the IRQ-gated guest release compatibility path', () => {
+  assert.equal(requiresIrqReleaseGate('BPRE'), true);
+  assert.equal(requiresIrqReleaseGate('AX4E'), false);
+
+  const pair = corePair();
+  pair.host._vba_link_siocnt = () => 0x4000;
+  applyDirectCablePair(pair.host, pair.guest, {
+    lastPairSequence: -1, guestHandshakePending: false,
+  });
+  assert.deepEqual(releaseDirectCableGuest(pair.host, pair.guest, -1, true), {
+    released: false, lastReleaseSequence: -1,
+  });
+  assert.deepEqual(releaseDirectCableGuest(pair.host, pair.guest, -1, false), {
+    released: true, lastReleaseSequence: 7,
+  });
 });
 
 test('guest response timing keeps its pump alive across a completed video frame', () => {

@@ -5,6 +5,7 @@ import {
   directCableIdle,
   guestCableResponsePending,
   releaseDirectCableGuest,
+  requiresIrqReleaseGate,
 } from '/local-link-transport.js';
 import { pumpLinkRuntime } from '/link-runtime-pump.js';
 import { gamepadMaskForSlot } from '/player-input.js';
@@ -757,10 +758,28 @@ function gamepadMask(slot = 0) {
   return gamepadMaskForSlot(navigator.getGamepads?.(), slot);
 }
 
+function syncImmersiveViewport() {
+  const root = document.documentElement;
+  const properties = [
+    '--immersive-viewport-top', '--immersive-viewport-left',
+    '--immersive-viewport-width', '--immersive-viewport-height',
+  ];
+  if (!immersiveFullscreen) {
+    for (const property of properties) root.style.removeProperty(property);
+    return;
+  }
+  const viewport = window.visualViewport;
+  root.style.setProperty('--immersive-viewport-top', `${viewport?.offsetTop ?? 0}px`);
+  root.style.setProperty('--immersive-viewport-left', `${viewport?.offsetLeft ?? 0}px`);
+  root.style.setProperty('--immersive-viewport-width', `${viewport?.width ?? window.innerWidth}px`);
+  root.style.setProperty('--immersive-viewport-height', `${viewport?.height ?? window.innerHeight}px`);
+}
+
 function renderImmersiveFullscreen() {
   document.documentElement.classList.toggle('immersive-play', immersiveFullscreen);
   elements.workspace.classList.toggle('immersive-stage', immersiveFullscreen);
   elements['fullscreen-exit'].hidden = !immersiveFullscreen;
+  syncImmersiveViewport();
 }
 
 async function lockLandscape() {
@@ -786,6 +805,8 @@ async function enterImmersiveFullscreen() {
     }
   }
   await lockLandscape();
+  syncImmersiveViewport();
+  requestAnimationFrame(syncImmersiveViewport);
 }
 
 async function exitImmersiveFullscreen({ browserAlreadyExited = false } = {}) {
@@ -1263,6 +1284,7 @@ class LocalTwoPlayerController {
           requestTicks: Number(runtime.core._vba_link_request_ticks()),
           linkTime: Number(runtime.core._vba_link_time()),
           siocnt: Number(runtime.core._vba_link_siocnt()),
+          rcnt: Number(runtime.core._vba_link_rcnt()),
           frameCount: Number(runtime.core._vba_frame_counter()),
           emulationSteps: Number(runtime.core._vba_emulation_steps()),
           pumpBurst: this.pumpBurst[runtime.slot],
@@ -1337,6 +1359,7 @@ class LocalTwoPlayerController {
   releaseGuestIfIdle() {
     const result = releaseDirectCableGuest(
       playerOne.core, playerTwo.core, this.lastReleaseSequence,
+      requiresIrqReleaseGate(playerOne.activeRom?.gameCode),
     );
     this.lastReleaseSequence = result.lastReleaseSequence;
     if (result.released) this.schedulePump(1);
@@ -1761,6 +1784,7 @@ function sendLinkDiagnostic() {
       requestTicks: Number(core._vba_link_request_ticks()),
       linkTime: Number(core._vba_link_time()),
       siocnt: Number(core._vba_link_siocnt()),
+      rcnt: Number(core._vba_link_rcnt()),
       siodata8: Number(core._vba_link_siodata8()),
       lastOfferSequence: linkLastOfferSequence,
       pendingOffers: linkMessageQueue.pendingOffers,
@@ -1804,7 +1828,9 @@ function maybeSendLinkRelease() {
   const participant = currentLinkParticipant();
   if (participant?.slot !== 0 || linkRoom?.status !== 'active' || linkRoom.paused ||
       !core || core._vba_link_waiting() || core._vba_link_transfer_active() ||
-      core._vba_link_request_pending() || (Number(core._vba_link_siocnt()) & 0x4000)) return;
+      core._vba_link_request_pending() ||
+      (requiresIrqReleaseGate(activeRom?.gameCode) &&
+        (Number(core._vba_link_siocnt()) & 0x4000))) return;
   const sequence = Number(core._vba_link_request_sequence());
   if (sequence <= 0 || sequence === linkLastReleaseSequence) return;
   if (sendLinkMessage({ type: 'link-release', sequence })) {
@@ -3076,8 +3102,16 @@ for (const button of document.querySelectorAll('[data-button]')) {
   });
   button.addEventListener('pointerup', release);
   button.addEventListener('pointercancel', release);
+  button.addEventListener('lostpointercapture', release);
+  button.addEventListener('dblclick', (event) => event.preventDefault());
+  button.addEventListener('dragstart', (event) => event.preventDefault());
   button.addEventListener('contextmenu', (event) => event.preventDefault());
 }
+
+window.visualViewport?.addEventListener('resize', syncImmersiveViewport);
+window.visualViewport?.addEventListener('scroll', syncImmersiveViewport);
+window.addEventListener('resize', syncImmersiveViewport);
+window.addEventListener('orientationchange', syncImmersiveViewport);
 
 window.addEventListener('pagehide', () => {
   try { screen.orientation?.unlock?.(); } catch {}
@@ -3193,6 +3227,7 @@ window.__gbaPoc = {
         linkRequestTicks: runtime.core ? Number(runtime.core._vba_link_request_ticks()) : null,
         linkTime: runtime.core ? Number(runtime.core._vba_link_time()) : null,
         linkSiocnt: runtime.core ? Number(runtime.core._vba_link_siocnt()) : null,
+        linkRcnt: runtime.core ? Number(runtime.core._vba_link_rcnt()) : null,
         generation: runtime.generation,
         audioPointer: runtime.audioPointer,
         audioContextState: runtime.audioContext?.state || 'closed',

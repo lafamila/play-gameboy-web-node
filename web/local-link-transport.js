@@ -1,5 +1,11 @@
 import { hostTransferData, isSlaveHandshake } from './link-message-queue.js';
 
+const POKEMON_GEN3_CODES = new Set(['BPR', 'BPG', 'BPE', 'AXV', 'AXP']);
+
+export function requiresIrqReleaseGate(gameCode) {
+  return POKEMON_GEN3_CODES.has(String(gameCode || '').toUpperCase().slice(0, 3));
+}
+
 export function applyDirectCablePair(host, guest, state) {
   if (!host?._vba_link_request_pending()) return { ...state, applied: false };
   const sequence = Number(host._vba_link_request_sequence());
@@ -24,10 +30,12 @@ export function applyDirectCablePair(host, guest, state) {
   };
 }
 
-export function releaseDirectCableGuest(host, guest, lastReleaseSequence) {
+export function releaseDirectCableGuest(
+  host, guest, lastReleaseSequence, waitForIrqDisable = false,
+) {
   if (!host || !guest?._vba_link_guest_held() || host._vba_link_waiting() ||
       host._vba_link_transfer_active() || host._vba_link_request_pending() ||
-      (Number(host._vba_link_siocnt()) & 0x4000)) {
+      (waitForIrqDisable && (Number(host._vba_link_siocnt()) & 0x4000))) {
     return { released: false, lastReleaseSequence };
   }
   const sequence = Number(host._vba_link_request_sequence());

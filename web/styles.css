@@ -293,6 +293,13 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
   gap: 16px;
   padding: 14px 0;
   touch-action: none;
+  -webkit-touch-callout: none;
+}
+
+.touch-controls button {
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
 }
 
 .dpad { width: 126px; height: 126px; display: grid; grid-template: repeat(3, 42px) / repeat(3, 42px); }
@@ -355,9 +362,11 @@ html.immersive-play .workspace.immersive-stage,
 .workspace.immersive-stage:fullscreen {
   position: fixed;
   z-index: 100;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  inset: auto;
+  top: var(--immersive-viewport-top, 0px);
+  left: var(--immersive-viewport-left, 0px);
+  width: var(--immersive-viewport-width, 100dvw);
+  height: var(--immersive-viewport-height, 100dvh);
   padding: 0;
   gap: 0;
   grid-template-columns: minmax(0, 1fr);
@@ -399,6 +408,8 @@ html.immersive-play .workspace.immersive-stage .screen-shell {
 html.immersive-play .workspace.immersive-stage .screen-shell canvas {
   width: 100%;
   height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   object-fit: contain;
 }
 html.immersive-play .workspace.immersive-stage .playback-bar,

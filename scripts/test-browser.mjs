@@ -319,6 +319,35 @@ async function main() {
     assert.equal(singleFullscreen.playbackHidden, 'none');
     assert.equal(singleFullscreen.exitVisible, true);
     await captureScreenshot('fullscreen-player-one.png');
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 844, height: 390, deviceScaleFactor: 1, mobile: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    const rotatedSingleFullscreen = await evaluate(`(() => {
+      const stage = document.getElementById('workspace').getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const dpadButton = document.querySelector('#player-one-panel .dpad button').getBoundingClientRect();
+      const selectButton = document.querySelector('#player-one-panel .system-controls button').getBoundingClientRect();
+      return {stage: {left: stage.left, top: stage.top, width: stage.width, height: stage.height},
+        viewport: {left: viewport?.offsetLeft ?? 0, top: viewport?.offsetTop ?? 0,
+          width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight},
+        dpadButton: {width: dpadButton.width, height: dpadButton.height},
+        selectButton: {height: selectButton.height}};
+    })()`);
+    assert.deepEqual(rotatedSingleFullscreen.stage, rotatedSingleFullscreen.viewport);
+    assert.ok(rotatedSingleFullscreen.dpadButton.width >= 60 &&
+      rotatedSingleFullscreen.dpadButton.height >= 60, JSON.stringify(rotatedSingleFullscreen));
+    assert.ok(rotatedSingleFullscreen.selectButton.height <= 56,
+      JSON.stringify(rotatedSingleFullscreen));
+    await captureScreenshot('fullscreen-player-one-mobile-landscape.png');
+    await cdp.send('Emulation.setDeviceMetricsOverride', {
+      width: 1280, height: 720, deviceScaleFactor: 1, mobile: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 900));
     await click('fullscreen-exit');
     await waitExpression(
       '!window.__gbaPoc.diagnostics().immersiveFullscreen',

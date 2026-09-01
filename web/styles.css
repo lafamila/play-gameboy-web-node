@@ -367,6 +367,8 @@ html.immersive-play .workspace.immersive-stage,
   left: var(--immersive-viewport-left, 0px);
   width: var(--immersive-viewport-width, 100dvw);
   height: var(--immersive-viewport-height, 100dvh);
+  max-width: 100dvw;
+  max-height: 100dvh;
   padding: 0;
   gap: 0;
   grid-template-columns: minmax(0, 1fr);
@@ -416,7 +418,8 @@ html.immersive-play .workspace.immersive-stage .playback-bar,
 html.immersive-play .workspace.immersive-stage .keymap,
 html.immersive-play .workspace.immersive-stage .local-link-actions { display: none; }
 html.immersive-play .workspace.immersive-stage .touch-controls {
-  --control-unit: clamp(40px, 6vmin, 56px);
+  --control-unit: clamp(60px, 9vmin, 84px);
+  --system-control-height: clamp(40px, 6vmin, 56px);
   position: absolute;
   z-index: 5;
   inset: 0;
@@ -427,7 +430,7 @@ html.immersive-play .workspace.immersive-stage .touch-controls {
   pointer-events: none;
 }
 html.immersive-play .workspace.immersive-stage .touch-controls button {
-  min-height: var(--control-unit);
+  min-height: var(--system-control-height);
   border-color: rgb(255 255 255 / 32%);
   background: rgb(5 7 9 / 18%);
   color: rgb(255 255 255 / 68%);

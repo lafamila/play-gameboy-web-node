@@ -758,16 +758,19 @@ function gamepadMask(slot = 0) {
   return gamepadMaskForSlot(navigator.getGamepads?.(), slot);
 }
 
-function syncImmersiveViewport() {
+let immersiveViewportTimers = [];
+
+function clearImmersiveViewportMetrics() {
   const root = document.documentElement;
-  const properties = [
+  for (const property of [
     '--immersive-viewport-top', '--immersive-viewport-left',
     '--immersive-viewport-width', '--immersive-viewport-height',
-  ];
-  if (!immersiveFullscreen) {
-    for (const property of properties) root.style.removeProperty(property);
-    return;
-  }
+  ]) root.style.removeProperty(property);
+}
+
+function syncImmersiveViewport() {
+  if (!immersiveFullscreen) return;
+  const root = document.documentElement;
   const viewport = window.visualViewport;
   root.style.setProperty('--immersive-viewport-top', `${viewport?.offsetTop ?? 0}px`);
   root.style.setProperty('--immersive-viewport-left', `${viewport?.offsetLeft ?? 0}px`);
@@ -775,11 +778,22 @@ function syncImmersiveViewport() {
   root.style.setProperty('--immersive-viewport-height', `${viewport?.height ?? window.innerHeight}px`);
 }
 
+function scheduleImmersiveViewportSync() {
+  for (const timer of immersiveViewportTimers) clearTimeout(timer);
+  immersiveViewportTimers = [];
+  clearImmersiveViewportMetrics();
+  if (!immersiveFullscreen) return;
+  requestAnimationFrame(syncImmersiveViewport);
+  for (const delay of [80, 200, 400, 800]) {
+    immersiveViewportTimers.push(setTimeout(syncImmersiveViewport, delay));
+  }
+}
+
 function renderImmersiveFullscreen() {
   document.documentElement.classList.toggle('immersive-play', immersiveFullscreen);
   elements.workspace.classList.toggle('immersive-stage', immersiveFullscreen);
   elements['fullscreen-exit'].hidden = !immersiveFullscreen;
-  syncImmersiveViewport();
+  scheduleImmersiveViewportSync();
 }
 
 async function lockLandscape() {
@@ -805,8 +819,7 @@ async function enterImmersiveFullscreen() {
     }
   }
   await lockLandscape();
-  syncImmersiveViewport();
-  requestAnimationFrame(syncImmersiveViewport);
+  scheduleImmersiveViewportSync();
 }
 
 async function exitImmersiveFullscreen({ browserAlreadyExited = false } = {}) {
@@ -3108,10 +3121,10 @@ for (const button of document.querySelectorAll('[data-button]')) {
   button.addEventListener('contextmenu', (event) => event.preventDefault());
 }
 
-window.visualViewport?.addEventListener('resize', syncImmersiveViewport);
-window.visualViewport?.addEventListener('scroll', syncImmersiveViewport);
-window.addEventListener('resize', syncImmersiveViewport);
-window.addEventListener('orientationchange', syncImmersiveViewport);
+window.visualViewport?.addEventListener('resize', scheduleImmersiveViewportSync);
+window.visualViewport?.addEventListener('scroll', scheduleImmersiveViewportSync);
+window.addEventListener('resize', scheduleImmersiveViewportSync);
+window.addEventListener('orientationchange', scheduleImmersiveViewportSync);
 
 window.addEventListener('pagehide', () => {
   try { screen.orientation?.unlock?.(); } catch {}

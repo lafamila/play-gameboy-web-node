@@ -62,6 +62,15 @@ test('Pokemon Gen 3 ROMs in the same region share a cable compatibility group', 
   );
 });
 
+test('standalone ROM compatibility groups retain the complete SHA-256 identity', () => {
+  const rom = {
+    id: 'c'.repeat(64), platform: 'gba', gameCode: 'AX4E', title: 'Mario', filename: 'mario.gba',
+  };
+  const compatibility = compatibilityForRom(rom);
+  assert.equal(compatibility.gameGroup, `rom:${rom.id}`);
+  assert.equal(compatibility.gameGroup.length, 68);
+});
+
 test('two accounts ready and exchange one virtual cable transfer', async () => {
   const { database, service, roomId } = await setup();
   assert.equal((await service.setReady({ roomId, accountId: 'host', ready: true })).status, 'waiting');

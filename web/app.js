@@ -766,6 +766,28 @@ function clearImmersiveViewportMetrics() {
     '--immersive-viewport-top', '--immersive-viewport-left',
     '--immersive-viewport-width', '--immersive-viewport-height',
   ]) root.style.removeProperty(property);
+  for (const runtime of [playerOne, playerTwo]) {
+    runtime.shell.style.removeProperty('--immersive-screen-width');
+    runtime.shell.style.removeProperty('--immersive-screen-height');
+  }
+}
+
+function fitImmersiveScreens() {
+  if (!immersiveFullscreen) return;
+  for (const runtime of [playerOne, playerTwo]) {
+    const panel = runtime.shell.closest('.player-panel');
+    if (!runtime.running || !panel || panel.hidden) continue;
+    const bounds = panel.getBoundingClientRect();
+    const aspect = runtime.frameWidth / runtime.frameHeight;
+    let width = bounds.width;
+    let height = width / aspect;
+    if (height > bounds.height) {
+      height = bounds.height;
+      width = height * aspect;
+    }
+    runtime.shell.style.setProperty('--immersive-screen-width', `${width}px`);
+    runtime.shell.style.setProperty('--immersive-screen-height', `${height}px`);
+  }
 }
 
 function syncImmersiveViewport() {
@@ -776,6 +798,7 @@ function syncImmersiveViewport() {
   root.style.setProperty('--immersive-viewport-left', `${viewport?.offsetLeft ?? 0}px`);
   root.style.setProperty('--immersive-viewport-width', `${viewport?.width ?? window.innerWidth}px`);
   root.style.setProperty('--immersive-viewport-height', `${viewport?.height ?? window.innerHeight}px`);
+  fitImmersiveScreens();
 }
 
 function scheduleImmersiveViewportSync() {

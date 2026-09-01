@@ -310,7 +310,7 @@ async function main() {
         exitVisible: !document.getElementById('fullscreen-exit').hidden};
     })()`);
     assert.deepEqual(singleFullscreen.stage, { left: 0, top: 0, width: 1280, height: 720 });
-    assert.deepEqual(singleFullscreen.screen, { left: 0, top: 0, width: 1280, height: 720 });
+    assert.deepEqual(singleFullscreen.screen, { left: 100, top: 0, width: 1080, height: 720 });
     assert.ok(singleFullscreen.dpadBottom <= 720 && singleFullscreen.actionsRight <= 1280,
       JSON.stringify(singleFullscreen));
     assert.match(singleFullscreen.overlayBackground, /0\.18\)/);
@@ -329,16 +329,25 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 900));
     const rotatedSingleFullscreen = await evaluate(`(() => {
       const stage = document.getElementById('workspace').getBoundingClientRect();
+      const gameScreen = document.getElementById('screen-shell').getBoundingClientRect();
       const viewport = window.visualViewport;
       const dpadButton = document.querySelector('#player-one-panel .dpad button').getBoundingClientRect();
       const selectButton = document.querySelector('#player-one-panel .system-controls button').getBoundingClientRect();
       return {stage: {left: stage.left, top: stage.top, width: stage.width, height: stage.height},
+        gameScreen: {left: gameScreen.left, top: gameScreen.top,
+          width: gameScreen.width, height: gameScreen.height},
         viewport: {left: viewport?.offsetLeft ?? 0, top: viewport?.offsetTop ?? 0,
           width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight},
         dpadButton: {width: dpadButton.width, height: dpadButton.height},
         selectButton: {height: selectButton.height}};
     })()`);
     assert.deepEqual(rotatedSingleFullscreen.stage, rotatedSingleFullscreen.viewport);
+    assert.ok(Math.abs(rotatedSingleFullscreen.gameScreen.width - 585) < 0.1 &&
+      Math.abs(rotatedSingleFullscreen.gameScreen.height - 390) < 0.1,
+      JSON.stringify(rotatedSingleFullscreen));
+    assert.ok(rotatedSingleFullscreen.gameScreen.top >= rotatedSingleFullscreen.viewport.top &&
+      rotatedSingleFullscreen.gameScreen.left >= rotatedSingleFullscreen.viewport.left,
+      JSON.stringify(rotatedSingleFullscreen));
     assert.ok(rotatedSingleFullscreen.dpadButton.width >= 60 &&
       rotatedSingleFullscreen.dpadButton.height >= 60, JSON.stringify(rotatedSingleFullscreen));
     assert.ok(rotatedSingleFullscreen.selectButton.height <= 56,
@@ -752,8 +761,12 @@ async function main() {
     })()`);
     assert.deepEqual(splitFullscreen.first, { left: 0, width: 640, height: 720 });
     assert.deepEqual(splitFullscreen.second, { left: 640, width: 640, height: 720 });
-    assert.deepEqual(splitFullscreen.firstScreen, { left: 0, width: 640, height: 720 });
-    assert.deepEqual(splitFullscreen.secondScreen, { left: 640, width: 640, height: 720 });
+    assert.ok(splitFullscreen.firstScreen.left === 0 && splitFullscreen.firstScreen.width === 640 &&
+      Math.abs(splitFullscreen.firstScreen.height - (640 / 1.5)) < 0.1,
+      JSON.stringify(splitFullscreen));
+    assert.ok(splitFullscreen.secondScreen.left === 640 && splitFullscreen.secondScreen.width === 640 &&
+      Math.abs(splitFullscreen.secondScreen.height - (640 / 1.5)) < 0.1,
+      JSON.stringify(splitFullscreen));
     await captureScreenshot('fullscreen-local-2p-desktop.png');
     await cdp.send('Emulation.setDeviceMetricsOverride', {
       width: 844, height: 390, deviceScaleFactor: 1, mobile: true,

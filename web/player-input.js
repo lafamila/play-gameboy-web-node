@@ -17,12 +17,26 @@ export const GAMEPAD_ACTIONS = Object.freeze([
   ] },
   { key: 'r', label: 'R', mask: 256, bindings: [{ type: 'button', index: 5 }] },
   { key: 'l', label: 'L', mask: 512, bindings: [{ type: 'button', index: 4 }] },
+  { key: 'quickSave', label: 'Quick Save', command: true, bindings: [] },
+  { key: 'quickLoad', label: 'Quick Load', command: true, bindings: [] },
+  { key: 'speed', label: 'Speed', command: true, bindings: [] },
+  { key: 'fullscreen', label: 'Fullscreen', command: true, bindings: [] },
 ]);
 
 export function createDefaultGamepadMapping() {
   return Object.fromEntries(GAMEPAD_ACTIONS.map((action) => [
     action.key, action.bindings.map((binding) => ({ ...binding })),
   ]));
+}
+
+export function normalizeGamepadMapping(mapping) {
+  const normalized = createDefaultGamepadMapping();
+  for (const action of GAMEPAD_ACTIONS) {
+    if (Array.isArray(mapping?.[action.key])) {
+      normalized[action.key] = mapping[action.key].map((binding) => ({ ...binding }));
+    }
+  }
+  return normalized;
 }
 
 export function gamepadControllerKey(gamepad) {
@@ -76,11 +90,19 @@ function bindingPressed(gamepad, binding) {
   return false;
 }
 
+export function activeGamepadCommands(gamepad, mapping) {
+  if (!gamepad) return [];
+  return GAMEPAD_ACTIONS.filter((action) => action.command &&
+    (mapping?.[action.key] || []).some((binding) => bindingPressed(gamepad, binding)))
+    .map((action) => action.key);
+}
+
 export function gamepadMaskForSlot(gamepads, slot, mapping = null) {
   const gamepad = gamepads?.[slot];
   if (!gamepad) return 0;
   let mask = 0;
   for (const action of GAMEPAD_ACTIONS) {
+    if (action.command) continue;
     const bindings = Array.isArray(mapping?.[action.key]) ? mapping[action.key] : action.bindings;
     if (bindings.some((binding) => bindingPressed(gamepad, binding))) mask |= action.mask;
   }

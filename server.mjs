@@ -17,7 +17,11 @@ import { LocalLinkService } from './lib/local-link-service.mjs';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
 const PLAY_PERMISSIONS = ['user', 'admin', 'superadmin'];
-const GAMEPAD_ACTION_KEYS = ['a', 'b', 'select', 'start', 'right', 'left', 'up', 'down', 'r', 'l'];
+const GAMEPAD_ACTION_KEYS = [
+  'a', 'b', 'select', 'start', 'right', 'left', 'up', 'down', 'r', 'l',
+  'quickSave', 'quickLoad', 'speed', 'fullscreen',
+];
+const GAMEPAD_COMMAND_KEYS = new Set(['quickSave', 'quickLoad', 'speed', 'fullscreen']);
 
 const MIME_TYPES = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -619,8 +623,10 @@ function gamepadMappingPayload(value) {
   }
   const mapping = {};
   for (const key of GAMEPAD_ACTION_KEYS) {
-    const bindings = value.mapping[key];
-    if (!Array.isArray(bindings) || bindings.length < 1 || bindings.length > 2) {
+    const bindings = value.mapping[key] ?? (GAMEPAD_COMMAND_KEYS.has(key) ? [] : null);
+    const minimum = GAMEPAD_COMMAND_KEYS.has(key) ? 0 : 1;
+    const maximum = GAMEPAD_COMMAND_KEYS.has(key) ? 1 : 2;
+    if (!Array.isArray(bindings) || bindings.length < minimum || bindings.length > maximum) {
       throw new AuthError(400, `mapping.${key} is invalid`);
     }
     mapping[key] = bindings.map((binding) => {

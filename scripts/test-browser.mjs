@@ -280,7 +280,7 @@ async function main() {
     })()`);
     await click('gamepad-mapping-open');
     assert.equal(await evaluate('document.getElementById("gamepad-mapping-dialog").open'), true);
-    assert.equal(await evaluate('document.querySelectorAll(".gamepad-mapping-row").length'), 10);
+    assert.equal(await evaluate('document.querySelectorAll(".gamepad-mapping-row").length'), 14);
     assert.match(await evaluate('document.getElementById("gamepad-mapping-controller").value'), /^0$/);
     await evaluate('document.querySelector(".gamepad-mapping-row button").click()');
     await evaluate(`(() => {
@@ -293,14 +293,39 @@ async function main() {
     await evaluate(`(() => {
       window.__testGamepad.buttons[2] = {pressed: false, value: 0};
     })()`);
+    await evaluate('document.querySelector("[data-gamepad-action=quickSave] button").click()');
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[6] = {pressed: true, value: 1};
+    })()`);
+    await waitExpression(
+      'document.querySelector("[data-gamepad-action=quickSave] .gamepad-mapping-binding").innerText === "Button 6"',
+      'gamepad command capture',
+    );
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[6] = {pressed: false, value: 0};
+    })()`);
     await click('gamepad-mapping-save');
     await waitExpression(
       'document.getElementById("gamepad-mapping-status").innerText === "Saved"',
       'gamepad mapping save',
     );
     assert.deepEqual(await evaluate(`fetch('/api/gamepad-mappings').then(response => response.json())
-      .then(result => result.mappings[0].mapping.a)`), [{type: 'button', index: 2}]);
+      .then(result => ({a: result.mappings[0].mapping.a,
+        quickSave: result.mappings[0].mapping.quickSave}))`), {
+      a: [{type: 'button', index: 2}], quickSave: [{type: 'button', index: 6}],
+    });
     await captureScreenshot('gamepad-mapping-mobile.png');
+    await evaluate(`(() => {
+      const dialog = document.getElementById('gamepad-mapping-dialog');
+      dialog.scrollTop = dialog.scrollHeight;
+    })()`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(await evaluate(`[...document.querySelectorAll(
+      '[data-gamepad-action=quickSave], [data-gamepad-action=quickLoad], ' +
+      '[data-gamepad-action=speed], [data-gamepad-action=fullscreen]')]
+      .map(row => row.querySelector('.gamepad-mapping-action').innerText)`),
+    ['Quick Save', 'Quick Load', 'Speed', 'Fullscreen']);
+    await captureScreenshot('gamepad-mapping-commands.png');
     await click('gamepad-mapping-close');
     assert.equal(await evaluate('document.getElementById("gamepad-mapping-dialog").open'), false);
     await click('menu-toggle');
@@ -310,6 +335,22 @@ async function main() {
     await click('load-rom');
     await waitExpression('document.getElementById("runtime-status").innerText === "Running"', 'ROM load');
     await new Promise((resolve) => setTimeout(resolve, 1800));
+    const commandSaveCount = await evaluate(`[...document.querySelectorAll('#event-log li')]
+      .filter(item => item.innerText.includes('Quick state saved')).length`);
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[6] = {pressed: true, value: 1};
+    })()`);
+    await waitExpression(
+      `[...document.querySelectorAll('#event-log li')]
+        .filter(item => item.innerText.includes('Quick state saved')).length === ${commandSaveCount + 1}`,
+      'gamepad quick save command',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(await evaluate(`([...document.querySelectorAll('#event-log li')]
+      .filter(item => item.innerText.includes('Quick state saved')).length)`), commandSaveCount + 1);
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[6] = {pressed: false, value: 0};
+    })()`);
 
     const startup = await evaluate('window.__gbaPoc.diagnostics()');
     assert.equal(startup.running, true);

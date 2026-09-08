@@ -9,6 +9,7 @@ import {
 } from '/local-link-transport.js';
 import { pumpLinkRuntime } from '/link-runtime-pump.js';
 import {
+  activeGamepadCommands,
   createDefaultGamepadMapping,
   detectGamepadInput,
   GAMEPAD_ACTIONS,
@@ -16,6 +17,7 @@ import {
   gamepadControllerKey,
   gamepadInputSnapshot,
   gamepadMaskForSlot,
+  normalizeGamepadMapping,
 } from '/player-input.js';
 import { mountPlayerRuntime } from '/player-runtime-view.js';
 
@@ -416,6 +418,8 @@ let gamepadMappingDraftIdentity = '';
 let gamepadMappingDirty = false;
 let gamepadMappingCapture = null;
 let gamepadMappingCaptureFrame = 0;
+const gamepadCommandStates = [new Set(), new Set()];
+let gamepadCommandFrame = 0;
 const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
@@ -791,6 +795,34 @@ function gamepadMask(slot = 0) {
   return gamepadMaskForSlot(gamepads, slot, storedGamepadMapping(slot, gamepad)?.mapping);
 }
 
+function pollGamepadCommands() {
+  const controls = [
+    {
+      quickSave: elements['quick-save'], quickLoad: elements['quick-load'],
+      speed: elements['speed-toggle'], fullscreen: elements.fullscreen,
+    },
+    {
+      quickSave: elements['player2-quick-save'], quickLoad: elements['player2-quick-load'],
+      speed: elements['player2-speed-toggle'], fullscreen: elements['player2-fullscreen'],
+    },
+  ];
+  for (const slot of [0, 1]) {
+    const gamepad = gamepadForSlot(slot);
+    const active = new Set(activeGamepadCommands(
+      gamepad, storedGamepadMapping(slot, gamepad)?.mapping,
+    ));
+    if (!elements['gamepad-mapping-dialog'].open) {
+      for (const command of active) {
+        if (!gamepadCommandStates[slot].has(command) && !controls[slot][command]?.disabled) {
+          controls[slot][command].click();
+        }
+      }
+    }
+    gamepadCommandStates[slot] = active;
+  }
+  gamepadCommandFrame = requestAnimationFrame(pollGamepadCommands);
+}
+
 async function loadGamepadMappings(ownerSlot) {
   const endpoint = ownerSlot === 1 ? '/api/player2/gamepad-mappings' : '/api/gamepad-mappings';
   const response = await apiFetch(endpoint);
@@ -821,6 +853,7 @@ function renderGamepadMappingRows() {
   elements['gamepad-mapping-list'].replaceChildren(...GAMEPAD_ACTIONS.map((action) => {
     const row = document.createElement('div');
     row.className = 'gamepad-mapping-row';
+    row.dataset.gamepadAction = action.key;
     const label = document.createElement('span');
     label.className = 'gamepad-mapping-action';
     label.textContent = action.label;
@@ -876,7 +909,7 @@ function refreshGamepadMappingDialog({ force = false } = {}) {
   if (force || identity !== gamepadMappingDraftIdentity) {
     cancelGamepadMappingCapture();
     const stored = storedGamepadMapping(playerSlot, gamepad);
-    gamepadMappingDraft = structuredClone(stored?.mapping || createDefaultGamepadMapping());
+    gamepadMappingDraft = normalizeGamepadMapping(stored?.mapping);
     gamepadMappingDraftIdentity = identity;
     gamepadMappingDirty = false;
   }
@@ -3382,6 +3415,7 @@ window.addEventListener('orientationchange', scheduleImmersiveViewportSync);
 
 window.addEventListener('pagehide', () => {
   try { screen.orientation?.unlock?.(); } catch {}
+  cancelAnimationFrame(gamepadCommandFrame);
   player2AuthChannel.close();
   if (activeRom && !isLinkRoomOpen() && !localTwoPlayer.preparing && !localTwoPlayer.active) {
     stashStandaloneBatteries();
@@ -3526,6 +3560,8 @@ window.__gbaPoc = {
     };
   },
 };
+
+gamepadCommandFrame = requestAnimationFrame(pollGamepadCommands);
 
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {

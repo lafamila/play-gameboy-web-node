@@ -192,6 +192,7 @@ test('gamepad mappings persist by account and controller for both player session
   const player2 = await loginPlayer2(origin, 'mapping-player-two', 'user');
   const mapping = createDefaultGamepadMapping();
   mapping.a = [{ type: 'button', index: 3 }];
+  mapping.quickSave = [{ type: 'button', index: 6 }];
   const payload = {
     controllerKey: 'Xbox Wireless Controller|standard|b17|a4',
     controllerLabel: 'BSP-D3 / Xbox Wireless Controller',

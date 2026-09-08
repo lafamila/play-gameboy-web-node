@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  activeGamepadCommands,
   createDefaultGamepadMapping,
   detectGamepadInput,
   gamepadControllerKey,
@@ -52,4 +53,13 @@ test('mapping capture detects fresh button and axis input only', () => {
   assert.equal(detectGamepadInput(input, {
     buttons: Array.from({ length: 16 }, (_, index) => index === 4), axes: [0, .9],
   }), null);
+});
+
+test('gamepad commands are reported while held without changing the GBA mask', () => {
+  const mapping = createDefaultGamepadMapping();
+  mapping.quickSave = [{ type: 'button', index: 6 }];
+  mapping.speed = [{ type: 'button', index: 10 }];
+  const input = gamepad([6, 10]);
+  assert.deepEqual(activeGamepadCommands(input, mapping), ['quickSave', 'speed']);
+  assert.equal(gamepadMaskForSlot([input], 0, mapping), 0);
 });

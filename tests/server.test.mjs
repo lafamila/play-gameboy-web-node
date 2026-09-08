@@ -7,6 +7,7 @@ import { WebSocket } from 'ws';
 
 import { createConfig } from '../lib/config.mjs';
 import { buildAuthLogoutUrl, createApp } from '../server.mjs';
+import { createDefaultGamepadMapping } from '../web/player-input.js';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = path.join(ROOT, 'data');
@@ -184,6 +185,54 @@ test('creating a replacement P2 test session revokes the previous app session', 
   assert.equal((await fetch(`${origin}/api/player2/session`, {
     headers: { Cookie: secondCookie },
   }).then((item) => item.json())).account.id, 'replace-p2-new');
+}));
+
+test('gamepad mappings persist by account and controller for both player sessions', () => withServer(async ({ origin }) => {
+  const player1 = await login(origin, 'mapping-player-one', 'user');
+  const player2 = await loginPlayer2(origin, 'mapping-player-two', 'user');
+  const mapping = createDefaultGamepadMapping();
+  mapping.a = [{ type: 'button', index: 3 }];
+  const payload = {
+    controllerKey: 'Xbox Wireless Controller|standard|b17|a4',
+    controllerLabel: 'BSP-D3 / Xbox Wireless Controller',
+    mapping,
+  };
+  const saved = await fetch(`${origin}/api/gamepad-mappings`, {
+    method: 'PUT',
+    headers: { ...player1.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual((await saved.json()).mapping.mapping.a, [{ type: 'button', index: 3 }]);
+  assert.equal((await fetch(`${origin}/api/gamepad-mappings`, {
+    headers: { Cookie: player1.headers.Cookie },
+  }).then((response) => response.json())).mappings.length, 1);
+
+  const combinedCookie = `${player1.headers.Cookie}; ${player2.cookie}`;
+  assert.deepEqual((await fetch(`${origin}/api/player2/gamepad-mappings`, {
+    headers: { Cookie: combinedCookie },
+  }).then((response) => response.json())).mappings, []);
+  const player2Save = await fetch(`${origin}/api/player2/gamepad-mappings`, {
+    method: 'PUT',
+    headers: {
+      Cookie: combinedCookie,
+      'X-Player2-CSRF-Token': player2.session.csrfToken,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(player2Save.status, 200);
+  assert.equal((await fetch(`${origin}/api/player2/gamepad-mappings`, {
+    headers: { Cookie: combinedCookie },
+  }).then((response) => response.json())).mappings.length, 1);
+
+  const removed = await fetch(`${origin}/api/gamepad-mappings`, {
+    method: 'DELETE',
+    headers: { ...player1.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ controllerKey: payload.controllerKey }),
+  });
+  assert.equal(removed.status, 200);
+  assert.equal((await removed.json()).deleted, true);
 }));
 
 test('same-account callback revokes both the previous and rejected P2 sessions', async () => {

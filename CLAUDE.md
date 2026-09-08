@@ -82,6 +82,8 @@ Single Play page
 - local 2P 독립 실행 중에는 P1/P2 각각 quick save/load와 `2x` speed를 사용할 수 있다. cable preparing/active에서는 두 runtime 모두 해당 제어를 표시하되 비활성화하고, cable 자체는 화면 프레임 기준 정상 속도로 유지한다.
 - P1/P2의 screen, playback bar, touch controller, keymap은 `player-runtime-template`과 `mountPlayerRuntime`을 공유한다. 플레이어별로는 element ID, keymap, 초기 mute, cable Start 소유권만 설정한다.
 - 설치 가능한 PWA 는 `V` 아이콘, `manifest.webmanifest`, versioned app-shell service worker 를 사용한다. `/api`, `/auth`, `/oauth` 요청은 캐시하지 않는다.
+- gamepad는 표준 Gamepad API 매핑을 기본으로 사용하며, 버튼/축 보정값은 `(account_id, controller_key)`별로 저장한다. 로그인 P2는 자신의 계정 매핑을 사용하고 Guest P2는 P1 계정 매핑을 사용한다.
+- BSP-D3의 iOS 기본 연결은 `RB + HOME` Xbox 모드이며 `B + HOME` MFi 모드도 사용자 보정으로 지원한다.
 - immersive fullscreen은 app shell을 숨기고 canvas 위에 반투명 game controls를 배치한다. 1P는 단일 stage, local 2P는 P1 버튼 하나로 진입해 좌우 50:50 stage를 사용하며 Screen Orientation API landscape lock은 best-effort다.
 
 ## Commands

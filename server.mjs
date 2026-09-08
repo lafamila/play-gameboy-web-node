@@ -17,6 +17,7 @@ import { LocalLinkService } from './lib/local-link-service.mjs';
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(ROOT, 'web');
 const PLAY_PERMISSIONS = ['user', 'admin', 'superadmin'];
+const GAMEPAD_ACTION_KEYS = ['a', 'b', 'select', 'start', 'right', 'left', 'up', 'down', 'r', 'l'];
 
 const MIME_TYPES = new Map([
   ['.html', 'text/html; charset=utf-8'],
@@ -237,6 +238,28 @@ async function handleRequest(context) {
     return json(response, 200, player2Session
       ? { authenticated: true, ...publicSession(player2Session) }
       : { authenticated: false });
+  }
+
+  if (['/api/gamepad-mappings', '/api/player2/gamepad-mappings'].includes(url.pathname)) {
+    const player2 = url.pathname.startsWith('/api/player2/');
+    const owner = player2 ? player2Session : session;
+    requirePermission(owner, PLAY_PERMISSIONS);
+    if (request.method === 'GET') {
+      return json(response, 200, { mappings: await database.listGamepadMappings(owner.accountId) });
+    }
+    if (player2) requireSlotCsrf(request, owner, config, 'x-player2-csrf-token');
+    else requireCsrf(request, owner, config);
+    const body = await readJsonRequest(request, 32 * 1024);
+    if (request.method === 'PUT') {
+      const mapping = gamepadMappingPayload(body);
+      return json(response, 200, { mapping: await database.putGamepadMapping(owner.accountId, mapping) });
+    }
+    if (request.method === 'DELETE') {
+      const controllerKey = boundedString(body.controllerKey, 'controllerKey', 255);
+      return json(response, 200, {
+        deleted: await database.deleteGamepadMapping(owner.accountId, controllerKey),
+      });
+    }
   }
 
   if (url.pathname === '/api/access-request') {
@@ -579,6 +602,40 @@ function requireSession(session) {
 function requirePermission(session, permissions) {
   requireSession(session);
   if (!permissions.includes(session.permission)) throw new AuthError(403, 'Permission denied');
+}
+
+function boundedString(value, name, maxLength) {
+  if (typeof value !== 'string' || !value.trim() || value.length > maxLength) {
+    throw new AuthError(400, `${name} is invalid`);
+  }
+  return value.trim();
+}
+
+function gamepadMappingPayload(value) {
+  const controllerKey = boundedString(value?.controllerKey, 'controllerKey', 255);
+  const controllerLabel = boundedString(value?.controllerLabel, 'controllerLabel', 255);
+  if (!value?.mapping || typeof value.mapping !== 'object' || Array.isArray(value.mapping)) {
+    throw new AuthError(400, 'mapping is invalid');
+  }
+  const mapping = {};
+  for (const key of GAMEPAD_ACTION_KEYS) {
+    const bindings = value.mapping[key];
+    if (!Array.isArray(bindings) || bindings.length < 1 || bindings.length > 2) {
+      throw new AuthError(400, `mapping.${key} is invalid`);
+    }
+    mapping[key] = bindings.map((binding) => {
+      if (binding?.type === 'button' && Number.isInteger(binding.index) &&
+          binding.index >= 0 && binding.index <= 63) {
+        return { type: 'button', index: binding.index };
+      }
+      if (binding?.type === 'axis' && Number.isInteger(binding.index) &&
+          binding.index >= 0 && binding.index <= 15 && [-1, 1].includes(binding.direction)) {
+        return { type: 'axis', index: binding.index, direction: binding.direction };
+      }
+      throw new AuthError(400, `mapping.${key} contains an invalid binding`);
+    });
+  }
+  return { controllerKey, controllerLabel, mapping };
 }
 
 function requireCsrf(request, session, config) {

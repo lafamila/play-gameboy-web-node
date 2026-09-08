@@ -271,6 +271,39 @@ async function main() {
     assert.equal(await evaluate('document.querySelector("label[for=rom-upload]").hidden'), false);
     assert.equal(await evaluate('document.getElementById("export-state").closest(".save-admin-only").hidden'), false);
     assert.equal(await evaluate('document.getElementById("fixture-list").closest("section").hidden'), false);
+    await evaluate(`(() => {
+      const buttons = Array.from({length: 17}, () => ({pressed: false, value: 0}));
+      window.__testGamepad = {index: 0, id: 'BSP-D3', mapping: 'standard', buttons, axes: [0, 0, 0, 0]};
+      Object.defineProperty(navigator, 'getGamepads', {
+        configurable: true, value: () => [window.__testGamepad],
+      });
+    })()`);
+    await click('gamepad-mapping-open');
+    assert.equal(await evaluate('document.getElementById("gamepad-mapping-dialog").open'), true);
+    assert.equal(await evaluate('document.querySelectorAll(".gamepad-mapping-row").length'), 10);
+    assert.match(await evaluate('document.getElementById("gamepad-mapping-controller").value'), /^0$/);
+    await evaluate('document.querySelector(".gamepad-mapping-row button").click()');
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[2] = {pressed: true, value: 1};
+    })()`);
+    await waitExpression(
+      'document.querySelector(".gamepad-mapping-binding").innerText === "Button 2"',
+      'gamepad button capture',
+    );
+    await evaluate(`(() => {
+      window.__testGamepad.buttons[2] = {pressed: false, value: 0};
+    })()`);
+    await click('gamepad-mapping-save');
+    await waitExpression(
+      'document.getElementById("gamepad-mapping-status").innerText === "Saved"',
+      'gamepad mapping save',
+    );
+    assert.deepEqual(await evaluate(`fetch('/api/gamepad-mappings').then(response => response.json())
+      .then(result => result.mappings[0].mapping.a)`), [{type: 'button', index: 2}]);
+    await captureScreenshot('gamepad-mapping-mobile.png');
+    await click('gamepad-mapping-close');
+    assert.equal(await evaluate('document.getElementById("gamepad-mapping-dialog").open'), false);
+    await click('menu-toggle');
     const fixtureRom = path.join(root, 'data', (await readdir(path.join(root, 'data'))).find((name) => name.endsWith('.gba')));
     await setFile('#rom-upload', fixtureRom);
     await waitExpression('document.getElementById("event-log").innerText.includes("ROM uploaded / BPRE")', 'ROM upload');

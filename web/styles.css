@@ -167,6 +167,72 @@ select { height: 30px; min-width: 0; padding: 3px 28px 3px 8px; }
 .menu-label { font-size: 10px; font-weight: 650; text-transform: uppercase; }
 .menu-save-actions { margin-top: 2px; }
 
+.gamepad-dialog {
+  width: min(520px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  padding: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+.gamepad-dialog::backdrop { background: rgb(0 0 0 / 72%); }
+.gamepad-dialog-header {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+.gamepad-dialog-header h2 { margin: 0; font-size: 14px; }
+.dialog-close { width: 30px; min-height: 30px; padding: 0; font-size: 18px; }
+.gamepad-fields {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 8px;
+  padding: 12px 12px 8px;
+}
+.gamepad-fields label { min-width: 0; display: grid; gap: 5px; }
+.gamepad-fields label > span { color: var(--muted); font-size: 9px; text-transform: uppercase; }
+.gamepad-fields select { width: 100%; }
+.gamepad-mapping-status {
+  min-height: 25px;
+  padding: 4px 12px 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.gamepad-mapping-status.capturing { color: var(--amber); }
+.gamepad-mapping-status.saved { color: var(--green); }
+.gamepad-mapping-status.error { color: var(--red); }
+.gamepad-mapping-list { display: grid; padding: 0 12px; }
+.gamepad-mapping-row {
+  min-height: 39px;
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) 54px;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+}
+.gamepad-mapping-action { font-weight: 650; }
+.gamepad-mapping-binding { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
+.gamepad-mapping-row button { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+.gamepad-dialog-actions {
+  position: sticky;
+  bottom: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(520px, 1fr) minmax(300px, 390px);
@@ -583,6 +649,7 @@ html.immersive-play .workspace.immersive-stage .fullscreen-exit {
 
 @media (max-width: 620px) {
   main { padding: 0 12px 18px; }
+  .gamepad-dialog { max-height: calc(100dvh - 12px); }
   .app-header { grid-template-columns: 30px minmax(0, 1fr); gap: 7px; min-height: 52px; }
   .app-brand img { width: 28px; height: 28px; border-radius: 6px; }
   .rom-toolbar { gap: 7px; }

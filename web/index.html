@@ -83,6 +83,7 @@
               </div>
             </div>
 
+            <button id="gamepad-mapping-open" class="menu-command" type="button">Gamepad mapping</button>
             <button id="logout" class="menu-command" type="button">Logout</button>
             </div>
           </div>
@@ -175,6 +176,32 @@
       </section>
     </main>
     </div>
+
+    <dialog id="gamepad-mapping-dialog" class="gamepad-dialog">
+      <div class="gamepad-dialog-header">
+        <h2>Gamepad mapping</h2>
+        <button id="gamepad-mapping-close" class="dialog-close" type="button"
+          aria-label="Close gamepad mapping" title="Close">×</button>
+      </div>
+      <div class="gamepad-fields">
+        <label>
+          <span>Player</span>
+          <select id="gamepad-mapping-player">
+            <option value="0">P1</option>
+          </select>
+        </label>
+        <label>
+          <span>Controller</span>
+          <select id="gamepad-mapping-controller"></select>
+        </label>
+      </div>
+      <div id="gamepad-mapping-status" class="gamepad-mapping-status" aria-live="polite"></div>
+      <div id="gamepad-mapping-list" class="gamepad-mapping-list"></div>
+      <div class="gamepad-dialog-actions">
+        <button id="gamepad-mapping-defaults" type="button">Defaults</button>
+        <button id="gamepad-mapping-save" class="primary" type="button">Save</button>
+      </div>
+    </dialog>
 
     <template id="player-runtime-template">
       <div class="player-runtime" data-player-runtime>

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'v-play-shell-v4';
+const CACHE_NAME = 'v-play-shell-v5';
 const APP_SHELL = [
   '/',
   '/styles.css',

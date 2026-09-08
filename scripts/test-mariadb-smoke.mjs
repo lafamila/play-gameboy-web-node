@@ -181,11 +181,25 @@ try {
   await assert.rejects(() => repeated.updateLinkRoomStatus(
     'remote-start-race', 'active', now + 13, ['ready'],
   ), { code: 'LINK_ROOM_STATE_CONFLICT' });
+  await repeated.putGamepadMapping('mapping-account', {
+    controllerKey: 'BSP-D3|standard|b17|a4',
+    controllerLabel: 'BSP-D3',
+    mapping: { a: [{ type: 'button', index: 0 }] },
+  }, now + 14);
+  assert.deepEqual((await repeated.listGamepadMappings('mapping-account')).map((item) => ({
+    controllerKey: item.controllerKey, controllerLabel: item.controllerLabel, mapping: item.mapping,
+  })), [{
+    controllerKey: 'BSP-D3|standard|b17|a4', controllerLabel: 'BSP-D3',
+    mapping: { a: [{ type: 'button', index: 0 }] },
+  }]);
+  assert.equal(await repeated.deleteGamepadMapping(
+    'mapping-account', 'BSP-D3|standard|b17|a4',
+  ), true);
   const [admissions] = await repeated.pool.query('SELECT * FROM play_admission_locks');
   assert.equal(admissions.length, 0);
   await repeated.close();
   console.log(JSON.stringify({ migrationConcurrency: 'passed', legacyPreservation: 'passed',
-    admissionRace: 'passed', pairedRollback: 'passed' }));
+    admissionRace: 'passed', pairedRollback: 'passed', gamepadMapping: 'passed' }));
 } finally {
   await admin.query(`DROP DATABASE IF EXISTS \`${name}\``);
   await admin.end();

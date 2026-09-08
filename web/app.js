@@ -8,7 +8,15 @@ import {
   requiresIrqReleaseGate,
 } from '/local-link-transport.js';
 import { pumpLinkRuntime } from '/link-runtime-pump.js';
-import { gamepadMaskForSlot } from '/player-input.js';
+import {
+  createDefaultGamepadMapping,
+  detectGamepadInput,
+  GAMEPAD_ACTIONS,
+  gamepadBindingLabel,
+  gamepadControllerKey,
+  gamepadInputSnapshot,
+  gamepadMaskForSlot,
+} from '/player-input.js';
 import { mountPlayerRuntime } from '/player-runtime-view.js';
 
 const FRAME_RATE = 59.7275;
@@ -74,7 +82,7 @@ async function optionalSaveBytes(response, label) {
 const elements = Object.fromEntries([
   'auth-loading', 'login-view', 'login-link', 'visitor-view', 'app-view', 'visitor-account',
   'request-access', 'access-request-status', 'visitor-logout', 'account-name',
-  'menu-toggle', 'app-menu-panel', 'logout',
+  'menu-toggle', 'app-menu-panel', 'logout', 'gamepad-mapping-open',
   'rom-upload', 'refresh-roms', 'rom-select', 'load-rom', 'rom-meta', 'screen',
   'screen-shell', 'screen-empty', 'pause', 'mute', 'fullscreen', 'runtime-status',
   'speed-toggle',
@@ -95,6 +103,9 @@ const elements = Object.fromEntries([
   'player2-screen-empty', 'player2-pause', 'player2-mute', 'player2-fullscreen',
   'player2-runtime-status',
   'player2-quick-save', 'player2-quick-load', 'player2-speed-toggle',
+  'gamepad-mapping-dialog', 'gamepad-mapping-close', 'gamepad-mapping-player',
+  'gamepad-mapping-controller', 'gamepad-mapping-status', 'gamepad-mapping-list',
+  'gamepad-mapping-defaults', 'gamepad-mapping-save',
 ].map((id) => [id, document.getElementById(id)]));
 
 let wasmBinaryPromise;
@@ -399,6 +410,12 @@ let linkFinishIdle = false;
 let linkDebugEnabled = false;
 let localTwoPlayer;
 let immersiveFullscreen = false;
+const gamepadMappingStores = [new Map(), new Map()];
+let gamepadMappingDraft = createDefaultGamepadMapping();
+let gamepadMappingDraftIdentity = '';
+let gamepadMappingDirty = false;
+let gamepadMappingCapture = null;
+let gamepadMappingCaptureFrame = 0;
 const linkMessageQueue = new LinkMessageQueue();
 const copyFeedbackTimers = new Map();
 
@@ -754,8 +771,185 @@ function renderFrame() {
   canvasContext.putImageData(imageData, 0, 0);
 }
 
+function gamepadMappingOwnerSlot(playerSlot) {
+  return playerSlot === 1 && localTwoPlayer?.mode === 'account' && currentPlayer2Session ? 1 : 0;
+}
+
+function gamepadForSlot(slot) {
+  return navigator.getGamepads?.()[slot] || null;
+}
+
+function storedGamepadMapping(slot, gamepad = gamepadForSlot(slot)) {
+  if (!gamepad) return null;
+  return gamepadMappingStores[gamepadMappingOwnerSlot(slot)].get(gamepadControllerKey(gamepad)) || null;
+}
+
 function gamepadMask(slot = 0) {
-  return gamepadMaskForSlot(navigator.getGamepads?.(), slot);
+  if (elements['gamepad-mapping-dialog'].open) return 0;
+  const gamepads = navigator.getGamepads?.();
+  const gamepad = gamepads?.[slot];
+  return gamepadMaskForSlot(gamepads, slot, storedGamepadMapping(slot, gamepad)?.mapping);
+}
+
+async function loadGamepadMappings(ownerSlot) {
+  const endpoint = ownerSlot === 1 ? '/api/player2/gamepad-mappings' : '/api/gamepad-mappings';
+  const response = await apiFetch(endpoint);
+  if (!response.ok) throw new Error(`P${ownerSlot + 1} gamepad mapping load failed`);
+  const result = await response.json();
+  const store = gamepadMappingStores[ownerSlot];
+  store.clear();
+  for (const mapping of result.mappings || []) store.set(mapping.controllerKey, mapping);
+}
+
+function selectedGamepadPlayer() {
+  return Number(elements['gamepad-mapping-player'].value) === 1 ? 1 : 0;
+}
+
+function setGamepadMappingStatus(text, kind = '') {
+  elements['gamepad-mapping-status'].textContent = text;
+  elements['gamepad-mapping-status'].className = `gamepad-mapping-status ${kind}`.trim();
+}
+
+function cancelGamepadMappingCapture() {
+  cancelAnimationFrame(gamepadMappingCaptureFrame);
+  gamepadMappingCaptureFrame = 0;
+  gamepadMappingCapture = null;
+}
+
+function renderGamepadMappingRows() {
+  const hasController = Boolean(gamepadForSlot(selectedGamepadPlayer()));
+  elements['gamepad-mapping-list'].replaceChildren(...GAMEPAD_ACTIONS.map((action) => {
+    const row = document.createElement('div');
+    row.className = 'gamepad-mapping-row';
+    const label = document.createElement('span');
+    label.className = 'gamepad-mapping-action';
+    label.textContent = action.label;
+    const binding = document.createElement('span');
+    binding.className = 'gamepad-mapping-binding';
+    binding.textContent = gamepadBindingLabel(gamepadMappingDraft[action.key]);
+    binding.title = binding.textContent;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = gamepadMappingCapture?.actionKey === action.key ? 'Waiting' : 'Map';
+    button.disabled = !hasController || Boolean(gamepadMappingCapture);
+    button.addEventListener('click', () => startGamepadMappingCapture(action));
+    row.append(label, binding, button);
+    return row;
+  }));
+  elements['gamepad-mapping-defaults'].disabled = !hasController || Boolean(gamepadMappingCapture);
+  elements['gamepad-mapping-save'].disabled = !hasController || !gamepadMappingDirty ||
+    Boolean(gamepadMappingCapture);
+}
+
+function currentGamepadMappingIdentity() {
+  const playerSlot = selectedGamepadPlayer();
+  const gamepad = gamepadForSlot(playerSlot);
+  if (!gamepad) return '';
+  return `${gamepadMappingOwnerSlot(playerSlot)}:${gamepadControllerKey(gamepad)}`;
+}
+
+function refreshGamepadMappingDialog({ force = false } = {}) {
+  const previousPlayer = elements['gamepad-mapping-player'].value || '0';
+  const players = [{ value: '0', label: 'P1' }];
+  if (localTwoPlayer?.enabled) players.push({ value: '1', label: 'P2' });
+  elements['gamepad-mapping-player'].replaceChildren(...players.map(({ value, label }) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    return option;
+  }));
+  elements['gamepad-mapping-player'].value = players.some(({ value }) => value === previousPlayer)
+    ? previousPlayer : '0';
+
+  const playerSlot = selectedGamepadPlayer();
+  const gamepad = gamepadForSlot(playerSlot);
+  elements['gamepad-mapping-controller'].replaceChildren();
+  const option = document.createElement('option');
+  option.value = gamepad ? String(gamepad.index) : '';
+  option.textContent = gamepad
+    ? `${gamepad.id || 'Gamepad'}${gamepad.mapping ? ` / ${gamepad.mapping}` : ''}`
+    : 'No controller';
+  elements['gamepad-mapping-controller'].append(option);
+  elements['gamepad-mapping-controller'].disabled = !gamepad;
+
+  const identity = currentGamepadMappingIdentity();
+  if (force || identity !== gamepadMappingDraftIdentity) {
+    cancelGamepadMappingCapture();
+    const stored = storedGamepadMapping(playerSlot, gamepad);
+    gamepadMappingDraft = structuredClone(stored?.mapping || createDefaultGamepadMapping());
+    gamepadMappingDraftIdentity = identity;
+    gamepadMappingDirty = false;
+  }
+  if (!gamepad) setGamepadMappingStatus('Press a controller button', 'capturing');
+  else if (storedGamepadMapping(playerSlot, gamepad)) setGamepadMappingStatus('Saved', 'saved');
+  else setGamepadMappingStatus('Defaults');
+  renderGamepadMappingRows();
+}
+
+function startGamepadMappingCapture(action) {
+  const playerSlot = selectedGamepadPlayer();
+  const gamepad = gamepadForSlot(playerSlot);
+  if (!gamepad) return;
+  cancelGamepadMappingCapture();
+  gamepadMappingCapture = {
+    actionKey: action.key,
+    actionLabel: action.label,
+    playerSlot,
+    controllerKey: gamepadControllerKey(gamepad),
+    baseline: gamepadInputSnapshot(gamepad),
+  };
+  setGamepadMappingStatus(`${action.label} / press input`, 'capturing');
+  renderGamepadMappingRows();
+  const poll = () => {
+    if (!gamepadMappingCapture || !elements['gamepad-mapping-dialog'].open) return;
+    const current = gamepadForSlot(gamepadMappingCapture.playerSlot);
+    if (!current || gamepadControllerKey(current) !== gamepadMappingCapture.controllerKey) {
+      cancelGamepadMappingCapture();
+      refreshGamepadMappingDialog({ force: true });
+      return;
+    }
+    const input = detectGamepadInput(current, gamepadMappingCapture.baseline);
+    if (!input) {
+      gamepadMappingCaptureFrame = requestAnimationFrame(poll);
+      return;
+    }
+    const { actionKey, actionLabel } = gamepadMappingCapture;
+    cancelGamepadMappingCapture();
+    gamepadMappingDraft[actionKey] = [input];
+    gamepadMappingDirty = true;
+    setGamepadMappingStatus(`${actionLabel} / ${gamepadBindingLabel([input])}`);
+    renderGamepadMappingRows();
+  };
+  gamepadMappingCaptureFrame = requestAnimationFrame(poll);
+}
+
+async function saveGamepadMapping() {
+  const playerSlot = selectedGamepadPlayer();
+  const gamepad = gamepadForSlot(playerSlot);
+  if (!gamepad) throw new Error('Controller is not connected');
+  const ownerSlot = gamepadMappingOwnerSlot(playerSlot);
+  const headers = { 'Content-Type': 'application/json' };
+  if (ownerSlot === 1) headers['X-Player2-CSRF-Token'] = currentPlayer2Session.csrfToken;
+  setGamepadMappingStatus('Saving', 'capturing');
+  const response = await apiFetch(
+    ownerSlot === 1 ? '/api/player2/gamepad-mappings' : '/api/gamepad-mappings',
+    {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        controllerKey: gamepadControllerKey(gamepad),
+        controllerLabel: gamepad.id || 'Gamepad',
+        mapping: gamepadMappingDraft,
+      }),
+    },
+  );
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'Gamepad mapping save failed');
+  gamepadMappingStores[ownerSlot].set(result.mapping.controllerKey, result.mapping);
+  gamepadMappingDirty = false;
+  gamepadMappingDraftIdentity = currentGamepadMappingIdentity();
+  setGamepadMappingStatus('Saved', 'saved');
+  renderGamepadMappingRows();
 }
 
 let immersiveViewportTimers = [];
@@ -961,6 +1155,7 @@ class LocalTwoPlayerController {
       elements['player2-request-access'].disabled = pending;
       return;
     }
+    await loadGamepadMappings(1);
     this.selectMode('account');
   }
 
@@ -1565,6 +1760,7 @@ class LocalTwoPlayerController {
           });
           if (!response.ok) throw new Error('Player 2 logout failed');
           currentPlayer2Session = null;
+          gamepadMappingStores[1].clear();
         } catch (logoutError) {
           failure = failure
             ? new Error(`${failure.message}; ${logoutError.message}`)
@@ -2858,7 +3054,7 @@ async function bootstrap() {
   applyPermissionVisibility();
   showAuthView('app');
   setControls(false);
-  await refreshCatalog();
+  await Promise.all([refreshCatalog(), loadGamepadMappings(0)]);
   await flushStandaloneBatteryRecovery();
   setStatus('Idle', 'idle');
   logEvent('Catalog ready');
@@ -2913,6 +3109,40 @@ elements['refresh-roms'].addEventListener('click', () => runAction(async () => {
   await refreshCatalog();
   setMenuOpen(false);
 }));
+elements['gamepad-mapping-open'].addEventListener('click', () => {
+  setMenuOpen(false);
+  refreshGamepadMappingDialog({ force: true });
+  elements['gamepad-mapping-dialog'].showModal();
+});
+elements['gamepad-mapping-close'].addEventListener('click', () => {
+  elements['gamepad-mapping-dialog'].close();
+});
+elements['gamepad-mapping-dialog'].addEventListener('close', cancelGamepadMappingCapture);
+elements['gamepad-mapping-dialog'].addEventListener('cancel', cancelGamepadMappingCapture);
+elements['gamepad-mapping-player'].addEventListener('change', () => {
+  refreshGamepadMappingDialog({ force: true });
+});
+elements['gamepad-mapping-defaults'].addEventListener('click', () => {
+  cancelGamepadMappingCapture();
+  gamepadMappingDraft = createDefaultGamepadMapping();
+  gamepadMappingDirty = true;
+  setGamepadMappingStatus('Defaults / unsaved');
+  renderGamepadMappingRows();
+});
+elements['gamepad-mapping-save'].addEventListener('click', async () => {
+  try {
+    await saveGamepadMapping();
+  } catch (error) {
+    setGamepadMappingStatus(error.message, 'error');
+    console.error(error);
+  }
+});
+window.addEventListener('gamepadconnected', () => {
+  if (elements['gamepad-mapping-dialog'].open) refreshGamepadMappingDialog({ force: true });
+});
+window.addEventListener('gamepaddisconnected', () => {
+  if (elements['gamepad-mapping-dialog'].open) refreshGamepadMappingDialog({ force: true });
+});
 elements['rom-select'].addEventListener('change', applyControlState);
 elements['local-2p-toggle'].addEventListener('click', () => runAction(() =>
   localTwoPlayer.enabled
@@ -2943,6 +3173,7 @@ elements['player2-visitor-back'].addEventListener('click', () => runAction(async
     throw new Error(body.error || `Player 2 logout failed (${response.status})`);
   }
   currentPlayer2Session = null;
+  gamepadMappingStores[1].clear();
   elements['player2-visitor'].hidden = true;
   elements['player2-choice'].hidden = false;
 }));

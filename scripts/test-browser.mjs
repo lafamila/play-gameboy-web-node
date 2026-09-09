@@ -957,8 +957,9 @@ async function main() {
     assert.deepEqual(realCoreCableProbe, {
       applied: true,
       sequence: 0,
-      masterData: 0x1234,
-      slaveData: 0xabcd,
+      mode: 2,
+      bits: 16,
+      dataBySlot: [0x1234, 0xabcd],
       hostPeerData: 0xabcd,
       guestPeerData: 0xabcd,
       independentMemories: true,
@@ -1140,6 +1141,12 @@ async function main() {
       JSON.stringify({ dualStart, dualRunning }));
     assert.ok(dualRunning.players[1].emulationSteps > dualStart.players[1].emulationSteps,
       JSON.stringify({ dualStart, dualRunning }));
+    const linkedFrameProgress = dualRunning.players.map((player, index) =>
+      player.frameCount - dualStart.players[index].frameCount);
+    assert.ok(linkedFrameProgress.every((frames) => frames >= 60),
+      JSON.stringify({ linkedFrameProgress, dualStart, dualRunning }));
+    assert.ok(Math.abs(linkedFrameProgress[0] - linkedFrameProgress[1]) <= 2,
+      JSON.stringify({ linkedFrameProgress, dualStart, dualRunning }));
     assert.equal(await evaluate('window.__localWebSocketCount'), 0);
     await evaluate(`(() => {
       const nativeFetch = window.fetch;
@@ -1420,10 +1427,41 @@ async function main() {
       JSON.stringify(guestStartResult));
     const guestStart = await evaluate('window.__gbaPoc.diagnostics().players[1].emulationSteps');
     await new Promise((resolve) => setTimeout(resolve, 900));
-    assert.ok(await evaluate(`window.__gbaPoc.diagnostics().players[1].emulationSteps > ${guestStart}`));
+    const guestProgress = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.ok(guestProgress.players[1].emulationSteps > guestStart, JSON.stringify(guestProgress));
     assert.equal(await evaluate('window.__localWebSocketCount'), 0);
     await click('local-exit');
     await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null', 'Guest P2 exit', 30000);
+
+    await click('local-2p-toggle');
+    await waitExpression('!document.getElementById("player2-choice").hidden', 'Download Play P2 choice');
+    await click('player2-guest');
+    assert.equal(await evaluate(
+      `Boolean(document.querySelector('#player2-rom-select option[value="__download_play__"]'))`,
+    ), true);
+    await evaluate(`document.getElementById('player2-rom-select').value = '__download_play__'`);
+    await click('player2-load');
+    await waitExpression(
+      `window.__gbaPoc.diagnostics().players[1].activeRom === '__download_play__' && ` +
+      `window.__gbaPoc.diagnostics().players[1].bootKind === 'multiboot-client'`,
+      'Download Play receiver ready',
+    );
+    await click('local-p1-ready');
+    await click('local-p2-ready');
+    await waitExpression('!document.getElementById("local-start").disabled', 'Download Play ready');
+    await click('local-start');
+    await waitExpression(
+      `window.__gbaPoc.diagnostics().localTwoPlayer?.active && ` +
+      `window.__gbaPoc.diagnostics().players[0].linkPlayer === 0`,
+      'Download Play cable start',
+      30000,
+    );
+    const downloadPlayStarted = await evaluate('window.__gbaPoc.diagnostics()');
+    assert.equal(downloadPlayStarted.players[1].running, false);
+    assert.equal(downloadPlayStarted.players[1].memoryBytes, 0);
+    await click('local-exit');
+    await waitExpression('window.__gbaPoc.diagnostics().localTwoPlayer === null',
+      'Download Play P2 exit', 30000);
 
     await click('export-battery');
     const exportedBattery = await waitFor(async () => {

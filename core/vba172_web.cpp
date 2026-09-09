@@ -34,11 +34,13 @@ constexpr int kGbScreenHeight = 144;
 constexpr int kAudioCapacity = 1 << 18;
 #ifdef __EMSCRIPTEN__
 constexpr const char* kGbaRomPath = "/game.gba";
+constexpr const char* kMultibootPath = "/game.mb";
 constexpr const char* kGbRomPath = "/game.gb";
 constexpr const char* kStatePath = "/state.sg1";
 constexpr const char* kBatteryPath = "/battery.sa1";
 #else
 constexpr const char* kGbaRomPath = "/private/tmp/vba172-game.gba";
+constexpr const char* kMultibootPath = "/private/tmp/vba172-game.mb";
 constexpr const char* kGbRomPath = "/private/tmp/vba172-game.gb";
 constexpr const char* kStatePath = "/private/tmp/vba172-state.sg1";
 constexpr const char* kBatteryPath = "/private/tmp/vba172-battery.sa1";
@@ -279,16 +281,67 @@ VBA_EXPORT int vba_load_rom(const uint8_t* data, int size, int system) {
   return 1;
 }
 
+VBA_EXPORT int vba_load_multiboot(const uint8_t* data, int size) {
+  g_last_error.clear();
+  std::remove(kMultibootPath);
+  std::remove(kStatePath);
+  std::remove(kBatteryPath);
+  if (!data || size < 0x100 || size > 0x40000 || !WriteFile(kMultibootPath, data, size)) {
+    g_last_error = "Invalid multiboot payload";
+    return 0;
+  }
+  ShutdownLoaded();
+  vbaLinkReset();
+  ConfigureColorMap();
+  cpuIsMultiBoot = true;
+  if (!CPULoadRom(kMultibootPath)) {
+    if (g_last_error.empty()) g_last_error = "VisualBoyAdvance rejected the multiboot payload";
+    return 0;
+  }
+  CPUInit(nullptr, false);
+  flashSetSize(0x20000);
+  CPUReset();
+  soundSetQuality(1);
+  g_emulator = &GBASystem;
+  if (!soundInit()) {
+    g_last_error = "Audio initialization failed";
+    g_emulator->emuCleanUp();
+    g_emulator = nullptr;
+    return 0;
+  }
+  g_frame_counter = 0;
+  g_emulation_steps = 0;
+  g_audio_total = 0;
+  g_state_audio_quality = 1;
+  g_joypad = 0;
+  g_loaded = true;
+  g_system = 0;
+  emulating = 1;
+  return 1;
+}
+
 VBA_EXPORT int vba_run_frame() {
   if (!g_loaded) return 0;
-  if (vbaLinkWaiting() || vbaLinkGuestHeld()) return 2;
+  if (vbaLinkMultibootActive() && vbaLinkRunMultiboot() == 2) return 2;
+  if (vbaLinkWaiting()) return 2;
   const uint64_t target = g_frame_counter + 1;
   for (int attempt = 0; attempt < 4 && g_frame_counter < target; ++attempt) {
     g_emulator->emuMain(g_emulator->emuCount);
     ++g_emulation_steps;
-    if (vbaLinkWaiting() || vbaLinkGuestHeld()) return 2;
+    if (vbaLinkWaiting()) return 2;
   }
   return g_frame_counter >= target ? 1 : 0;
+}
+
+VBA_EXPORT int vba_run_cycles(int cycles) {
+  if (!g_loaded || g_system != 0 || cycles <= 0 || cycles > 0x100000) return 0;
+  if (vbaLinkMultibootActive() && vbaLinkRunMultiboot() == 2) return 2;
+  if (vbaLinkWaiting()) return 2;
+  const uint64_t frame = g_frame_counter;
+  g_emulator->emuMain(cycles);
+  ++g_emulation_steps;
+  if (vbaLinkWaiting()) return 2;
+  return g_frame_counter != frame ? 1 : 0;
 }
 
 VBA_EXPORT void vba_set_joypad(uint32_t buttons) { g_joypad = buttons; }
@@ -393,15 +446,21 @@ VBA_EXPORT int vba_link_set_player(int player_id) {
   if (!g_loaded || g_system != 0) return 0;
   return vbaLinkSetPlayer(player_id);
 }
+VBA_EXPORT int vba_link_set_sequence(int sequence) { return vbaLinkSetSequence(sequence); }
+VBA_EXPORT int vba_link_multiboot_active() { return vbaLinkMultibootActive(); }
 VBA_EXPORT int vba_link_player() { return vbaLinkPlayer(); }
 VBA_EXPORT int vba_link_waiting() { return vbaLinkWaiting(); }
 VBA_EXPORT int vba_link_transfer_active() { return vbaLinkTransferActive(); }
 VBA_EXPORT int vba_link_request_pending() { return vbaLinkRequestPending(); }
 VBA_EXPORT int vba_link_request_sequence() { return vbaLinkRequestSequence(); }
+VBA_EXPORT int vba_link_mode() { return vbaLinkMode(); }
+VBA_EXPORT int vba_link_state_epoch() { return vbaLinkStateEpoch(); }
+VBA_EXPORT int vba_link_request_mode() { return vbaLinkRequestMode(); }
+VBA_EXPORT int vba_link_request_bits() { return vbaLinkRequestBits(); }
+VBA_EXPORT int vba_link_request_initiator() { return vbaLinkRequestInitiator(); }
 VBA_EXPORT int vba_link_request_speed() { return vbaLinkRequestSpeed(); }
-VBA_EXPORT int vba_link_request_data() { return vbaLinkRequestData(); }
+VBA_EXPORT uint32_t vba_link_request_data() { return vbaLinkRequestData(); }
 VBA_EXPORT int vba_link_request_ticks() { return vbaLinkRequestTicks(); }
-VBA_EXPORT int vba_link_guest_held() { return vbaLinkGuestHeld(); }
 VBA_EXPORT int vba_link_time() { return linktime; }
 VBA_EXPORT int vba_link_siocnt() {
   return ioMem ? READ16LE(&ioMem[0x128]) : -1;
@@ -412,21 +471,38 @@ VBA_EXPORT int vba_link_rcnt() {
 VBA_EXPORT int vba_link_siodata8() {
   return ioMem ? READ16LE(&ioMem[0x12a]) : -1;
 }
-VBA_EXPORT int vba_link_prepare_remote(int sequence, int speed, int master_data,
-                                      int transfer_ticks) {
-  return vbaLinkPrepareRemote(sequence, speed, master_data, transfer_ticks);
+VBA_EXPORT int vba_link_set_peer_state(int mode, int siocnt, int rcnt) {
+  return vbaLinkSetPeerState(mode, siocnt, rcnt);
 }
-VBA_EXPORT int vba_link_apply_pair(int sequence, int speed, int master_data,
-                                  int slave_data) {
-  return vbaLinkApplyPair(sequence, speed, master_data, slave_data);
+VBA_EXPORT int vba_link_prepare_remote(int sequence, int mode, int bits,
+                                      int speed, int initiator,
+                                      uint32_t data, int transfer_ticks) {
+  return vbaLinkPrepareRemote(sequence, mode, bits, speed, initiator, data,
+                              transfer_ticks);
+}
+VBA_EXPORT uint32_t vba_link_response_data() { return vbaLinkResponseData(); }
+VBA_EXPORT int vba_link_apply_transfer(int sequence, int mode, int bits,
+                                      int speed, int initiator,
+                                      uint32_t player0_data,
+                                      uint32_t player1_data) {
+  return vbaLinkApplyTransfer(sequence, mode, bits, speed, initiator,
+                              player0_data, player1_data);
 }
 VBA_EXPORT void vba_link_cancel_wait() { vbaLinkCancelWait(); }
 
 #ifdef VBA_LINK_TEST_PROBE
 // Deterministic integration probe for validating two independent WASM instances.
+VBA_EXPORT uint32_t vba_link_test_pc() { return reg[15].I; }
+VBA_EXPORT int vba_link_test_if() { return IF; }
+VBA_EXPORT int vba_link_test_ie() { return IE; }
+VBA_EXPORT int vba_link_test_ime() { return IME; }
 VBA_EXPORT int vba_link_test_set_data(int data) {
   if (!ioMem || data < 0 || data > 0xffff) return 0;
-  WRITE16LE(&ioMem[0x12a], data);
+  StartGPLink(0);
+  StartLink(0x6003);
+  vbaLinkSetPeerState(2, vbaLinkPlayer() == 0 ? 0x601f : 0x600b,
+                      vbaLinkPlayer() == 0 ? 0x000f : 0x000b);
+  WriteLinkData(static_cast<u16>(data));
   return 1;
 }
 
@@ -435,7 +511,9 @@ VBA_EXPORT int vba_link_test_begin_request(int data, int speed) {
     return 0;
   }
   StartGPLink(0);
-  WRITE16LE(&ioMem[0x12a], data);
+  StartLink(0x6000 | speed);
+  vbaLinkSetPeerState(2, 0x600c | speed, 0x000f);
+  WriteLinkData(static_cast<u16>(data));
   StartLink(0x6080 | speed);
   return vbaLinkRequestPending() ? 1 : 0;
 }
@@ -456,125 +534,217 @@ VBA_EXPORT void vba_shutdown() {
 
 #ifdef VBA_NATIVE_TEST
 bool RunNativeLinkProbe() {
-  StartGPLink(0);
-  if (!vba_link_set_player(0)) {
-    fprintf(stderr, "LINK probe configure failed\n");
-    return false;
-  }
-  if ((READ16LE(&ioMem[0x128]) & 0x3c) != 0x08) {
-    fprintf(stderr, "LINK parent pre-transfer role bits invalid: %04x\n",
-            READ16LE(&ioMem[0x128]));
-    return false;
-  }
-  if ((READ16LE(&ioMem[0x134]) & 0x07) != 0x03) {
-    fprintf(stderr, "LINK parent idle cable lines invalid: %04x\n",
-            READ16LE(&ioMem[0x134]));
-    return false;
-  }
-  StartGPLink(0);
-  WRITE16LE(&ioMem[0x12a], 0x1234);
-  StartLink(0x6083);
-  if (!vba_link_request_pending() || !vba_link_waiting() ||
-      vba_link_request_sequence() != 0 || vba_link_request_speed() != 3 ||
-      vba_link_request_data() != 0x1234 || vba_link_request_ticks() != 0) {
-    fprintf(stderr, "LINK probe request=%d wait=%d seq=%d speed=%d data=%04x\n",
-            vba_link_request_pending(), vba_link_waiting(),
-            vba_link_request_sequence(), vba_link_request_speed(),
-            vba_link_request_data());
-    return false;
-  }
-  if (!vba_link_apply_pair(0, 3, 0x1234, 0xabcd)) {
-    fprintf(stderr, "LINK probe pair failed\n");
-    return false;
-  }
-  if (READ16LE(&ioMem[0x134]) & 0x01) {
-    fprintf(stderr, "LINK parent transfer clock stayed high: %04x\n",
-            READ16LE(&ioMem[0x134]));
-    return false;
-  }
-  linktime = 100000;
-  LinkUpdate();
-  const bool passed = !vba_link_transfer_active() && !vba_link_waiting() &&
-                      READ16LE(&ioMem[0x120]) == 0x1234 &&
-                      READ16LE(&ioMem[0x122]) == 0xabcd &&
-                      (READ16LE(&ioMem[0x134]) & 0x07) == 0x03;
-  if (!passed) {
-    fprintf(stderr, "LINK probe active=%d wait=%d data=%04x/%04x\n",
-            vba_link_transfer_active(), vba_link_waiting(),
-            READ16LE(&ioMem[0x120]), READ16LE(&ioMem[0x122]));
-  }
-  if (!passed || !vba_link_set_player(-1) || !vba_link_set_player(1)) return false;
+  auto reset_port = [](int player, u16 siocnt, int peer_mode,
+                       u16 peer_siocnt, u16 peer_rcnt) {
+    vba_link_cancel_wait();
+    if (!vba_link_set_player(-1)) return false;
+    StartGPLink(0);
+    StartLink(siocnt);
+    if (!vba_link_set_player(player)) return false;
+    return vba_link_set_peer_state(peer_mode, peer_siocnt, peer_rcnt) == 1;
+  };
 
-  if ((READ16LE(&ioMem[0x128]) & 0x3c) != 0x1c) {
-    fprintf(stderr, "LINK child pre-transfer role bits invalid: %04x\n",
-            READ16LE(&ioMem[0x128]));
-    return false;
-  }
-  if ((READ16LE(&ioMem[0x134]) & 0x07) != 0x07) {
-    fprintf(stderr, "LINK child idle cable lines invalid: %04x\n",
-            READ16LE(&ioMem[0x134]));
-    return false;
+  for (int speed = 0; speed < 4; ++speed) {
+    if (!reset_port(0, static_cast<u16>(0x6000 | speed), 2,
+                    static_cast<u16>(0x601c | speed), 0x000f)) {
+      fprintf(stderr, "SIO multi setup failed at speed %d\n", speed);
+      return false;
+    }
+    IF = 0;
+    WRITE16LE(&ioMem[0x202], IF);
+    WriteLinkData(static_cast<u16>(0x1200 + speed));
+    StartLink(static_cast<u16>(0x6080 | speed));
+    if (!vba_link_request_pending() || vba_link_request_mode() != 2 ||
+        vba_link_request_bits() != 16 || vba_link_request_initiator() != 0 ||
+        vba_link_request_data() != static_cast<uint32_t>(0x1200 + speed)) {
+      fprintf(stderr, "SIO multi request invalid at speed %d\n", speed);
+      return false;
+    }
+    if (!vba_link_apply_transfer(0, 2, 16, speed, 0,
+                                 static_cast<uint32_t>(0x1200 + speed),
+                                 static_cast<uint32_t>(0xab00 + speed))) {
+      fprintf(stderr, "SIO multi apply failed at speed %d\n", speed);
+      return false;
+    }
+    const int cycles[4] = {63427, 16241, 10998, 5755};
+    linktime = cycles[speed] - 1;
+    LinkUpdate();
+    if (!vba_link_transfer_active() || (IF & 0x80)) {
+      fprintf(stderr, "SIO multi completed early at speed %d\n", speed);
+      return false;
+    }
+    ++linktime;
+    LinkUpdate();
+    if (vba_link_transfer_active() || !(IF & 0x80) ||
+        READ16LE(&ioMem[0x120]) != 0x1200 + speed ||
+        READ16LE(&ioMem[0x122]) != 0xab00 + speed ||
+        (READ16LE(&ioMem[0x134]) & 0x0f) != 0x03) {
+      fprintf(stderr, "SIO multi completion invalid at speed %d\n", speed);
+      return false;
+    }
   }
 
-  WRITE16LE(&ioMem[0x12a], 0xabcd);
-  if (vba_link_prepare_remote(0, 3, 0x1234, 0) != 0xabcd) {
-    fprintf(stderr, "LINK guest first transfer failed\n");
-    return false;
-  }
-  StartLink(0x6083);
-  if (!(READ16LE(&ioMem[0x128]) & 0x80) ||
-      !vba_link_apply_pair(0, 3, 0x1234, 0xabcd)) {
-    fprintf(stderr, "LINK guest transfer start bit was not preserved\n");
-    return false;
-  }
-  linktime = 100000;
-  LinkUpdate();
-  if ((READ16LE(&ioMem[0x128]) & 0x30) != 0x10) {
-    fprintf(stderr, "LINK child post-transfer ID bits invalid: %04x\n",
-            READ16LE(&ioMem[0x128]));
-    return false;
-  }
-  if (vba_link_guest_held()) {
-    fprintf(stderr, "LINK guest held before serial response write\n");
-    return false;
-  }
+  if (!reset_port(1, 0x6003, 2, 0x600b, 0x0003)) return false;
   WriteLinkData(0xabcd);
-  if (!vba_link_guest_held()) {
-    fprintf(stderr, "LINK guest was not held after serial response write\n");
+  if (vba_link_prepare_remote(0, 2, 16, 3, 0, 0x1234, 0) != 1 ||
+      vba_link_response_data() != 0xabcd ||
+      !vba_link_apply_transfer(0, 2, 16, 3, 0, 0x1234, 0xabcd)) {
+    fprintf(stderr, "SIO multi child response failed\n");
     return false;
   }
-  linktime = 1000;
-  if (vba_link_prepare_remote(1, 3, 0x5678, 2000) != -2 || vba_link_waiting()) {
-    fprintf(stderr, "LINK guest accepted transfer before scheduled tick\n");
-    return false;
-  }
-  linktime = 2500;
+  linktime = 5755;
   LinkUpdate();
-  if (vba_link_prepare_remote(1, 3, 0x5678, 2000) != 0xabcd ||
-      !vba_link_waiting() || linktime != 500) {
-    fprintf(stderr, "LINK guest scheduled transfer failed wait=%d ticks=%d\n",
-            vba_link_waiting(), linktime);
+  if (READ16LE(&ioMem[0x120]) != 0x1234 ||
+      READ16LE(&ioMem[0x122]) != 0xabcd || vba_link_waiting()) {
+    fprintf(stderr, "SIO multi child completion failed\n");
     return false;
   }
-  StartLink(0x6003);
-  if (READ16LE(&ioMem[0x128]) & 0x80) {
-    fprintf(stderr, "LINK guest forced an unrequested transfer start bit\n");
+  if (!reset_port(0, 0x1001, 15, 0x0008, 0x000f)) return false;
+  WRITE32LE(&ioMem[0x120], 0x6200);
+  StartLink(0x1081);
+  if (!vba_link_request_pending() || vba_link_request_mode() != 1 ||
+      vba_link_request_data() != 0x6200) {
+    fprintf(stderr, "SIO multiboot auto-mode request failed\n");
     return false;
   }
   vba_link_cancel_wait();
-  if (!vba_link_set_player(0)) return false;
-  WRITE16LE(&ioMem[0x12a], 0x4321);
-  StartLink(0x6083);
-  if (!vba_link_waiting() || !vba_link_request_pending()) {
-    fprintf(stderr, "LINK probe stale wait setup failed\n");
+
+  if (!reset_port(0, 0x0001, 0, 0x0080, 0x0000)) return false;
+  IF = 0;
+  WRITE16LE(&ioMem[0x202], IF);
+  WriteLinkData(0x00aa);
+  StartLink(0x4081);
+  if (vba_link_request_mode() != 0 || vba_link_request_bits() != 8 ||
+      vba_link_request_speed() != 0 || vba_link_request_data() != 0xaa ||
+      !vba_link_apply_transfer(0, 0, 8, 0, 0, 0xaa, 0x55)) {
+    fprintf(stderr, "SIO normal8 request failed\n");
     return false;
   }
-  if (!vba_link_set_player(0) || vba_link_waiting() ||
-      vba_link_request_pending()) {
-    fprintf(stderr, "LINK probe waiting reattach failed\n");
+  linktime = 511;
+  LinkUpdate();
+  if (!vba_link_transfer_active() || (IF & 0x80)) return false;
+  ++linktime;
+  LinkUpdate();
+  if (vba_link_transfer_active() || !(IF & 0x80) ||
+      (READ16LE(&ioMem[0x12a]) & 0xff) != 0x55) {
+    fprintf(stderr, "SIO normal8 completion failed\n");
+    return false;
+  }
+
+  if (!reset_port(0, 0x1003, 1, 0x1080, 0x0000)) return false;
+  IF = 0;
+  WRITE16LE(&ioMem[0x202], IF);
+  WRITE32LE(&ioMem[0x120], 0x12345678);
+  StartLink(0x5083);
+  if (vba_link_request_mode() != 1 || vba_link_request_bits() != 32 ||
+      vba_link_request_speed() != 1 || vba_link_request_data() != 0x12345678 ||
+      !vba_link_apply_transfer(0, 1, 32, 1, 0, 0x12345678, 0xdeadbeef)) {
+    fprintf(stderr, "SIO normal32 request failed\n");
+    return false;
+  }
+  linktime = 255;
+  LinkUpdate();
+  if (!vba_link_transfer_active() || (IF & 0x80)) return false;
+  ++linktime;
+  LinkUpdate();
+  if (vba_link_transfer_active() || !(IF & 0x80) ||
+      READ32LE(&ioMem[0x120]) != 0xdeadbeef) {
+    fprintf(stderr, "SIO normal32 completion failed\n");
+    return false;
+  }
+
+  if (!reset_port(1, 0x1080, 1, 0x1083, 0x0001)) return false;
+  WRITE32LE(&ioMem[0x120], 0xaabbccdd);
+  StartLink(0x1080);
+  if (!vba_link_waiting() ||
+      vba_link_prepare_remote(0, 1, 32, 1, 0, 0x11223344, 0) != 1 ||
+      vba_link_response_data() != 0xaabbccdd ||
+      !vba_link_apply_transfer(0, 1, 32, 1, 0, 0x11223344, 0xaabbccdd)) {
+    fprintf(stderr, "SIO normal32 child response failed\n");
+    return false;
+  }
+  linktime = 256;
+  LinkUpdate();
+  if (READ32LE(&ioMem[0x120]) != 0x11223344) return false;
+
+  if (!reset_port(0, 0x1001, 1, 0x1080, 0x0000)) return false;
+  const uint32_t parameter = 0x02001000;
+  const uint32_t source = 0x02002000;
+  workRAM[0x1014] = 0xb2;
+  workRAM[0x1019] = 0xd1;
+  workRAM[0x101a] = 0xff;
+  workRAM[0x101b] = 0xff;
+  workRAM[0x101c] = 0x93;
+  WRITE32LE(&workRAM[0x1020], source);
+  WRITE32LE(&workRAM[0x1024], source + 0x100);
+  for (int index = 0; index < 0x100; ++index) {
+    workRAM[0x2000 + index] = static_cast<u8>(index * 29 + 3);
+  }
+  reg[0].I = parameter;
+  if (!vbaLinkStartMultiboot(parameter, 0)) {
+    fprintf(stderr, "SIO multiboot host did not start\n");
+    return false;
+  }
+  if (READ16LE(&ioMem[0x128]) != 0x1089) {
+    fprintf(stderr, "SIO multiboot host control state failed\n");
+    return false;
+  }
+  if (vbaLinkRunMultiboot() != 2) return false;
+  int endPolls = 0;
+  bool crcFollows = false;
+  int transfers = 0;
+  while (vbaLinkMultibootActive() && transfers++ < 100) {
+    const uint32_t sent = vbaLinkRequestData();
+    uint16_t reply = 0x00c0;
+    if (transfers == 1) reply = 0x73d1;
+    else if ((sent & 0xffff) == 0x0065) {
+      reply = endPolls == 0 ? 0x01c0 : (endPolls == 1 ? 0x0074 : 0x0075);
+      ++endPolls;
+    } else if ((sent & 0xffff) == 0x0066) {
+      reply = 0x0075;
+      crcFollows = true;
+    } else if (crcFollows) {
+      reply = static_cast<uint16_t>(sent);
+    }
+    const uint32_t response = (static_cast<uint32_t>(reply) << 16) |
+        (sent & 0xffff);
+    if (!vbaLinkApplyTransfer(vbaLinkRequestSequence(), 1, 32, 0, 0,
+                              sent, response)) {
+      fprintf(stderr, "SIO multiboot host transfer %d failed\n", transfers);
+      return false;
+    }
+    const int runResult = vbaLinkRunMultiboot();
+    if ((vbaLinkMultibootActive() && runResult != 2) ||
+        (!vbaLinkMultibootActive() && runResult != 1)) {
+      fprintf(stderr, "SIO multiboot host run state failed\n");
+      return false;
+    }
+  }
+  if (vbaLinkMultibootActive() || reg[0].I != 0 || transfers >= 100) {
+    fprintf(stderr, "SIO multiboot host completion failed result=%08x transfers=%d\n",
+            reg[0].I, transfers);
+    return false;
+  }
+
+  StartGPLink(0x80a5);
+  if (vba_link_mode() != 8 || READ16LE(&ioMem[0x134]) != 0x80a5) {
+    fprintf(stderr, "SIO GPIO pass-through failed\n");
     return false;
   }
   return vba_link_set_player(-1);
+}
+
+bool RunNativeMultibootEntryProbe() {
+  std::vector<uint8_t> payload(0x100, 0);
+  if (!vba_load_multiboot(payload.data(), static_cast<int>(payload.size()))) {
+    fprintf(stderr, "MULTIBOOT LOAD: %s\n", vba_last_error());
+    return false;
+  }
+  if (reg[15].I != 0x020000c4) {
+    fprintf(stderr, "MULTIBOOT ENTRY: expected pipeline PC 020000c4, got %08x\n", reg[15].I);
+    return false;
+  }
+  return true;
 }
 
 int main(int argc, char** argv) {
@@ -630,6 +800,7 @@ int main(int argc, char** argv) {
   }
   printf("ok version=%d state=%d frames=%llu\n", vba_state_version(),
          vba_export_size(), static_cast<unsigned long long>(g_frame_counter));
+  if (system == 0 && !RunNativeMultibootEntryProbe()) return 1;
   return 0;
 }
 #endif

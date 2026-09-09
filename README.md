@@ -1,6 +1,6 @@
 # GBC Porting
 
-VisualBoyAdvance 1.7.2 GB/GBC/GBA emulation in the browser with VBA Link 1.72-derived two-user GBA cable rooms. Legacy gzip save-state and battery formats remain compatible.
+VisualBoyAdvance 1.7.2 GB/GBC/GBA emulation in the browser with a hardware-oriented two-user GBA serial transport. Legacy gzip save-state and battery formats remain compatible.
 
 ## Features
 
@@ -16,7 +16,8 @@ VisualBoyAdvance 1.7.2 GB/GBC/GBA emulation in the browser with VBA Link 1.72-de
 - GB/GBC 160x144 and GBA 240x160 automatic display switching
 - Persistent Speed toggle using VBA's speed input mode
 - Authenticated two-account GBA cable rooms over same-origin WebSocket
-- FireRed/LeafGreen/Ruby/Sapphire/Emerald region-compatible room matching
+- Generic GBA Normal 8/32-bit and Multiplayer 16-bit serial transfers
+- Single-Pak Download Play with a clean-room multiboot receiver
 - Transfer-sequence barrier, paired checkpoints and atomic two-account battery commit
 - One-page local 2P with account or P1-owned Guest P2 saves
 - Two independent VBA WASM module/memory/audio/input runtimes with direct in-page cable transport
@@ -69,14 +70,18 @@ The build downloads the pinned VisualBoyAdvance 1.7.2 source, the VBA Link 1.72 
 
 ## Link Cable
 
-1. Both users load a GBA ROM and enter `Link Cable`.
+1. The host loads a GBA ROM. The guest loads a GBA ROM for Multi-Pak or `Download Play` for Single-Pak.
 2. The host creates a room and sends its room ID and invite code to the guest.
-3. The guest joins with a compatible ROM. Pokemon Gen 3 titles may differ when their region code matches.
+3. The guest joins. The games negotiate the serial mode and payload over the generic cable.
 4. Both users select `Ready`; the host selects `Start`.
 5. The browsers exchange only GBA serial words. Gameplay and rendering remain local.
 6. Leave the in-game trade room so both games write their battery save, then select `Finish + save` on both browsers.
 
-While a room is active, speed mode and individual quick-state load/import are disabled. Periodic resume checkpoints are accepted only as a synchronized pair. Battery saves are written only when both participants submit successfully; disconnecting or aborting cannot commit one side alone.
+While a room is active, speed mode and individual quick-state load/import are disabled. Periodic resume checkpoints are accepted only as a synchronized pair. Multi-Pak battery saves are written only when both cartridge participants submit successfully; a Download Play receiver is ephemeral and has no ROM battery row.
+
+Normal 8-bit, Normal 32-bit and Multiplayer 16-bit transfers use one mode/width/baud/IRQ contract without game-code branches. Single-Pak uses the game's own host protocol and BIOS `MultiBoot` call; the browser receiver performs the documented handshake, decryption and CRC without distributing a Nintendo BIOS. Wireless Adapter, JoyBus and cartridge-specific peripherals are outside the current cable scope.
+
+Linked GBA cores run in alternating 4,096-cycle slices instead of whole frames. This bounds parent/child drift for games such as Mario Bros. Classic that perform several serial transfers inside one video frame and prevents video starvation followed by audio-buffer clipping.
 
 `Leave room` aborts the whole two-player room and immediately releases both save locks. A network disconnect keeps the room resumable for 60 seconds, then automatically aborts it. Creating a new room for the same account and ROM also cleans up an unrecoverable stale room before acquiring a new lock.
 
@@ -88,7 +93,7 @@ Open the hamburger menu and select `2P`. Player 2 can authenticate with a differ
 
 Player 1 and authenticated Player 2 use each account's `primary` save profile. Guest P2 uses Player 1's fixed `guest-p2` profile, so the same ROM cannot overwrite Player 1's save. Existing rows migrate idempotently to `primary`. The server never accepts a client-selected account ID or profile key.
 
-Load a GBA ROM for each player and both cores run independently immediately; loading or reloading P2 never pauses P1. No local-link session or save lock exists in this state. Each player reaches the in-game communication wait independently, then toggles the Ready control below that player's controller. Only P1 Start briefly pauses both runtimes, flushes both standalone batteries, acquires the paired server locks, creates the initial checkpoint, and attaches the cable. A failed Start returns both players to independent execution and standalone autosave without closing 2P.
+Load a GBA ROM for each player and both cores run independently immediately; loading or reloading P2 never pauses P1. For Single-Pak, select `Download Play` for P2 instead of a ROM. No local-link session or save lock exists in this state. Each cartridge player reaches the in-game communication wait independently, then toggles Ready. Only P1 Start briefly pauses the loaded runtimes, flushes cartridge batteries, acquires the required locks, creates a cartridge checkpoint when possible, and attaches the cable. The Download Play endpoint becomes a real VBA runtime after the host payload passes CRC. A failed Start returns the players to independent execution without closing 2P.
 
 Landscape places both ROM toolbars on one top row and the players left/right; portrait stacks the toolbars and players without recreating either core. Player 1 keeps the existing keyboard controls, and Player 2 uses `I/J/K/L`, `M/N`, `U/O`, `P/H`. Gamepad indices 0 and 1 stay assigned to P1 and P2. P2 starts muted and can be unmuted independently. P1 pause affects P1 alone before cable Start and both runtimes during active cable mode. Immersive fullscreen hides the app shell, overlays translucent controls, and attempts to lock landscape orientation; local 2P uses one P1 fullscreen entry and splits the stage left/right.
 
@@ -100,10 +105,13 @@ Local 2P and remote Rooms are mutually exclusive in both the UI and server. One 
 npm test
 npm run test:core
 npm run test:browser
+npm run test:mario
 MARIADB_SMOKE=1 MARIADB_SMOKE_PORT=43307 MARIADB_SMOKE_PASSWORD=test npm run test:mariadb
 ```
 
 `npm run test:browser` builds probe-enabled core artifacts only under `.build/core-probe`, starts an isolated auth test session, in-memory test database and Chrome profile, proves a peer-originated cable word across two real WASM instances, then deletes the probe artifacts. Normal `npm run build:core` omits those exports. The Node suite additionally opens two authenticated HTTP/WebSocket sessions and verifies room admission, serial-word exchange, mixed-ROM save locking, paired checkpoints and atomic battery commit. The env-gated MariaDB smoke script refuses database names outside the `gbc_porting_smoke_` prefix and verifies concurrent/repeated legacy migration, PK/FK validity, admission and terminal-transition races, and paired rollback. Runtime code uses MariaDB; the memory adapter is rejected outside `NODE_ENV=test`.
+
+`npm run test:mario` uses the local AX4E fixture when present, navigates two independent cores into Mario Bros. Classic, and verifies that 4,096-cycle link scheduling keeps both gameplay frame counters aligned. It skips when that local ROM fixture is unavailable.
 
 ## Docker
 

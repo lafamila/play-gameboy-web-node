@@ -1,13 +1,12 @@
 import createVbaModule from '/core/vba172.js';
-import { hostTransferData, isSlaveHandshake, LinkMessageQueue } from '/link-message-queue.js';
+import { LinkMessageQueue } from '/link-message-queue.js';
 import {
-  applyDirectCablePair,
-  directCableIdle,
-  guestCableResponsePending,
-  releaseDirectCableGuest,
-  requiresIrqReleaseGate,
+  applyDirectSioTransfer,
+  pendingSioOffer,
+  sioPortState,
+  synchronizeDirectCableState,
 } from '/local-link-transport.js';
-import { pumpLinkRuntime } from '/link-runtime-pump.js';
+import { MultibootClientEndpoint } from '/multiboot-client.js';
 import {
   activeGamepadCommands,
   createDefaultGamepadMapping,
@@ -22,12 +21,41 @@ import {
 import { mountPlayerRuntime } from '/player-runtime-view.js';
 
 const FRAME_RATE = 59.7275;
+const GBA_CPU_CLOCK = 16_777_216;
+const GBA_FRAME_CYCLES = GBA_CPU_CLOCK / FRAME_RATE;
+const LINK_CYCLE_SLICE = 4096;
+const MAX_LINK_SLICES_PER_TICK = 160;
 const CORE_SAMPLE_RATE = 44100;
 const SPEED_MODE_MULTIPLIER = 2;
 const LINK_CHECKPOINT_INTERVAL = 30_000;
 const LINK_ROOM_POLL_INTERVAL = 3_000;
 const LINK_DIAGNOSTIC_INTERVAL = 1_000;
 const STANDALONE_BATTERY_RECOVERY_KEY = 'gbc-standalone-battery-recovery';
+const DOWNLOAD_PLAY_ID = '__download_play__';
+const DOWNLOAD_PLAY_ROM = Object.freeze({
+  id: DOWNLOAD_PLAY_ID,
+  platform: 'gba',
+  title: 'Download Play',
+  gameCode: 'MB',
+  revision: 0,
+  size: 0,
+  bootKind: 'multiboot-client',
+});
+
+function isDownloadPlayRom(rom) {
+  return rom?.bootKind === 'multiboot-client' || rom?.id === DOWNLOAD_PLAY_ID;
+}
+
+function romOption(rom) {
+  const option = document.createElement('option');
+  option.value = rom.id;
+  option.textContent = isDownloadPlayRom(rom)
+    ? '[GBA] Download Play'
+    : `[${rom.platform.toUpperCase()}] ${rom.title}${rom.platform === 'gba' ? ` (${rom.gameCode})` : ''}`;
+  option.dataset.platform = rom.platform;
+  option.dataset.bootKind = rom.bootKind || 'cartridge';
+  return option;
+}
 
 const playerRuntimeTemplate = document.getElementById('player-runtime-template');
 mountPlayerRuntime({
@@ -137,6 +165,7 @@ class PlayerRuntime {
     this.imageData = this.canvasContext.createImageData(this.frameWidth, this.frameHeight);
     this.core = null;
     this.activeRom = null;
+    this.bootKind = 'cartridge';
     this.romIdentity = '';
     this.running = false;
     this.paused = false;
@@ -145,6 +174,7 @@ class PlayerRuntime {
     this.animationHandle = 0;
     this.lastFrameTime = 0;
     this.frameDebt = 0;
+    this.linkCycleDebt = 0;
     this.keyMask = 0;
     this.touchMask = 0;
     this.audioContext = null;
@@ -278,6 +308,7 @@ class PlayerRuntime {
       this.core._vba_load_rom(pointer, size, isGba ? 0 : 1));
     if (!loaded) throw new Error(this.error('ROM load failed'));
     this.activeRom = rom;
+    this.bootKind = 'cartridge';
     this.frameWidth = this.core._vba_frame_width();
     this.frameHeight = this.core._vba_frame_height();
     this.canvas.width = this.frameWidth;
@@ -289,7 +320,46 @@ class PlayerRuntime {
     this.speedMode = false;
     this.lastFrameTime = 0;
     this.frameDebt = 1000 / FRAME_RATE;
+    this.linkCycleDebt = GBA_FRAME_CYCLES;
     this.setStatus('Ready', 'running');
+  }
+
+  prepareDownloadPlay() {
+    this.shutdown();
+    this.activeRom = DOWNLOAD_PLAY_ROM;
+    this.bootKind = 'multiboot-client';
+    this.paused = true;
+    this.setStatus('Download Play', 'loading');
+  }
+
+  async loadMultiboot(payload, sequence, isCurrent = () => true, linkSlot = this.slot) {
+    await this.ensureCore();
+    assertCurrentLoad(isCurrent);
+    await this.ensureAudio();
+    assertCurrentLoad(isCurrent);
+    const loaded = this.withBytes(payload, (pointer, size) =>
+      this.core._vba_load_multiboot(pointer, size));
+    if (!loaded) throw new Error(this.error('Download Play load failed'));
+    if (!this.core._vba_link_set_player(linkSlot) ||
+        !this.core._vba_link_set_sequence(sequence)) {
+      throw new Error('Download Play cable attach failed');
+    }
+    this.activeRom = DOWNLOAD_PLAY_ROM;
+    this.bootKind = 'multiboot-client';
+    this.frameWidth = this.core._vba_frame_width();
+    this.frameHeight = this.core._vba_frame_height();
+    this.canvas.width = this.frameWidth;
+    this.canvas.height = this.frameHeight;
+    this.shell.style.aspectRatio = `${this.frameWidth} / ${this.frameHeight}`;
+    this.imageData = this.canvasContext.createImageData(this.frameWidth, this.frameHeight);
+    this.running = true;
+    this.paused = false;
+    this.speedMode = false;
+    this.lastFrameTime = 0;
+    this.frameDebt = 1000 / FRAME_RATE;
+    this.linkCycleDebt = GBA_FRAME_CYCLES;
+    this.renderFrame();
+    this.setStatus('Running', 'running');
   }
 
   loadBattery(bytes) {
@@ -323,6 +393,15 @@ class PlayerRuntime {
     return result;
   }
 
+  runCycles(cycles, inputMask = this.keyMask | this.touchMask | gamepadMask(this.slot)) {
+    this.core._vba_set_joypad(inputMask);
+    const previousFrame = Number(this.core._vba_frame_counter());
+    const result = this.core._vba_run_cycles(cycles);
+    const completedFrame = Number(this.core._vba_frame_counter()) !== previousFrame;
+    if (completedFrame) this.renderFrame();
+    return { result, completedFrame };
+  }
+
   shutdown() {
     clearInterval(this.batteryTimer);
     this.batteryTimer = 0;
@@ -342,12 +421,14 @@ class PlayerRuntime {
     if (this.core) this.core._vba_shutdown();
     this.core = null;
     this.activeRom = null;
+    this.bootKind = 'cartridge';
     this.audioContext = null;
     this.audioNode = null;
     this.audioPointer = 0;
     this.audioPosition = 0;
     this.muted = this.defaultMuted;
     this.speedMode = false;
+    this.linkCycleDebt = 0;
     this.hasStoredQuickState = false;
     this.setStatus('Idle', 'idle');
   }
@@ -369,8 +450,9 @@ const playerTwo = new PlayerRuntime({
 
 for (const property of [
   'canvasContext', 'frameWidth', 'frameHeight', 'imageData', 'core', 'activeRom',
-  'romIdentity', 'running', 'paused', 'muted', 'speedMode', 'animationHandle',
-  'lastFrameTime', 'frameDebt', 'keyMask', 'touchMask', 'audioContext', 'audioNode',
+  'bootKind', 'romIdentity', 'running', 'paused', 'muted', 'speedMode', 'animationHandle',
+  'lastFrameTime', 'frameDebt', 'linkCycleDebt', 'keyMask', 'touchMask',
+  'audioContext', 'audioNode',
   'audioPointer', 'audioQueue', 'audioPosition', 'batteryTimer', 'hasStoredQuickState',
 ]) {
   Object.defineProperty(globalThis, property, {
@@ -395,7 +477,6 @@ let linkReconnectTimer;
 let linkRoomTimer;
 let linkCheckpointTimer;
 let linkDiagnosticTimer;
-let linkPumpScheduled = false;
 let linkRoomRefreshing = false;
 let linkCheckpointing = false;
 let linkCheckpointPendingSequence = null;
@@ -404,12 +485,14 @@ let linkFinishSubmitted = false;
 let linkCorePlayer = -1;
 let linkDetachPending = false;
 let linkLastOfferSequence = -1;
-let linkGuestHandshakePending = false;
-let linkLastReleaseSequence = -1;
 let linkTransferActive = false;
+let linkPeerSioState = null;
+let linkLastSioStateSignature = '';
 let linkIdleSince = 0;
 let linkFinishIdle = false;
 let linkDebugEnabled = false;
+let remoteMultibootEndpoint = null;
+let remoteMultibootActivation = null;
 let localTwoPlayer;
 let immersiveFullscreen = false;
 const gamepadMappingStores = [new Map(), new Map()];
@@ -448,6 +531,9 @@ function stopEmulation() {
   closeLinkSocket();
   clearLinkTimers();
   if (core) core._vba_shutdown();
+  remoteMultibootEndpoint?._vba_link_cancel_wait();
+  remoteMultibootEndpoint = null;
+  remoteMultibootActivation = null;
   linkCorePlayer = -1;
   linkMessageQueue.clear();
 }
@@ -521,9 +607,62 @@ function activeGbaSelected() {
   return Boolean(activeRom?.platform === 'gba' && activeRom.id === elements['rom-select'].value);
 }
 
+function remoteCableEndpoint() {
+  return remoteMultibootEndpoint || core;
+}
+
 function cableIdle() {
-  return Boolean(core && !core._vba_link_waiting() && !core._vba_link_transfer_active() &&
-    !core._vba_link_request_pending());
+  const endpoint = remoteCableEndpoint();
+  return Boolean(endpoint && !endpoint._vba_link_waiting() &&
+    !endpoint._vba_link_transfer_active() && !endpoint._vba_link_request_pending());
+}
+
+function prepareRemoteDownloadPlay() {
+  cancelAnimationFrame(animationHandle);
+  clearInterval(batteryTimer);
+  playerOne.prepareDownloadPlay();
+  remoteMultibootActivation = null;
+  remoteMultibootEndpoint = new MultibootClientEndpoint({
+    onComplete: (payload) => activateRemoteMultiboot(payload),
+  });
+  elements['screen-empty'].textContent = 'Download Play';
+  elements['screen-empty'].hidden = false;
+  elements['rom-meta'].textContent = 'GBA / Download Play';
+  setControls(false);
+  applyControlState();
+}
+
+function activateRemoteMultiboot(payload) {
+  if (remoteMultibootActivation || !remoteMultibootEndpoint) return;
+  const endpoint = remoteMultibootEndpoint;
+  const sequence = endpoint._vba_link_request_sequence();
+  const roomId = linkRoom?.id;
+  remoteMultibootActivation = (async () => {
+    const participant = currentLinkParticipant();
+    if (!participant || participant.bootKind !== 'multiboot-client' || participant.slot !== 1) {
+      throw new Error('Download Play participant is no longer active');
+    }
+    await playerOne.loadMultiboot(payload, sequence,
+      () => linkRoom?.id === roomId && linkRoom?.status === 'active', participant.slot);
+    remoteMultibootEndpoint = null;
+    linkCorePlayer = participant.slot;
+    if (linkPeerSioState) {
+      core._vba_link_set_peer_state(
+        linkPeerSioState.mode, linkPeerSioState.siocnt, linkPeerSioState.rcnt,
+      );
+    }
+    elements['screen-empty'].hidden = true;
+    setControls(true);
+    startLoop();
+    sendLinkSioState(true);
+    drainLinkMessages();
+    logEvent('Download Play started');
+  })().catch((error) => {
+    logEvent(error.message, true);
+    void abortLinkRoom().catch((abortError) => logEvent(abortError.message, true));
+  }).finally(() => {
+    remoteMultibootActivation = null;
+  });
 }
 
 function updateLinkIdleGate(now = performance.now()) {
@@ -559,7 +698,7 @@ function applyControlState() {
   elements['quick-save'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen;
   elements['quick-load'].disabled = !emulatorControlsEnabled || roomOpen || localCableOpen || !hasStoredQuickState;
 
-  const saveAdminEnabled = emulatorControlsEnabled &&
+  const saveAdminEnabled = emulatorControlsEnabled && !isDownloadPlayRom(activeRom) &&
     ['admin', 'superadmin'].includes(currentSession?.permission);
   elements['export-state'].disabled = !saveAdminEnabled || roomOpen || localCableOpen;
   elements['import-state'].disabled = !saveAdminEnabled || roomOpen || localCableOpen;
@@ -568,7 +707,7 @@ function applyControlState() {
   elements['import-state-label'].classList.toggle('disabled', elements['import-state'].disabled);
   elements['import-battery-label'].classList.toggle('disabled', elements['import-battery'].disabled);
   elements['rom-select'].disabled = roomOpen || localCableOpen;
-  elements['load-rom'].disabled = roomOpen || localCableOpen || roms.length === 0;
+  elements['load-rom'].disabled = roomOpen || localCableOpen || !elements['rom-select'].value;
   const playerTwoLoadBlocked = localCableOpen || Boolean(localTwoPlayer?.playerTwoLoading);
   elements['player2-rom-select'].disabled = playerTwoLoadBlocked;
   elements['player2-load'].disabled = playerTwoLoadBlocked || !localTwoPlayer?.mode ||
@@ -579,12 +718,13 @@ function applyControlState() {
   }
   elements['player2-fullscreen'].hidden = localOpen;
   elements['player2-speed-toggle'].disabled = !playerTwoControlsEnabled || localCableOpen;
-  elements['player2-quick-save'].disabled = !playerTwoControlsEnabled || localCableOpen;
+  elements['player2-quick-save'].disabled = !playerTwoControlsEnabled || localCableOpen ||
+    isDownloadPlayRom(playerTwo.activeRom);
   elements['player2-quick-load'].disabled = !playerTwoControlsEnabled || localCableOpen ||
-    !playerTwo.hasStoredQuickState;
+    isDownloadPlayRom(playerTwo.activeRom) || !playerTwo.hasStoredQuickState;
 
   const canEnterRoom = activeGbaSelected() && !linkRoom && !localOpen;
-  elements['link-create'].disabled = !canEnterRoom;
+  elements['link-create'].disabled = !canEnterRoom || isDownloadPlayRom(activeRom);
   elements['link-join'].disabled = !canEnterRoom || !elements['link-room-input'].value.trim() ||
     !elements['link-invite-input'].value.trim();
   elements['local-2p-toggle'].disabled = roomOpen;
@@ -615,7 +755,7 @@ function getExportBytes() {
 }
 
 async function updateStoredStateControls() {
-  if (!activeRom || !core) {
+  if (!activeRom || !core || isDownloadPlayRom(activeRom)) {
     hasStoredQuickState = false;
     applyControlState();
     return;
@@ -636,7 +776,8 @@ async function updateStoredStateControls() {
 }
 
 async function updatePlayerTwoStoredStateControls() {
-  if (!localTwoPlayer?.mode || !playerTwo.activeRom || !playerTwo.core) {
+  if (!localTwoPlayer?.mode || !playerTwo.activeRom || !playerTwo.core ||
+      isDownloadPlayRom(playerTwo.activeRom)) {
     playerTwo.hasStoredQuickState = false;
     applyControlState();
     return;
@@ -1101,8 +1242,6 @@ class LocalTwoPlayerController {
     this.session = null;
     this.ready = [false, false];
     this.lastPairSequence = -1;
-    this.lastReleaseSequence = -1;
-    this.guestHandshakePending = false;
     this.checkpointSequence = 0;
     this.pendingCheckpoint = null;
     this.lastCheckpoint = null;
@@ -1113,8 +1252,9 @@ class LocalTwoPlayerController {
     this.rollbackCount = 0;
     this.debug = false;
     this.pairCount = 0;
-    this.pumpScheduled = [false, false];
-    this.pumpBurst = [0, 0];
+    this.multibootEndpoint = null;
+    this.multibootPayload = null;
+    this.multibootActivation = null;
     this.boundUpdateLayout = () => this.updateLayout();
     this.resizeObserver = new ResizeObserver(() => this.updateLayout());
   }
@@ -1209,32 +1349,33 @@ class LocalTwoPlayerController {
 
   renderRomCatalog() {
     const selected = elements['player2-rom-select'].value;
-    elements['player2-rom-select'].replaceChildren(...roms.filter((rom) => rom.platform === 'gba').map((rom) => {
-      const option = document.createElement('option');
-      option.value = rom.id;
-      option.textContent = `[GBA] ${rom.title} (${rom.gameCode})`;
-      return option;
-    }));
-    if (roms.some((rom) => rom.id === selected && rom.platform === 'gba')) {
+    const choices = [...roms.filter((rom) => rom.platform === 'gba'), DOWNLOAD_PLAY_ROM];
+    elements['player2-rom-select'].replaceChildren(...choices.map(romOption));
+    if (choices.some((rom) => rom.id === selected)) {
       elements['player2-rom-select'].value = selected;
     }
   }
 
   resetCableMetadata() {
-    this.guestHandshakePending = false;
     this.lastPairSequence = -1;
-    this.lastReleaseSequence = -1;
     this.checkpointSequence = 0;
     this.pendingCheckpoint = null;
     this.lastCheckpoint = null;
     this.pairCount = 0;
-    this.pumpScheduled = [false, false];
-    this.pumpBurst = [0, 0];
+  }
+
+  playerTwoIsMultiboot() {
+    return isDownloadPlayRom(playerTwo.activeRom);
+  }
+
+  cableEndpoints() {
+    return [playerOne.core, this.multibootEndpoint || playerTwo.core];
   }
 
   bothRuntimesLoaded() {
-    return Boolean(playerOne.running && playerTwo.running &&
-      playerOne.activeRom?.platform === 'gba' && playerTwo.activeRom?.platform === 'gba');
+    return Boolean(playerOne.running && playerOne.activeRom?.platform === 'gba' &&
+      ((playerTwo.running && playerTwo.activeRom?.platform === 'gba') ||
+        (this.playerTwoIsMultiboot() && this.multibootEndpoint)));
   }
 
   clearReady() {
@@ -1263,14 +1404,16 @@ class LocalTwoPlayerController {
     if (!activeRom || activeRom.platform !== 'gba') {
       throw new Error('Load a GBA ROM for Player 1 first');
     }
-    const selected = roms.find((rom) =>
-      rom.id === elements['player2-rom-select'].value && rom.platform === 'gba');
+    const selectedId = elements['player2-rom-select'].value;
+    const selected = selectedId === DOWNLOAD_PLAY_ID
+      ? DOWNLOAD_PLAY_ROM
+      : roms.find((rom) => rom.id === selectedId && rom.platform === 'gba');
     if (!selected) throw new Error('Select a GBA ROM for Player 2');
     if (this.preparing || this.active) throw new Error('Stop the local cable before loading another ROM');
     if (this.playerTwoLoading) throw new Error('Player 2 is already loading');
     const generation = ++this.playerTwoLoadGeneration;
     const isCurrent = () => this.enabled && generation === this.playerTwoLoadGeneration;
-    const previous = playerTwo.running && playerTwo.activeRom ? {
+    const previous = playerTwo.running && playerTwo.activeRom && !this.playerTwoIsMultiboot() ? {
       rom: playerTwo.activeRom,
       state: playerTwo.exportState(),
       battery: playerTwo.core._vba_export_battery() ? playerTwo.exportBytes() : null,
@@ -1288,6 +1431,21 @@ class LocalTwoPlayerController {
     try {
       if (previous) await persistStandaloneBattery(playerTwo, this.mode);
       assertCurrentLoad(isCurrent);
+      if (isDownloadPlayRom(selected)) {
+        mutationStarted = true;
+        playerTwo.prepareDownloadPlay();
+        this.multibootPayload = null;
+        this.multibootEndpoint = new MultibootClientEndpoint({
+          onComplete: (payload) => { this.multibootPayload = payload; },
+        });
+        elements['player2-screen-empty'].textContent = 'Download Play';
+        elements['player2-screen-empty'].hidden = false;
+        elements['player2-mute'].disabled = true;
+        playerTwo.hasStoredQuickState = false;
+        return true;
+      }
+      this.multibootEndpoint = null;
+      this.multibootPayload = null;
       loadData = await this.fetchRuntimeLoadData(selected, this.mode, null, isCurrent);
       assertCurrentLoad(isCurrent);
       mutationStarted = true;
@@ -1325,6 +1483,8 @@ class LocalTwoPlayerController {
         }
       } else if (mutationStarted) {
         playerTwo.shutdown();
+        this.multibootEndpoint = null;
+        this.multibootPayload = null;
         elements['player2-screen-empty'].hidden = false;
       } else {
         playerTwo.setStatus('Idle', 'idle');
@@ -1404,17 +1564,19 @@ class LocalTwoPlayerController {
     this.renderReadyControls();
     applyControlState();
     try {
-      await Promise.all([
-        persistStandaloneBattery(playerOne, 'account'),
-        persistStandaloneBattery(playerTwo, this.mode),
-      ]);
+      const persistence = [persistStandaloneBattery(playerOne, 'account')];
+      if (!this.playerTwoIsMultiboot()) {
+        persistence.push(persistStandaloneBattery(playerTwo, this.mode));
+      }
+      await Promise.all(persistence);
       const response = await apiFetch('/api/local-2p', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           player2Mode: this.mode,
           player1RomId: playerOne.activeRom.id,
-          player2RomId: playerTwo.activeRom.id,
+          player2BootKind: this.playerTwoIsMultiboot() ? 'multiboot-client' : 'cartridge',
+          player2RomId: this.playerTwoIsMultiboot() ? null : playerTwo.activeRom.id,
         }),
       });
       const body = await response.json().catch(() => ({}));
@@ -1425,22 +1587,26 @@ class LocalTwoPlayerController {
       await this.setServerReady(0);
       await this.setServerReady(1);
       await this.checkpoint(true);
-      if (!this.lastCheckpoint) throw new Error('Initial paired checkpoint failed');
+      if (!this.lastCheckpoint) throw new Error('Initial cable checkpoint failed');
       const startResponse = await apiFetch(`/api/local-2p/${this.session.id}/start`, { method: 'POST' });
       const startBody = await startResponse.json().catch(() => ({}));
       if (!startResponse.ok) throw new Error(startBody.error || 'Local 2P start failed');
       this.session = startBody.session;
       core._vba_link_cancel_wait();
-      playerTwo.core?._vba_link_cancel_wait();
+      const playerTwoEndpoint = this.multibootEndpoint || playerTwo.core;
+      playerTwoEndpoint?._vba_link_cancel_wait();
       if (!core._vba_link_set_player(0) ||
-          !playerTwo.core?._vba_link_set_player(1)) {
+          !playerTwoEndpoint?._vba_link_set_player(1)) {
         throw new Error('Both cable cores could not attach at Start');
       }
+      synchronizeDirectCableState(core, playerTwoEndpoint);
+      playerOne.linkCycleDebt = 0;
+      playerTwo.linkCycleDebt = 0;
       this.active = true;
       this.preparing = false;
       paused = false;
-      playerTwo.paused = false;
-      playerTwo.running = true;
+      playerTwo.paused = this.playerTwoIsMultiboot();
+      playerTwo.running = !this.playerTwoIsMultiboot();
       speedMode = false;
       playerTwo.speedMode = false;
       elements['speed-toggle'].setAttribute('aria-pressed', 'false');
@@ -1450,14 +1616,12 @@ class LocalTwoPlayerController {
       elements.pause.textContent = 'Pause';
       elements['player2-pause'].textContent = 'Pause';
       this.lastPairSequence = -1;
-      this.lastReleaseSequence = -1;
       this.rollbackCount = 0;
       this.renderReadyControls();
       setStatus('Running / P1', 'running');
-      playerTwo.setStatus('Running / P2', 'running');
+      playerTwo.setStatus(this.playerTwoIsMultiboot() ? 'Download Play' : 'Running / P2',
+        this.playerTwoIsMultiboot() ? 'loading' : 'running');
       this.startTimers();
-      this.schedulePump(0);
-      this.schedulePump(1);
       applyControlState();
     } catch (error) {
       let failure = error;
@@ -1465,6 +1629,7 @@ class LocalTwoPlayerController {
         runtime.core?._vba_link_cancel_wait();
         runtime.core?._vba_link_set_player(-1);
       }
+      this.multibootEndpoint?._vba_link_cancel_wait();
       if (this.session) {
         try {
           await this.abortServerSession();
@@ -1532,60 +1697,67 @@ class LocalTwoPlayerController {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         lastPairSequence: this.lastPairSequence,
-        lastReleaseSequence: this.lastReleaseSequence,
-        guestHandshakePending: this.guestHandshakePending,
         pairCount: this.pairCount,
-        pumpBurst: this.pumpBurst[0] + this.pumpBurst[1],
-        players: [playerOne, playerTwo].map((runtime) => ({
+        players: [playerOne, playerTwo].map((runtime) => {
+          const endpoint = runtime.slot === 1 ? this.multibootEndpoint || runtime.core : runtime.core;
+          return ({
           slot: runtime.slot,
-          player: Number(runtime.core._vba_link_player()),
-          sequence: Number(runtime.core._vba_link_request_sequence()),
-          waiting: Boolean(runtime.core._vba_link_waiting()),
-          transferActive: Boolean(runtime.core._vba_link_transfer_active()),
-          requestPending: Boolean(runtime.core._vba_link_request_pending()),
-          guestHeld: Boolean(runtime.core._vba_link_guest_held()),
-          requestData: Number(runtime.core._vba_link_request_data()),
-          requestTicks: Number(runtime.core._vba_link_request_ticks()),
-          linkTime: Number(runtime.core._vba_link_time()),
-          siocnt: Number(runtime.core._vba_link_siocnt()),
-          rcnt: Number(runtime.core._vba_link_rcnt()),
-          frameCount: Number(runtime.core._vba_frame_counter()),
-          emulationSteps: Number(runtime.core._vba_emulation_steps()),
-          pumpBurst: this.pumpBurst[runtime.slot],
-        })),
+          bootKind: runtime.bootKind,
+          player: Number(endpoint?._vba_link_player?.() ?? -1),
+          sequence: Number(endpoint?._vba_link_request_sequence?.() ?? -1),
+          waiting: Boolean(endpoint?._vba_link_waiting?.()),
+          transferActive: Boolean(endpoint?._vba_link_transfer_active?.()),
+          requestPending: Boolean(endpoint?._vba_link_request_pending?.()),
+          mode: Number(endpoint?._vba_link_mode?.() ?? -1),
+          requestMode: Number(endpoint?._vba_link_request_mode?.() ?? -1),
+          requestBits: Number(endpoint?._vba_link_request_bits?.() ?? 0),
+          requestInitiator: Number(endpoint?._vba_link_request_initiator?.() ?? -1),
+          requestData: Number(endpoint?._vba_link_request_data?.() ?? -1),
+          requestTicks: Number(endpoint?._vba_link_request_ticks?.() ?? 0),
+          linkTime: Number(endpoint?._vba_link_time?.() ?? 0),
+          siocnt: Number(endpoint?._vba_link_siocnt?.() ?? -1),
+          rcnt: Number(endpoint?._vba_link_rcnt?.() ?? -1),
+          frameCount: Number(runtime.core?._vba_frame_counter?.() ?? 0),
+          emulationSteps: Number(runtime.core?._vba_emulation_steps?.() ?? 0),
+          cycleDebt: Math.floor(runtime.linkCycleDebt),
+        }); }),
       }),
     });
   }
 
   step(timestamp) {
     if (!this.active) return;
+    const endpoints = this.cableEndpoints();
+    if (!endpoints.every(Boolean)) return;
+    synchronizeDirectCableState(endpoints[0], endpoints[1]);
     for (const runtime of [playerOne, playerTwo]) {
       const elapsed = runtime.lastFrameTime ? Math.min(timestamp - runtime.lastFrameTime, 100) : 0;
       runtime.lastFrameTime = timestamp;
-      runtime.frameDebt += elapsed;
+      runtime.linkCycleDebt += elapsed * GBA_CPU_CLOCK / 1000;
+      runtime.linkCycleDebt = Math.min(runtime.linkCycleDebt, GBA_FRAME_CYCLES * 2);
     }
-    const frameDuration = 1000 / FRAME_RATE;
-    let cycles = 0;
-    while (cycles < 3 && (playerOne.frameDebt >= frameDuration || playerTwo.frameDebt >= frameDuration)) {
-      this.releaseGuestIfIdle();
-      if (playerOne.frameDebt >= frameDuration && !playerOne.paused &&
-          !core._vba_link_waiting() && !core._vba_link_guest_held()) {
-        const result = playerOne.runFrame();
-        playerOne.frameDebt -= frameDuration;
-        if (result === 0) this.schedulePump(0);
+    this.exchangeCable();
+    const inputMasks = [playerOne, playerTwo].map((runtime) =>
+      runtime.keyMask | runtime.touchMask | gamepadMask(runtime.slot));
+    let slices = 0;
+    while (slices < MAX_LINK_SLICES_PER_TICK) {
+      let progressed = false;
+      for (const runtime of [playerOne, playerTwo]) {
+        if (!runtime.running || !runtime.core || runtime.paused ||
+            runtime.linkCycleDebt < LINK_CYCLE_SLICE) continue;
+        this.exchangeCable();
+        if (runtime.core._vba_link_waiting()) continue;
+        runtime.runCycles(LINK_CYCLE_SLICE, inputMasks[runtime.slot]);
+        runtime.linkCycleDebt -= LINK_CYCLE_SLICE;
+        progressed = true;
+        this.exchangeCable();
       }
-      this.exchangeCable(0);
-      if (playerTwo.frameDebt >= frameDuration && !playerTwo.paused &&
-          !playerTwo.core._vba_link_waiting() && !playerTwo.core._vba_link_guest_held()) {
-        const result = playerTwo.runFrame();
-        playerTwo.frameDebt -= frameDuration;
-        if (result === 0) this.schedulePump(1);
-      }
-      this.exchangeCable(1);
-      ++cycles;
+      if (!progressed) break;
+      ++slices;
     }
-    playerOne.frameDebt = Math.min(playerOne.frameDebt, frameDuration * 2);
-    playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
+    if (this.multibootPayload && !playerOne.core._vba_link_transfer_active()) {
+      this.activateMultibootClient();
+    }
   }
 
   stepIndependent(timestamp) {
@@ -1603,69 +1775,17 @@ class LocalTwoPlayerController {
     playerTwo.frameDebt = Math.min(playerTwo.frameDebt, frameDuration * 2);
   }
 
-  exchangeCable(sourceSlot = null) {
-    const result = applyDirectCablePair(playerOne.core, playerTwo.core, {
+  exchangeCable() {
+    const endpoints = this.cableEndpoints();
+    if (!endpoints.every(Boolean)) return false;
+    const result = applyDirectSioTransfer(endpoints, {
       lastPairSequence: this.lastPairSequence,
-      guestHandshakePending: this.guestHandshakePending,
     });
-    if (!result.applied) {
-      if (guestCableResponsePending(playerOne.core, playerTwo.core)) this.schedulePump(1);
-      return false;
-    }
-    this.guestHandshakePending = result.guestHandshakePending;
+    if (!result.applied) return false;
     this.lastPairSequence = result.lastPairSequence;
     this.pairCount += 1;
     logCableSequence('Local cable pair', result.sequence);
-    if (sourceSlot !== null) this.schedulePump(sourceSlot === 0 ? 1 : 0);
     return true;
-  }
-
-  releaseGuestIfIdle() {
-    const result = releaseDirectCableGuest(
-      playerOne.core, playerTwo.core, this.lastReleaseSequence,
-      requiresIrqReleaseGate(playerOne.activeRom?.gameCode),
-    );
-    this.lastReleaseSequence = result.lastReleaseSequence;
-    if (result.released) this.schedulePump(1);
-  }
-
-  schedulePump(slot) {
-    if (!this.active || this.pumpScheduled[slot]) return;
-    this.pumpScheduled[slot] = true;
-    const run = () => {
-      this.pumpScheduled[slot] = false;
-      this.pumpRuntime(slot);
-    };
-    this.pumpBurst[slot] += 1;
-    if (this.pumpBurst[slot] % 64 === 0) setTimeout(run, 0);
-    else queueMicrotask(run);
-  }
-
-  pumpRuntime(slot) {
-    if (!this.active) return;
-    const runtime = slot === 0 ? playerOne : playerTwo;
-    if (!runtime.core || !runtime.running || runtime.paused) return;
-    const result = pumpLinkRuntime({
-      drain: () => this.exchangeCable(slot),
-      waiting: () => Boolean(runtime.core._vba_link_waiting()),
-      guestHeld: () => Boolean(runtime.core._vba_link_guest_held()),
-      run: () => {
-        runtime.core._vba_set_joypad(
-          runtime.keyMask | runtime.touchMask | gamepadMask(runtime.slot),
-        );
-        const previousFrame = Number(runtime.core._vba_frame_counter());
-        const value = runtime.core._vba_run_frame();
-        if (Number(runtime.core._vba_frame_counter()) !== previousFrame) runtime.renderFrame();
-        return value;
-      },
-      offer: () => this.exchangeCable(slot),
-      release: () => this.releaseGuestIfIdle(),
-    });
-    runtime.lastFrameTime = performance.now();
-    runtime.frameDebt = 0;
-    if (result === 0 || (slot === 1 && guestCableResponsePending(playerOne.core, playerTwo.core))) {
-      this.schedulePump(slot);
-    }
   }
 
   runDirectCableProbe() {
@@ -1680,9 +1800,8 @@ class LocalTwoPlayerController {
       throw new Error('Real core cable probe setup failed');
     }
     try {
-      const pair = applyDirectCablePair(host, guest, {
+      const pair = applyDirectSioTransfer([host, guest], {
         lastPairSequence: -1,
-        guestHandshakePending: false,
       });
       if (!pair.applied) throw new Error('Real core cable pair was not applied');
       const hostPeerData = Number(host._vba_link_test_finish_and_peer_data());
@@ -1690,8 +1809,9 @@ class LocalTwoPlayerController {
       return {
         applied: pair.applied,
         sequence: pair.sequence,
-        masterData: pair.masterData,
-        slaveData: pair.slaveData,
+        mode: pair.mode,
+        bits: pair.bits,
+        dataBySlot: pair.dataBySlot,
         hostPeerData,
         guestPeerData,
         independentMemories: host.HEAPU8.buffer !== guest.HEAPU8.buffer,
@@ -1705,22 +1825,55 @@ class LocalTwoPlayerController {
   }
 
   isCableIdle() {
-    return directCableIdle([playerOne, playerTwo]);
+    const endpoints = this.cableEndpoints();
+    return endpoints.every((endpoint) => endpoint && !endpoint._vba_link_waiting() &&
+      !endpoint._vba_link_transfer_active() && !endpoint._vba_link_request_pending());
+  }
+
+  activateMultibootClient() {
+    if (!this.multibootPayload || this.multibootActivation) return;
+    const payload = this.multibootPayload;
+    const sequence = this.multibootEndpoint._vba_link_request_sequence();
+    const generation = this.playerTwoLoadGeneration;
+    const wasPlayerOnePaused = playerOne.paused;
+    playerOne.paused = true;
+    this.multibootActivation = (async () => {
+      await playerTwo.loadMultiboot(payload, sequence,
+        () => this.enabled && this.active && generation === this.playerTwoLoadGeneration);
+      this.multibootEndpoint = null;
+      this.multibootPayload = null;
+      playerTwo.linkCycleDebt = playerOne.linkCycleDebt;
+      synchronizeDirectCableState(playerOne.core, playerTwo.core);
+      elements['player2-screen-empty'].hidden = true;
+      elements['player2-mute'].disabled = false;
+      playerOne.paused = wasPlayerOnePaused;
+      playerTwo.paused = wasPlayerOnePaused;
+      playerTwo.setStatus('Running / P2', 'running');
+      await this.checkpoint();
+      applyControlState();
+      logEvent('Download Play started');
+    })().catch((error) => {
+      logEvent(error.message, true);
+      return this.exit();
+    }).finally(() => {
+      this.multibootActivation = null;
+    });
   }
 
   async checkpoint(allowReady = false) {
+    if (this.multibootActivation || !playerOne.core ||
+        (!this.playerTwoIsMultiboot() && !playerTwo.core)) return false;
     if ((!this.active && !allowReady) || (!this.pendingCheckpoint && !this.isCableIdle())) return false;
     if (!this.pendingCheckpoint) {
+      const runtimes = this.playerTwoIsMultiboot() ? [playerOne] : [playerOne, playerTwo];
       this.pendingCheckpoint = {
         sequence: this.checkpointSequence,
-        states: [playerOne, playerTwo].map((runtime) => ({
+        states: runtimes.map((runtime) => ({
           slot: runtime.slot,
           data: bytesBase64(runtime.exportState()),
         })),
         metadata: {
-          guestHandshakePending: this.guestHandshakePending,
           lastPairSequence: this.lastPairSequence,
-          lastReleaseSequence: this.lastReleaseSequence,
         },
       };
     }
@@ -1751,7 +1904,8 @@ class LocalTwoPlayerController {
         playerTwo.paused = true;
         const idle = await this.waitForCableIdle(750);
         if (idle) {
-          const batteries = [playerOne, playerTwo].map((runtime) => ({
+          const batteryRuntimes = this.playerTwoIsMultiboot() ? [playerOne] : [playerOne, playerTwo];
+          const batteries = batteryRuntimes.map((runtime) => ({
             slot: runtime.slot,
             data: bytesBase64(runtime.exportBattery()),
           }));
@@ -1809,7 +1963,8 @@ class LocalTwoPlayerController {
   restorePairedCheckpoint() {
     if (!this.lastCheckpoint) return false;
     for (const state of this.lastCheckpoint.states) {
-      (state.slot === 0 ? playerOne : playerTwo).loadState(base64Bytes(state.data));
+      const runtime = state.slot === 0 ? playerOne : playerTwo;
+      if (runtime.core) runtime.loadState(base64Bytes(state.data));
     }
     ++this.rollbackCount;
     return true;
@@ -1844,6 +1999,7 @@ class LocalTwoPlayerController {
       playerOne.core._vba_link_cancel_wait();
       playerOne.core._vba_link_set_player(-1);
     }
+    this.multibootEndpoint?._vba_link_cancel_wait();
     playerTwo.shutdown();
     elements['player2-mute'].textContent = 'Unmute';
     elements['player2-pause'].textContent = 'Pause';
@@ -1857,6 +2013,9 @@ class LocalTwoPlayerController {
     this.mode = null;
     this.session = null;
     this.lastCheckpoint = null;
+    this.multibootEndpoint = null;
+    this.multibootPayload = null;
+    this.multibootActivation = null;
     playerOne.paused = false;
     elements.workspace.classList.remove('local-2p', 'local-portrait');
     elements['player-two-panel'].hidden = true;
@@ -1891,9 +2050,13 @@ class LocalTwoPlayerController {
       return;
     }
     this.selectMode(this.mode);
-    this.guestHandshakePending = recovered.session.guestHandshakePending;
+    if (recovered.session.participants?.[1]?.bootKind === 'multiboot-client') {
+      await this.abortServerSession();
+      this.restoreSinglePlayer();
+      logEvent('Download Play session ended after reload');
+      return;
+    }
     this.lastPairSequence = recovered.session.lastPairSequence;
-    this.lastReleaseSequence = recovered.session.lastReleaseSequence;
     this.checkpointSequence = recovered.session.lastCheckpointSequence + 1;
     this.pendingCheckpoint = null;
     const p1Rom = roms.find((rom) => rom.id === recovered.session.participants[0].romId);
@@ -1912,6 +2075,14 @@ class LocalTwoPlayerController {
       this.restoreSinglePlayer();
       return;
     }
+    const nextSioSequence = Math.max(0, this.lastPairSequence + 1);
+    if (!playerOne.core._vba_link_set_sequence(nextSioSequence) ||
+        !playerTwo.core._vba_link_set_sequence(nextSioSequence)) {
+      await this.abortServerSession();
+      this.restoreSinglePlayer();
+      return;
+    }
+    synchronizeDirectCableState(playerOne.core, playerTwo.core);
     this.lastCheckpoint = recovered.checkpoint;
     this.active = true;
     this.preparing = false;
@@ -1919,8 +2090,6 @@ class LocalTwoPlayerController {
     elements['player2-mute'].disabled = false;
     this.startTimers();
     startLoop();
-    this.schedulePump(0);
-    this.schedulePump(1);
     setStatus('Running / P1', 'running');
     playerTwo.setStatus('Running / P2', 'running');
     this.renderReadyControls();
@@ -1974,26 +2143,57 @@ function animationLoop(timestamp) {
   drainLinkMessages();
   const elapsed = lastFrameTime ? Math.min(timestamp - lastFrameTime, 100) : 0;
   lastFrameTime = timestamp;
-  frameDebt += elapsed * (speedMode ? SPEED_MODE_MULTIPLIER : 1);
   const frameDuration = 1000 / FRAME_RATE;
+  const linked = linkRoom?.status === 'active';
   const linkBlocked = isLinkRoomOpen() &&
     (linkRoom.paused || linkRoom.status === 'finishing' || linkCheckpointing ||
       (linkRoom.status === 'active' &&
-        (linkCorePlayer < 0 || Boolean(core?._vba_link_guest_held()))));
-  if (linkBlocked) frameDebt = Math.min(frameDebt, frameDuration);
-  if (!paused && !linkBlocked) {
+        linkCorePlayer < 0));
+  if (linked) {
+    linkCycleDebt += elapsed * GBA_CPU_CLOCK / 1000;
+    linkCycleDebt = Math.min(linkCycleDebt, GBA_FRAME_CYCLES * 2);
+    if (!paused && !linkBlocked) {
+      const linkedInputMask = keyMask | touchMask | gamepadMask();
+      let slices = 0;
+      while (linkCycleDebt >= LINK_CYCLE_SLICE && slices < MAX_LINK_SLICES_PER_TICK) {
+        drainLinkMessages();
+        if (core._vba_link_waiting()) {
+          maybeSendLinkOffer();
+          drainLinkMessages();
+          if (core._vba_link_waiting()) break;
+        }
+        core._vba_set_joypad(linkedInputMask);
+        const previousFrame = Number(core._vba_frame_counter());
+        const result = core._vba_run_cycles(LINK_CYCLE_SLICE);
+        linkCycleDebt -= LINK_CYCLE_SLICE;
+        if (Number(core._vba_frame_counter()) !== previousFrame) renderFrame();
+        if (result === 2) maybeSendLinkOffer();
+        drainLinkMessages();
+        ++slices;
+      }
+    }
+  } else {
+    frameDebt += elapsed * (speedMode ? SPEED_MODE_MULTIPLIER : 1);
+    if (linkBlocked) frameDebt = Math.min(frameDebt, frameDuration);
+  }
+  if (!linked && !paused && !linkBlocked) {
     let frames = 0;
     const maxFrames = 3;
     while (frameDebt >= frameDuration && frames < maxFrames) {
       core._vba_set_joypad(keyMask | touchMask | gamepadMask());
+      const previousFrame = Number(core._vba_frame_counter());
       const result = core._vba_run_frame();
+      const completedFrame = Number(core._vba_frame_counter()) !== previousFrame;
+      if (completedFrame) {
+        frameDebt -= frameDuration;
+        ++frames;
+      }
       if (result === 2) {
         maybeSendLinkOffer();
         frameDebt = Math.min(frameDebt, frameDuration);
         break;
       }
-      frameDebt -= frameDuration;
-      ++frames;
+      if (!completedFrame) break;
     }
     if (frames) renderFrame();
   }
@@ -2003,7 +2203,7 @@ function animationLoop(timestamp) {
     if (linkRoom) renderLinkRoom();
   }
   drainLinkMessages();
-  maybeSendLinkRelease();
+  sendLinkSioState();
   if (linkRoom?.status === 'active') updateLinkIdleGate(timestamp);
   localTwoPlayer?.stepIndependent(timestamp);
   animationHandle = requestAnimationFrame(animationLoop);
@@ -2032,164 +2232,141 @@ function sendLinkMessage(message) {
 
 function sendLinkDiagnostic() {
   const participant = currentLinkParticipant();
-  if (!linkDebugEnabled || !core || !participant || linkRoom?.status !== 'active' ||
+  const endpoint = remoteCableEndpoint();
+  if (!linkDebugEnabled || !endpoint || !participant || linkRoom?.status !== 'active' ||
       !linkSocketOpen()) return;
   sendLinkMessage({
     type: 'diagnostic',
     state: {
       slot: participant.slot,
       corePlayer: linkCorePlayer,
-      sequence: Number(core._vba_link_request_sequence()),
-      waiting: Boolean(core._vba_link_waiting()),
-      transferActive: Boolean(core._vba_link_transfer_active()),
-      requestPending: Boolean(core._vba_link_request_pending()),
-      guestHeld: Boolean(core._vba_link_guest_held()),
-      guestHandshakePending: linkGuestHandshakePending,
-      requestData: Number(core._vba_link_request_data()),
-      requestTicks: Number(core._vba_link_request_ticks()),
-      linkTime: Number(core._vba_link_time()),
-      siocnt: Number(core._vba_link_siocnt()),
-      rcnt: Number(core._vba_link_rcnt()),
-      siodata8: Number(core._vba_link_siodata8()),
+      bootKind: participant.bootKind || 'cartridge',
+      sequence: Number(endpoint._vba_link_request_sequence()),
+      waiting: Boolean(endpoint._vba_link_waiting()),
+      transferActive: Boolean(endpoint._vba_link_transfer_active()),
+      requestPending: Boolean(endpoint._vba_link_request_pending()),
+      mode: Number(endpoint._vba_link_mode()),
+      requestMode: Number(endpoint._vba_link_request_mode?.() ?? -1),
+      requestBits: Number(endpoint._vba_link_request_bits?.() ?? 0),
+      requestInitiator: Number(endpoint._vba_link_request_initiator?.() ?? -1),
+      requestData: Number(endpoint._vba_link_request_data?.() ?? -1) >>> 0,
+      requestTicks: Number(endpoint._vba_link_request_ticks?.() ?? 0),
+      linkTime: Number(endpoint._vba_link_time?.() ?? 0),
+      siocnt: Number(endpoint._vba_link_siocnt()),
+      rcnt: Number(endpoint._vba_link_rcnt()),
+      siodata8: Number(endpoint._vba_link_siodata8?.() ?? -1),
       lastOfferSequence: linkLastOfferSequence,
       pendingOffers: linkMessageQueue.pendingOffers,
       pendingPairs: linkMessageQueue.pendingPairs,
       preparedResponses: linkMessageQueue.preparedResponses,
-      frameCount: Number(core._vba_frame_counter()),
+      frameCount: Number(core?._vba_frame_counter?.() ?? 0),
+      cycleDebt: Math.floor(linkCycleDebt),
     },
   });
 }
 
 function syncLinkTransfer() {
-  if (!core || linkRoom?.status !== 'active') return;
-  sendLinkMessage({ type: 'sync', sequence: Number(core._vba_link_request_sequence()) });
+  const endpoint = remoteCableEndpoint();
+  if (!endpoint || linkRoom?.status !== 'active') return;
+  sendLinkMessage({ type: 'sync', sequence: Number(endpoint._vba_link_request_sequence()) });
+}
+
+function sendLinkSioState(force = false) {
+  const endpoint = remoteCableEndpoint();
+  if (!endpoint || linkCorePlayer < 0 || linkRoom?.status !== 'active' ||
+      linkRoom.paused || !linkSocketOpen()) return false;
+  const state = sioPortState(endpoint);
+  const signature = `${state.mode}:${state.siocnt}:${state.rcnt}:${state.epoch}`;
+  if (!force && signature === linkLastSioStateSignature) return false;
+  if (!sendLinkMessage({ type: 'sio-state', ...state })) return false;
+  linkLastSioStateSignature = signature;
+  return true;
 }
 
 function maybeSendLinkOffer() {
   const participant = currentLinkParticipant();
-  if (participant?.slot !== 0 || linkRoom?.status !== 'active' || linkRoom.paused ||
-      !core._vba_link_request_pending()) return;
-  const sequence = Number(core._vba_link_request_sequence());
-  if (sequence === linkLastOfferSequence) return;
-  const rawData = Number(core._vba_link_request_data());
-  const data = hostTransferData(rawData, linkGuestHandshakePending);
+  const offer = pendingSioOffer(remoteCableEndpoint());
+  if (!participant || !offer || offer.initiatorSlot !== participant.slot ||
+      linkRoom?.status !== 'active' || linkRoom.paused ||
+      offer.sequence === linkLastOfferSequence) return;
   if (sendLinkMessage({
-    type: 'link-offer',
-    sequence,
-    speed: Number(core._vba_link_request_speed()),
-    data,
-    ticks: Number(core._vba_link_request_ticks()),
+    type: 'sio-offer',
+    ...offer,
   })) {
-    linkLastOfferSequence = sequence;
-    if (data !== rawData && (sequence < 10 || sequence % 100 === 0)) {
-      logEvent('Cable master handshake restored');
-    }
-    logCableSequence('Cable offer sent', sequence);
+    linkLastOfferSequence = offer.sequence;
+    logCableSequence('SIO offer sent', offer.sequence);
     renderLinkRoom();
-  }
-}
-
-function maybeSendLinkRelease() {
-  const participant = currentLinkParticipant();
-  if (participant?.slot !== 0 || linkRoom?.status !== 'active' || linkRoom.paused ||
-      !core || core._vba_link_waiting() || core._vba_link_transfer_active() ||
-      core._vba_link_request_pending() ||
-      (requiresIrqReleaseGate(activeRom?.gameCode) &&
-        (Number(core._vba_link_siocnt()) & 0x4000))) return;
-  const sequence = Number(core._vba_link_request_sequence());
-  if (sequence <= 0 || sequence === linkLastReleaseSequence) return;
-  if (sendLinkMessage({ type: 'link-release', sequence })) {
-    linkLastReleaseSequence = sequence;
-    logEvent('Cable peer released');
   }
 }
 
 function drainLinkMessages() {
   const participant = currentLinkParticipant();
-  if (!core || !participant || linkRoom?.status !== 'active' || linkRoom.paused) return;
+  const endpoint = remoteCableEndpoint();
+  if (!endpoint || !participant || linkRoom?.status !== 'active' || linkRoom.paused) return;
   linkMessageQueue.drain({
     slot: participant.slot,
-    currentSequence: () => Number(core._vba_link_request_sequence()),
-    transferActive: () => Boolean(core._vba_link_transfer_active()),
-    prepareRemote: (sequence, speed, masterData, ticks) =>
-      core._vba_link_prepare_remote(sequence, speed, masterData, ticks),
+    currentSequence: () => Number(endpoint._vba_link_request_sequence()),
+    transferActive: () => Boolean(endpoint._vba_link_transfer_active()),
+    prepareRemote: (offer) => endpoint._vba_link_prepare_remote(
+      offer.sequence, offer.mode, offer.bits, offer.speed,
+      offer.initiatorSlot, offer.data, offer.ticks,
+    ),
+    responseData: () => Number(endpoint._vba_link_response_data()) >>> 0,
     sendResponse: (message) => {
       const sent = sendLinkMessage(message);
-      if (sent) logCableSequence('Cable response sent', message.sequence);
+      if (sent) logCableSequence('SIO response sent', message.sequence);
       return sent;
     },
-    applyPair: (sequence, speed, masterData, slaveData) =>
-      core._vba_link_apply_pair(sequence, speed, masterData, slaveData),
+    applyTransfer: (pair) => endpoint._vba_link_apply_transfer(
+      pair.sequence, pair.mode, pair.bits, pair.speed, pair.initiatorSlot,
+      pair.dataBySlot[0], pair.dataBySlot[1],
+    ),
     onPairApplied: (pair) => {
-      if (participant.slot === 0) {
-        linkGuestHandshakePending = isSlaveHandshake(pair.slaveData);
-      }
       linkLastOfferSequence = -1;
       linkRoom = {
         ...linkRoom,
         nextTransferSequence: Math.max(linkRoom.nextTransferSequence || 0, pair.sequence + 1),
       };
-      logCableSequence('Cable pair applied', pair.sequence);
+      logCableSequence('SIO transfer applied', pair.sequence);
       renderLinkRoom();
     },
   });
 }
 
-function scheduleLinkPump() {
-  if (linkPumpScheduled) return;
-  linkPumpScheduled = true;
-  queueMicrotask(() => {
-    linkPumpScheduled = false;
-    pumpLinkCore();
-  });
-}
-
-function pumpLinkCore() {
-  if (!core || !running || paused || linkRoom?.status !== 'active' || linkRoom.paused ||
-      linkCheckpointing || linkCorePlayer < 0) return;
-
-  const result = pumpLinkRuntime({
-    drain: drainLinkMessages,
-    waiting: () => Boolean(core._vba_link_waiting()),
-    guestHeld: () => Boolean(core._vba_link_guest_held()),
-    run: () => {
-      core._vba_set_joypad(keyMask | touchMask | gamepadMask());
-      const previousFrame = Number(core._vba_frame_counter());
-      const value = core._vba_run_frame();
-      if (Number(core._vba_frame_counter()) !== previousFrame) renderFrame();
-      return value;
-    },
-    offer: maybeSendLinkOffer,
-    release: maybeSendLinkRelease,
-  });
-  lastFrameTime = performance.now();
-  frameDebt = 0;
-  if (result === 0) scheduleLinkPump();
-}
-
 function attachLinkCore() {
   const participant = currentLinkParticipant();
-  if (!core || !participant || activeRom?.platform !== 'gba' || linkRoom?.status !== 'active') return;
+  const endpoint = remoteCableEndpoint();
+  if (!endpoint || !participant || activeRom?.platform !== 'gba' || linkRoom?.status !== 'active') return;
   if (linkCorePlayer === participant.slot) return;
-  if (!cableIdle() || !core._vba_link_set_player(participant.slot)) {
+  if (!cableIdle() || !endpoint._vba_link_set_player(participant.slot)) {
     logEvent('Link core is not ready', true);
     return;
   }
   linkCorePlayer = participant.slot;
   linkDetachPending = false;
+  linkCycleDebt = 0;
+  if (linkPeerSioState) {
+    endpoint._vba_link_set_peer_state(
+      linkPeerSioState.mode, linkPeerSioState.siocnt, linkPeerSioState.rcnt,
+    );
+  }
+  sendLinkSioState(true);
   logEvent(`Link player ${participant.slot + 1} ready`);
 }
 
 function detachLinkCore() {
-  if (!core || linkCorePlayer < 0) return;
-  if (core._vba_link_transfer_active()) {
+  const endpoint = remoteCableEndpoint();
+  if (!endpoint || linkCorePlayer < 0) return;
+  if (endpoint._vba_link_transfer_active()) {
     linkDetachPending = true;
     return;
   }
-  core._vba_link_cancel_wait();
-  if (core._vba_link_set_player(-1)) {
+  endpoint._vba_link_cancel_wait();
+  if (endpoint._vba_link_set_player(-1)) {
     linkCorePlayer = -1;
     linkDetachPending = false;
+    linkPeerSioState = null;
+    linkLastSioStateSignature = '';
   } else {
     linkDetachPending = true;
   }
@@ -2242,9 +2419,10 @@ function renderLinkRoom() {
   elements['link-ready'].disabled = !participant || room.paused || !linkSocketOpen();
   elements['link-start'].hidden = !canReady || !host;
   elements['link-start'].disabled = room.status !== 'ready' || room.paused || !linkSocketOpen();
-  elements['link-finish'].hidden = !['active', 'finishing'].includes(room.status);
+  const batteryParticipant = participant?.bootKind !== 'multiboot-client';
+  elements['link-finish'].hidden = !['active', 'finishing'].includes(room.status) || !batteryParticipant;
   elements['link-finish'].disabled = !['active', 'finishing'].includes(room.status) || room.paused || linkFinishSubmitted ||
-    linkCheckpointPendingSequence !== null || !linkSocketOpen() || !linkFinishIdle;
+    !batteryParticipant || linkCheckpointPendingSequence !== null || !linkSocketOpen() || !linkFinishIdle;
   elements['link-finish'].textContent = linkFinishSubmitted ? 'Saving...' : 'Finish + save';
   elements['link-abort'].hidden = terminal;
   elements['link-close'].hidden = !terminal;
@@ -2266,7 +2444,6 @@ function updateLinkRoom(room) {
     elements['speed-toggle'].textContent = 'Speed off';
     clearInterval(batteryTimer);
     attachLinkCore();
-    scheduleLinkPump();
   } else if (['completed', 'aborted'].includes(linkRoom.status)) {
     detachLinkCore();
     clearLinkTimers();
@@ -2353,12 +2530,10 @@ async function handleLinkMessage(message) {
     updateLinkRoom(message.room);
     syncLinkTransfer();
     sendLinkDiagnostic();
-    scheduleLinkPump();
     return;
   }
   if (message.type === 'room') {
     updateLinkRoom(message.room);
-    scheduleLinkPump();
     return;
   }
   if (message.type === 'paused') {
@@ -2368,28 +2543,29 @@ async function handleLinkMessage(message) {
     updateLinkRoom({ ...linkRoom, paused: true, participants });
     return;
   }
-  if (message.type === 'link-offer') {
-    if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' || linkRoom.paused) return;
-    logCableSequence('Cable offer received', message.sequence);
+  if (message.type === 'sio-state') {
+    linkPeerSioState = {
+      mode: message.mode, siocnt: message.siocnt, rcnt: message.rcnt, epoch: message.epoch,
+    };
+    const endpoint = remoteCableEndpoint();
+    if (endpoint && linkCorePlayer >= 0) {
+      endpoint._vba_link_set_peer_state(message.mode, message.siocnt, message.rcnt);
+    }
+    return;
+  }
+  if (message.type === 'sio-offer') {
+    if (message.initiatorSlot === currentLinkParticipant()?.slot ||
+        linkRoom.status !== 'active' || linkRoom.paused) return;
+    logCableSequence('SIO offer received', message.sequence);
     linkMessageQueue.enqueueOffer(message);
     drainLinkMessages();
-    scheduleLinkPump();
     renderLinkRoom();
     return;
   }
-  if (message.type === 'link-pair') {
-    logCableSequence('Cable pair received', message.sequence);
+  if (message.type === 'sio-pair') {
+    logCableSequence('SIO transfer received', message.sequence);
     linkMessageQueue.enqueuePair(message);
     drainLinkMessages();
-    scheduleLinkPump();
-    return;
-  }
-  if (message.type === 'link-release') {
-    if (currentLinkParticipant()?.slot !== 1 || linkRoom.status !== 'active' ||
-        Number(core?._vba_link_request_sequence()) !== message.sequence) return;
-    core._vba_link_cancel_wait();
-    logEvent('Cable peer finished');
-    scheduleLinkPump();
     return;
   }
   if (message.type === 'checkpoint-saved') {
@@ -2440,6 +2616,7 @@ async function linkJsonRequest(url, options = {}) {
 
 async function createLinkRoom() {
   if (!activeGbaSelected()) throw new Error('Load the selected GBA ROM first');
+  if (isDownloadPlayRom(activeRom)) throw new Error('Download Play can only join a host room');
   const result = await linkJsonRequest('/api/link/rooms', {
     method: 'POST', body: JSON.stringify({ romId: activeRom.id }),
   });
@@ -2448,11 +2625,15 @@ async function createLinkRoom() {
 }
 
 async function joinLinkRoom() {
-  if (!activeGbaSelected()) throw new Error('Load the selected GBA ROM first');
+  if (!activeGbaSelected()) throw new Error('Load a GBA ROM or Download Play first');
   const roomId = elements['link-room-input'].value.trim();
   const inviteCode = elements['link-invite-input'].value.trim();
   const result = await linkJsonRequest(`/api/link/rooms/${encodeURIComponent(roomId)}/join`, {
-    method: 'POST', body: JSON.stringify({ inviteCode, romId: activeRom.id }),
+    method: 'POST', body: JSON.stringify({
+      inviteCode,
+      bootKind: isDownloadPlayRom(activeRom) ? 'multiboot-client' : 'cartridge',
+      romId: isDownloadPlayRom(activeRom) ? null : activeRom.id,
+    }),
   });
   enterLinkRoom(result.room, '');
   logEvent('Link room joined');
@@ -2469,8 +2650,8 @@ function enterLinkRoom(room, inviteCode) {
   linkIdleSince = 0;
   linkFinishIdle = false;
   linkLastOfferSequence = -1;
-  linkGuestHandshakePending = false;
-  linkLastReleaseSequence = -1;
+  linkPeerSioState = null;
+  linkLastSioStateSignature = '';
   linkMessageQueue.clear();
   speedMode = false;
   elements['speed-toggle'].setAttribute('aria-pressed', 'false');
@@ -2528,8 +2709,9 @@ function checkpointBase64(bytes) {
 }
 
 async function submitLinkCheckpoint() {
+  if (currentLinkParticipant()?.bootKind === 'multiboot-client') return;
   if (linkRoom?.status !== 'active' || linkRoom.paused || paused || !linkSocketOpen() ||
-      linkCheckpointing || linkCheckpointPendingSequence !== null || !cableIdle()) return;
+      linkCheckpointing || linkCheckpointPendingSequence !== null || !cableIdle() || !core) return;
   const sequence = Number(linkRoom.nextCheckpointSequence || 0);
   linkCheckpointing = true;
   renderLinkRoom();
@@ -2550,6 +2732,10 @@ async function submitLinkCheckpoint() {
 async function finishLinkRoom() {
   if (!cableIdle()) throw new Error('Wait for the cable transfer to finish');
   if (linkCheckpointPendingSequence !== null) throw new Error('Wait for the checkpoint to finish');
+  const participant = currentLinkParticipant();
+  if (participant?.bootKind === 'multiboot-client') {
+    throw new Error('Download Play does not persist a battery save');
+  }
   if (!core._vba_export_battery()) throw new Error(coreError('Battery export failed'));
   const bytes = getExportBytes();
   validateBattery(bytes);
@@ -2578,7 +2764,8 @@ async function finishLinkRoom() {
 
 function restartBatteryTimer() {
   clearInterval(batteryTimer);
-  if (activeRom && !isLinkRoomOpen() && !localTwoPlayer?.preparing && !localTwoPlayer?.active) {
+  if (activeRom && !isDownloadPlayRom(activeRom) && !isLinkRoomOpen() &&
+      !localTwoPlayer?.preparing && !localTwoPlayer?.active) {
     batteryTimer = setInterval(() => saveBattery(false).catch((error) => logEvent(error.message, true)), 10000);
   }
 }
@@ -2634,7 +2821,8 @@ function queueBatteryWrite(runtime, mode, { romId, accountId, csrfToken, bytes }
 }
 
 function persistStandaloneBattery(runtime, mode) {
-  if (!runtime.running || !runtime.activeRom || !runtime.core) return Promise.resolve(false);
+  if (!runtime.running || !runtime.activeRom || !runtime.core ||
+      isDownloadPlayRom(runtime.activeRom)) return Promise.resolve(false);
   const romId = runtime.activeRom.id;
   const { accountId, csrfToken } = batterySaveIdentity(runtime, mode);
   if (!accountId || !csrfToken || !runtime.core._vba_export_battery()) return Promise.resolve(false);
@@ -2646,6 +2834,7 @@ function persistStandaloneBattery(runtime, mode) {
 function restartPlayerTwoBatteryTimer() {
   clearInterval(playerTwo.batteryTimer);
   if (localTwoPlayer?.enabled && playerTwo.running &&
+      !isDownloadPlayRom(playerTwo.activeRom) &&
       !localTwoPlayer.preparing && !localTwoPlayer.active) {
     playerTwo.batteryTimer = setInterval(() => {
       persistStandaloneBattery(playerTwo, localTwoPlayer.mode)
@@ -2661,7 +2850,8 @@ function stashStandaloneBatteries() {
     [playerTwo, localTwoPlayer?.mode, localTwoPlayer?.mode === 'account'
       ? currentPlayer2Session?.account?.id : currentSession?.account?.id],
   ]) {
-    if (!runtime.running || !runtime.activeRom || !runtime.core || !accountId) continue;
+    if (!runtime.running || !runtime.activeRom || !runtime.core || !accountId ||
+        isDownloadPlayRom(runtime.activeRom)) continue;
     if (!runtime.core._vba_export_battery()) continue;
     const bytes = runtime.exportBytes();
     validateBattery(bytes);
@@ -2757,6 +2947,8 @@ function clearLinkRoom() {
   linkFinishSubmitted = false;
   linkCheckpointPendingSequence = null;
   linkCheckpointPendingState = '';
+  linkPeerSioState = null;
+  linkLastSioStateSignature = '';
   linkMessageQueue.clear();
   elements['link-room-copy-feedback'].textContent = '';
   elements['link-pw-copy-feedback'].textContent = '';
@@ -2893,17 +3085,27 @@ async function loadSelectedRom() {
   if (localTwoPlayer?.preparing || localTwoPlayer?.active) {
     throw new Error('Stop the local cable before loading another ROM');
   }
-  const selected = roms.find((rom) => rom.id === elements['rom-select'].value);
+  const selectedId = elements['rom-select'].value;
+  const selected = selectedId === DOWNLOAD_PLAY_ID
+    ? DOWNLOAD_PLAY_ROM
+    : roms.find((rom) => rom.id === selectedId);
   if (!selected) return;
   if (localTwoPlayer?.enabled) localTwoPlayer.clearReady();
   const previousRunning = Boolean(activeRom && core && running);
-  if (previousRunning) {
+  if (previousRunning && !isDownloadPlayRom(activeRom)) {
     clearInterval(batteryTimer);
     await persistStandaloneBattery(playerOne, 'account');
   }
   setStatus('Loading ROM', 'loading');
   setControls(false);
   try {
+    if (isDownloadPlayRom(selected)) {
+      prepareRemoteDownloadPlay();
+      logEvent('Download Play ready');
+      return;
+    }
+    remoteMultibootEndpoint = null;
+    remoteMultibootActivation = null;
     await ensureCore();
     await ensureAudio();
     const response = await apiFetch(`/api/roms/${selected.id}/file`);
@@ -2969,14 +3171,9 @@ async function refreshCatalog() {
     fixtures = [];
   }
   const selectedId = elements['rom-select'].value;
-  elements['rom-select'].replaceChildren(...roms.map((rom) => {
-    const option = document.createElement('option');
-    option.value = rom.id;
-    option.textContent = `[${rom.platform.toUpperCase()}] ${rom.title}${rom.platform === 'gba' ? ` (${rom.gameCode})` : ''}`;
-    option.dataset.platform = rom.platform;
-    return option;
-  }));
-  if (roms.some((rom) => rom.id === selectedId)) elements['rom-select'].value = selectedId;
+  const choices = [...roms, DOWNLOAD_PLAY_ROM];
+  elements['rom-select'].replaceChildren(...choices.map(romOption));
+  if (choices.some((rom) => rom.id === selectedId)) elements['rom-select'].value = selectedId;
   applyControlState();
   renderFixtures();
 }
@@ -3253,10 +3450,6 @@ function toggleRuntimePause(slot) {
     elements['player2-pause'].textContent = next ? 'Resume' : 'Pause';
     setStatus(next ? 'Paused' : 'Running / P1', next ? 'idle' : 'running');
     playerTwo.setStatus(next ? 'Paused' : 'Running / P2', next ? 'idle' : 'running');
-    if (!next) {
-      localTwoPlayer.schedulePump(0);
-      localTwoPlayer.schedulePump(1);
-    }
     return;
   }
   const runtime = slot === 0 ? playerOne : playerTwo;
@@ -3493,8 +3686,10 @@ window.__gbaPoc = {
         coreWaiting: core ? Boolean(core._vba_link_waiting()) : null,
         coreTransferActive: core ? Boolean(core._vba_link_transfer_active()) : null,
         coreRequestPending: core ? Boolean(core._vba_link_request_pending()) : null,
-        coreGuestHeld: core ? Boolean(core._vba_link_guest_held()) : null,
-        guestHandshakePending: linkGuestHandshakePending,
+        coreMode: core ? Number(core._vba_link_mode()) : null,
+        coreRequestMode: core ? Number(core._vba_link_request_mode()) : null,
+        coreRequestBits: core ? Number(core._vba_link_request_bits()) : null,
+        coreRequestInitiator: core ? Number(core._vba_link_request_initiator()) : null,
         coreRequestTicks: core ? Number(core._vba_link_request_ticks()) : null,
         lastOfferSequence: linkLastOfferSequence,
         pendingOffers: linkMessageQueue.pendingOffers,
@@ -3523,7 +3718,11 @@ window.__gbaPoc = {
         linkWaiting: runtime.core ? Boolean(runtime.core._vba_link_waiting()) : null,
         linkTransferActive: runtime.core ? Boolean(runtime.core._vba_link_transfer_active()) : null,
         linkRequestPending: runtime.core ? Boolean(runtime.core._vba_link_request_pending()) : null,
-        linkGuestHeld: runtime.core ? Boolean(runtime.core._vba_link_guest_held()) : null,
+        bootKind: runtime.bootKind,
+        linkMode: runtime.core ? Number(runtime.core._vba_link_mode()) : null,
+        linkRequestMode: runtime.core ? Number(runtime.core._vba_link_request_mode()) : null,
+        linkRequestBits: runtime.core ? Number(runtime.core._vba_link_request_bits()) : null,
+        linkRequestInitiator: runtime.core ? Number(runtime.core._vba_link_request_initiator()) : null,
         linkRequestData: runtime.core ? Number(runtime.core._vba_link_request_data()) : null,
         linkRequestTicks: runtime.core ? Number(runtime.core._vba_link_request_ticks()) : null,
         linkTime: runtime.core ? Number(runtime.core._vba_link_time()) : null,
@@ -3532,6 +3731,7 @@ window.__gbaPoc = {
         generation: runtime.generation,
         audioPointer: runtime.audioPointer,
         audioContextState: runtime.audioContext?.state || 'closed',
+        linkCycleDebt: Math.floor(runtime.linkCycleDebt),
       })),
       coresDistinct: Boolean(playerOne.core && playerTwo.core && playerOne.core !== playerTwo.core &&
         playerOne.core.HEAPU8.buffer !== playerTwo.core.HEAPU8.buffer),
@@ -3546,10 +3746,6 @@ window.__gbaPoc = {
         status: localTwoPlayer.session?.status || null,
         sessionId: localTwoPlayer.session?.id || null,
         lastPairSequence: localTwoPlayer.lastPairSequence,
-        lastReleaseSequence: localTwoPlayer.lastReleaseSequence,
-        guestHandshakePending: localTwoPlayer.guestHandshakePending,
-        pumpScheduled: [...localTwoPlayer.pumpScheduled],
-        pumpBurst: [...localTwoPlayer.pumpBurst],
         pairCount: localTwoPlayer.pairCount,
         checkpointSequence: localTwoPlayer.checkpointSequence,
         checkpointPending: Boolean(localTwoPlayer.pendingCheckpoint),

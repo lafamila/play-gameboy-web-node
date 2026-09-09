@@ -1,4 +1,4 @@
-const CACHE_NAME = 'v-play-shell-v5';
+const CACHE_NAME = 'v-play-shell-v7';
 const APP_SHELL = [
   '/',
   '/styles.css',
@@ -6,8 +6,8 @@ const APP_SHELL = [
   '/player-input.js',
   '/player-runtime-view.js',
   '/link-message-queue.js',
-  '/link-runtime-pump.js',
   '/local-link-transport.js',
+  '/multiboot-client.js',
   '/manifest.webmanifest',
   '/icons/favicon.png',
   '/icons/apple-touch-icon.png',

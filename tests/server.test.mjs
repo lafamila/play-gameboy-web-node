@@ -474,6 +474,112 @@ test('static WebAssembly keeps isolation headers and source archive', () => with
   assert.equal((await fetch(`${origin}/core/V172lsrc.zip`)).status, 200);
 }));
 
+test('remote Single-Pak join exposes an ephemeral guest and finalizes with host battery only', () => withServer(async ({ origin, app }) => {
+  const host = await login(origin, 'single-pak-host', 'user');
+  const guest = await login(origin, 'single-pak-guest', 'user');
+  const rom = (await fetch(`${origin}/api/roms`, { headers: host.headers })
+    .then((response) => response.json())).find((item) => item.platform === 'gba');
+  const created = await fetch(`${origin}/api/link/rooms`, {
+    method: 'POST',
+    headers: { ...host.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ romId: rom.id }),
+  }).then((response) => response.json());
+  const joinedResponse = await fetch(`${origin}/api/link/rooms/${created.room.id}/join`, {
+    method: 'POST',
+    headers: { ...guest.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      inviteCode: created.inviteCode,
+      bootKind: 'multiboot-client',
+    }),
+  });
+  assert.equal(joinedResponse.status, 200);
+  const joined = (await joinedResponse.json()).room;
+  assert.deepEqual(joined.participants.map((participant) => ({
+    slot: participant.slot, bootKind: participant.bootKind, romId: participant.romId,
+  })), [
+    { slot: 0, bootKind: 'cartridge', romId: rom.id },
+    { slot: 1, bootKind: 'multiboot-client', romId: null },
+  ]);
+  assert.equal(app.database.linkSaveLocks.size, 1);
+
+  for (const actor of [host, guest]) {
+    assert.equal((await fetch(`${origin}/api/link/rooms/${created.room.id}/ready`, {
+      method: 'POST',
+      headers: { ...actor.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ready: true }),
+    })).status, 200);
+  }
+  assert.equal((await fetch(`${origin}/api/link/rooms/${created.room.id}/start`, {
+    method: 'POST', headers: host.headers,
+  })).status, 200);
+  const battery = await fixture('.sa1');
+  assert.equal((await fetch(`${origin}/api/link/rooms/${created.room.id}/battery`, {
+    method: 'POST', headers: guest.headers, body: battery,
+  })).status, 409);
+  const finished = await fetch(`${origin}/api/link/rooms/${created.room.id}/battery`, {
+    method: 'POST', headers: host.headers, body: battery,
+  });
+  assert.equal(finished.status, 200);
+  assert.equal((await finished.json()).status, 'completed');
+  assert.equal(app.database.linkSaveLocks.size, 0);
+  assert.equal(app.database.playAdmissionLocks.size, 0);
+}));
+
+test('local Single-Pak start checkpoints and commits only the cartridge player', () => withServer(async ({ origin, app }) => {
+  const player1 = await login(origin, 'local-single-pak', 'user');
+  const rom = (await fetch(`${origin}/api/roms`, { headers: player1.headers })
+    .then((response) => response.json())).find((item) => item.platform === 'gba');
+  const createdResponse = await fetch(`${origin}/api/local-2p`, {
+    method: 'POST',
+    headers: { ...player1.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      player2Mode: 'guest',
+      player1RomId: rom.id,
+      bootKind: 'multiboot-client',
+    }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const session = (await createdResponse.json()).session;
+  assert.deepEqual(session.participants.map((participant) => ({
+    slot: participant.slot, bootKind: participant.bootKind, romId: participant.romId,
+  })), [
+    { slot: 0, bootKind: 'cartridge', romId: rom.id },
+    { slot: 1, bootKind: 'multiboot-client', romId: null },
+  ]);
+  assert.equal(app.database.localSaveLocks.size, 1);
+
+  for (const action of ['player1-ready', 'player2-ready']) {
+    assert.equal((await fetch(`${origin}/api/local-2p/${session.id}/${action}`, {
+      method: 'POST',
+      headers: { ...player1.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ready: true }),
+    })).status, 200);
+  }
+  assert.equal((await fetch(`${origin}/api/local-2p/${session.id}/checkpoint`, {
+    method: 'POST',
+    headers: { ...player1.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sequence: 0,
+      states: [{ slot: 0, data: Buffer.from('host-state').toString('base64') }],
+    }),
+  })).status, 200);
+  assert.equal((await fetch(`${origin}/api/local-2p/${session.id}/start`, {
+    method: 'POST', headers: player1.headers,
+  })).status, 200);
+  const battery = await fixture('.sa1');
+  const finished = await fetch(`${origin}/api/local-2p/${session.id}/finish`, {
+    method: 'POST',
+    headers: { ...player1.headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      batteries: [{ slot: 0, data: battery.toString('base64') }],
+    }),
+  });
+  assert.equal(finished.status, 200);
+  assert.deepEqual((await finished.json()).result.saves, [{ slot: 0, revision: 1 }]);
+  assert.equal(app.database.localSaveLocks.size, 0);
+  assert.equal(app.database.playAdmissionLocks.size, 0);
+}));
+
 test('two authenticated browser sessions exchange a cable word and atomically commit batteries', () => withServer(async ({ origin }) => {
   const host = await login(origin, 'link-host', 'user');
   const guest = await login(origin, 'link-guest', 'user');
@@ -512,19 +618,22 @@ test('two authenticated browser sessions exchange a cable word and atomically co
   const hostSocket = await openLinkSocket(origin, roomId, host.headers.Cookie);
   const guestSocket = await openLinkSocket(origin, roomId, guest.headers.Cookie);
   try {
-    const offer = waitForSocketMessage(guestSocket, 'link-offer');
-    const hostPair = waitForSocketMessage(hostSocket, 'link-pair');
-    const guestPair = waitForSocketMessage(guestSocket, 'link-pair');
-    hostSocket.send(JSON.stringify({ type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 }));
-    assert.deepEqual(await offer, { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 });
+    const offer = waitForSocketMessage(guestSocket, 'sio-offer');
+    const hostPair = waitForSocketMessage(hostSocket, 'sio-pair');
+    const guestPair = waitForSocketMessage(guestSocket, 'sio-pair');
+    const transfer = {
+      sequence: 0, mode: 2, bits: 16, speed: 3, initiatorSlot: 0, ticks: 0,
+    };
+    hostSocket.send(JSON.stringify({ type: 'sio-offer', ...transfer, data: 0x1234 }));
+    assert.deepEqual(await offer, { type: 'sio-offer', ...transfer, data: 0x1234 });
     guestSocket.send(JSON.stringify({
-      type: 'link-response', sequence: 0, speed: 3, data: 0xabcd, ticks: 0,
+      type: 'sio-response', ...transfer, data: 0xabcd,
     }));
     assert.deepEqual(await hostPair, {
-      type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
+      type: 'sio-pair', ...transfer, dataBySlot: [0x1234, 0xabcd],
     });
     assert.deepEqual(await guestPair, {
-      type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
+      type: 'sio-pair', ...transfer, dataBySlot: [0x1234, 0xabcd],
     });
 
     const battery = await fixture('.sa1');

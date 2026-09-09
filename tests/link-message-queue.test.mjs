@@ -1,38 +1,37 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  hostTransferData,
-  isSlaveHandshake,
-  LinkMessageQueue,
-  MASTER_HANDSHAKE,
-  SLAVE_HANDSHAKE,
-} from '../web/link-message-queue.js';
+import { LinkMessageQueue } from '../web/link-message-queue.js';
 
-test('late cable attachment keeps promoting host handshakes until the game advances', () => {
-  assert.equal(hostTransferData(SLAVE_HANDSHAKE), MASTER_HANDSHAKE);
-  assert.equal(hostTransferData(SLAVE_HANDSHAKE), MASTER_HANDSHAKE);
-  assert.equal(hostTransferData(0, true), MASTER_HANDSHAKE);
-  assert.equal(isSlaveHandshake(SLAVE_HANDSHAKE), true);
-  assert.equal(isSlaveHandshake(0), false);
-  assert.equal(hostTransferData(0x1234), 0x1234);
-});
+function envelope(overrides = {}) {
+  return {
+    sequence: 2,
+    mode: 1,
+    bits: 32,
+    speed: 1,
+    initiatorSlot: 1,
+    data: 0x89abcdef,
+    ticks: 2048,
+    ...overrides,
+  };
+}
 
 function adapter(state) {
   return {
-    slot: 1,
+    slot: state.slot,
     currentSequence: () => state.sequence,
     transferActive: () => state.active,
-    prepareRemote: (...args) => {
-      state.prepared.push(args);
-      return state.slaveData;
+    prepareRemote: (offer) => {
+      state.prepared.push(offer);
+      return state.prepareStatus;
     },
+    responseData: () => state.responseData,
     sendResponse: (message) => {
       state.responses.push(message);
       return true;
     },
-    applyPair: (...args) => {
-      state.applied.push(args);
+    applyTransfer: (pair) => {
+      state.applied.push(pair);
       state.active = true;
       return true;
     },
@@ -40,75 +39,61 @@ function adapter(state) {
   };
 }
 
-test('offer waits while the previous transfer is active and runs at its sequence boundary', () => {
+test('a Normal32 offer waits for the responder core and preserves unsigned data', () => {
   const queue = new LinkMessageQueue();
   const state = {
-    sequence: 1, active: true, slaveData: 0xabcd,
-    prepared: [], responses: [], applied: [], completed: [],
+    slot: 0, sequence: 2, active: false, prepareStatus: 0,
+    responseData: 0xfedcba98, prepared: [], responses: [], applied: [], completed: [],
   };
-  queue.enqueueOffer({ type: 'link-offer', sequence: 2, speed: 3, data: 0x1234, ticks: 8520 });
+  const offer = { type: 'sio-offer', ...envelope() };
+  queue.enqueueOffer(offer);
   assert.equal(queue.drain(adapter(state)), false);
   assert.equal(queue.pendingOffers, 1);
-  assert.deepEqual(state.prepared, []);
+  assert.equal(state.responses.length, 0);
 
-  state.sequence = 2;
-  state.active = false;
+  state.prepareStatus = 1;
   assert.equal(queue.drain(adapter(state)), false);
   assert.equal(queue.pendingOffers, 0);
-  assert.deepEqual(state.prepared, [[2, 3, 0x1234, 8520]]);
   assert.deepEqual(state.responses, [{
-    type: 'link-response', sequence: 2, speed: 3, data: 0xabcd, ticks: 8520,
+    type: 'sio-response', ...envelope({ data: 0xfedcba98 }),
   }]);
+
+  queue.enqueueOffer(offer);
+  assert.equal(queue.drain(adapter(state)), false);
+  assert.equal(state.responses.length, 2);
+  assert.deepEqual(state.responses[1], state.responses[0]);
 });
 
-test('pair waits behind an active transfer and applies without being discarded', () => {
+test('a completed SIO pair waits behind an active core and applies once', () => {
   const queue = new LinkMessageQueue();
   const state = {
-    sequence: 2, active: true, slaveData: 0xabcd,
-    prepared: [], responses: [], applied: [], completed: [],
+    slot: 0, sequence: 2, active: true, prepareStatus: 1,
+    responseData: 0, prepared: [], responses: [], applied: [], completed: [],
   };
-  queue.enqueuePair({
-    type: 'link-pair', sequence: 2, speed: 3, ticks: 8520, masterData: 0x1234, slaveData: 0xabcd,
-  });
+  const pair = {
+    type: 'sio-pair', ...envelope(), dataBySlot: [0xfedcba98, 0x89abcdef],
+  };
+  delete pair.data;
+  queue.enqueuePair(pair);
   assert.equal(queue.drain(adapter(state)), false);
-  assert.equal(queue.pendingPairs, 1);
-
   state.active = false;
   assert.equal(queue.drain(adapter(state)), true);
-  assert.equal(queue.pendingPairs, 0);
-  assert.deepEqual(state.applied, [[2, 3, 0x1234, 0xabcd]]);
+  assert.deepEqual(state.applied, [pair]);
   assert.deepEqual(state.completed, [2]);
+  assert.equal(queue.drain(adapter(state)), false);
 });
 
-test('guest does not submit a duplicate response when the pair arrives', () => {
+test('the initiator never responds to its own offer and stale envelopes are pruned', () => {
   const queue = new LinkMessageQueue();
   const state = {
-    sequence: 4, active: false, slaveData: 0xabcd,
-    prepared: [], responses: [], applied: [], completed: [],
+    slot: 1, sequence: 2, active: false, prepareStatus: 1,
+    responseData: 0, prepared: [], responses: [], applied: [], completed: [],
   };
-  queue.enqueueOffer({ type: 'link-offer', sequence: 4, speed: 3, data: 0x1234, ticks: 6044 });
+  queue.enqueueOffer({ type: 'sio-offer', ...envelope() });
   assert.equal(queue.drain(adapter(state)), false);
-  assert.equal(state.responses.length, 1);
-  assert.equal(queue.preparedResponses, 1);
-
-  queue.enqueuePair({
-    type: 'link-pair', sequence: 4, speed: 3, ticks: 6044, masterData: 0x1234, slaveData: 0xabcd,
-  });
-  assert.equal(queue.drain(adapter(state)), true);
-  assert.equal(state.responses.length, 1);
-  assert.equal(queue.preparedResponses, 0);
-});
-
-test('stale offers and pairs are pruned after the core advances', () => {
-  const queue = new LinkMessageQueue();
-  queue.enqueueOffer({ sequence: 1, speed: 3, data: 1, ticks: 6044 });
-  queue.enqueuePair({ sequence: 1, speed: 3, ticks: 6044, masterData: 1, slaveData: 2 });
-  const state = {
-    sequence: 2, active: false, slaveData: 0,
-    prepared: [], responses: [], applied: [], completed: [],
-  };
-  assert.equal(queue.drain(adapter(state)), false);
+  assert.equal(state.prepared.length, 0);
+  queue.enqueueOffer({ type: 'sio-offer', ...envelope({ sequence: 1 }) });
+  state.sequence = 3;
+  queue.drain(adapter(state));
   assert.equal(queue.pendingOffers, 0);
-  assert.equal(queue.pendingPairs, 0);
-  assert.equal(queue.preparedResponses, 0);
 });

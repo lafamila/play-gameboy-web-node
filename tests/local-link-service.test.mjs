@@ -44,6 +44,81 @@ test('account and guest local players use server-owned isolated save profiles', 
   assert.equal(database.localSaveLocks.size, 2);
 });
 
+test('Single-Pak local P2 is ready-capable but ephemeral across checkpoint and finish', async () => {
+  const { database, service } = await setup();
+  const session = await service.create({
+    player1: host,
+    player2Mode: 'guest',
+    player1RomId: HOST_ROM,
+    bootKind: 'multiboot-client',
+  });
+  assert.deepEqual(session.participants.map((participant) => ({
+    slot: participant.slot,
+    bootKind: participant.bootKind,
+    romId: participant.romId,
+    saveRevision: participant.saveRevision,
+  })), [
+    { slot: 0, bootKind: 'cartridge', romId: HOST_ROM, saveRevision: 0 },
+    { slot: 1, bootKind: 'multiboot-client', romId: null, saveRevision: null },
+  ]);
+  assert.equal(database.localSaveLocks.size, 1);
+  assert.equal(database.playAdmissionLocks.size, 1);
+
+  await service.setReady({ id: session.id, slot: 0, player1: host });
+  await service.setReady({ id: session.id, slot: 1, player1: host });
+  await assert.rejects(service.start({ id: session.id, player1: host }), {
+    code: 'LOCAL_CHECKPOINT_REQUIRED',
+  });
+  const checkpoint = await service.checkpoint({
+    id: session.id,
+    sequence: 0,
+    player1: host,
+    states: [{ slot: 0, data: Buffer.from('host-state').toString('base64') }],
+  });
+  assert.deepEqual(checkpoint.checkpoints.map((entry) => entry.slot), [0]);
+  await service.start({ id: session.id, player1: host });
+
+  const hostBattery = Buffer.alloc(256, 0x51);
+  const finished = await service.finish({
+    id: session.id,
+    player1: host,
+    batteries: [{ slot: 0, data: hostBattery.toString('base64') }],
+  });
+  assert.deepEqual(finished.saves, [{ slot: 0, revision: 1 }]);
+  assert.deepEqual((await database.getSave('host', HOST_ROM, 'battery')).payload, hostBattery);
+  assert.equal(await database.getSave('host', HOST_ROM, 'battery', 'guest-p2'), null);
+  assert.equal(database.localSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
+
+  const abortedSession = await service.create({
+    player1: host,
+    player2Mode: 'guest',
+    player1RomId: HOST_ROM,
+    player2BootKind: 'multiboot-client',
+  });
+  const aborted = await service.abort({ id: abortedSession.id, player1: host });
+  assert.equal(aborted.status, 'aborted');
+  assert.equal(database.localSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
+});
+
+test('local boot selection rejects invalid values and ROM-backed multiboot clients', async () => {
+  const { service } = await setup();
+  await assert.rejects(service.create({
+    player1: host,
+    player2Mode: 'guest',
+    player1RomId: HOST_ROM,
+    bootKind: 'bios',
+  }), { code: 'BOOT_KIND_INVALID' });
+  await assert.rejects(service.create({
+    player1: host,
+    player2Mode: 'guest',
+    player1RomId: HOST_ROM,
+    player2RomId: GUEST_ROM,
+    bootKind: 'multiboot-client',
+  }), { code: 'MULTIBOOT_ROM_INVALID' });
+});
+
 test('pair cleanup still releases locks after Player 2 loses play permission', async () => {
   const { database, service } = await setup();
   const session = await service.create({
@@ -56,7 +131,7 @@ test('pair cleanup still releases locks after Player 2 loses play permission', a
   assert.equal(database.localSaveLocks.size, 0);
 });
 
-test('same-account P2 and incompatible ROM pairs are rejected before start', async () => {
+test('same-account P2 is rejected while different GBA ROMs may negotiate over the cable', async () => {
   const { database, service } = await setup();
   await assert.rejects(() => service.create({
     player1: host, player2: { ...host }, player2Mode: 'account',
@@ -67,10 +142,12 @@ test('same-account P2 and incompatible ROM pairs are rejected before start', asy
     filename: 'other.gba', romIdentity: 'other', revision: 0, size: 1024,
     path: '/tmp/other.gba', source: 'fixture',
   });
-  await assert.rejects(() => service.create({
+  const crossRom = await service.create({
     player1: host, player2: guest, player2Mode: 'account',
     player1RomId: HOST_ROM, player2RomId: 'c'.repeat(64),
-  }), { code: 'LOCAL_ROM_INCOMPATIBLE' });
+  });
+  assert.equal(crossRom.participants[1].romId, 'c'.repeat(64));
+  await service.abort({ id: crossRom.id, player1: host, player2: guest });
 });
 
 test('ready/start/checkpoint/final battery operations remain paired and atomic', async () => {

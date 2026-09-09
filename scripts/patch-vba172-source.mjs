@@ -190,6 +190,36 @@ extern void WriteLinkData(u16);
   gbaSource = gbaSource.replace(before, after);
 }
 
+if (!gbaSource.includes('extern int vbaLinkStartMultiboot(u32, int);')) {
+  const before = 'extern void LinkUpdate();\n';
+  const after = 'extern void LinkUpdate();\nextern int vbaLinkStartMultiboot(u32, int);\n';
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 multiboot declaration context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+if (!gbaSource.includes('vbaLinkStartMultiboot(reg[0].I')) {
+  const before = '  case 0x1F:\n    BIOS_MidiKey2Freq();\n    break;\n';
+  const after = before +
+    '  case 0x25:\n    if(!vbaLinkStartMultiboot(reg[0].I, reg[1].I))\n' +
+    '      reg[0].I = 1;\n    break;\n';
+  if (!gbaSource.includes(before)) {
+    throw new Error(`VBA 1.7.2 multiboot SWI context not found in ${gbaFilename}`);
+  }
+  gbaSource = gbaSource.replace(before, after);
+}
+
+if (gbaSource.includes('    reg[15].I = 0x02000000;')) {
+  gbaSource = gbaSource.replace(
+    '    reg[15].I = 0x02000000;',
+    '    reg[15].I = 0x020000c0;',
+  );
+}
+if (!gbaSource.includes('    reg[15].I = 0x020000c0;')) {
+  throw new Error(`VBA 1.7.2 multiboot RAM entry context not found in ${gbaFilename}`);
+}
+
 if (gbaSource.includes(`  case 0x12a:
     UPDATE_REG(0x12a, value);
 `)) {

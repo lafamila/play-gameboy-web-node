@@ -11,6 +11,8 @@
 #include "System.h"
 #include "Util.h"
 
+extern bool cpuIsMultiBoot;
+
 namespace {
 int (*g_write)(gzFile, const voidp, unsigned int) = nullptr;
 int (*g_read)(gzFile, voidp, unsigned int) = nullptr;
@@ -25,7 +27,8 @@ void utilApplyIPS(const char*, uint8_t**, int*) {}
 bool utilIsGBAImage(const char* file) {
   if (!file) return false;
   const char* ext = strrchr(file, '.');
-  return ext && strcasecmp(ext, ".gba") == 0;
+  cpuIsMultiBoot = ext && strcasecmp(ext, ".mb") == 0;
+  return ext && (strcasecmp(ext, ".gba") == 0 || cpuIsMultiBoot);
 }
 
 bool utilIsGBImage(const char* file) {

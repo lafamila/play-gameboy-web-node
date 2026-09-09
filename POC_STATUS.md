@@ -41,9 +41,11 @@ Target fixture:
 | Room lock recovery | PASS | Leave releases both locks, disconnect auto-aborts after grace, and new-room creation clears matching stale rooms |
 | Saves are isolated by account | PASS | Two accounts retain distinct states for the same ROM composite key |
 | Link source provenance is pinned | PASS | `V172lsrc.zip` SHA-256 is verified before every core build and served beside WASM |
-| GBA serial register/timing transport | PASS | Native probe verifies multiplayer request, paired word registers, IRQ completion and idle reset |
+| Generic GBA SIO register/timing transport | PASS | Native probe verifies Normal 8/32-bit and Multiplayer 16-bit width, baud timing, peer data, IRQ completion and disconnected completion |
+| Mario Bros. Classic cycle lockstep | PASS | Two AX4E cores reach gameplay and advance 174/174 frames while completing 1,198 SIO pairs under 4,096-cycle scheduling |
+| Single-Pak Download Play protocol | PASS-CORE | Clean-room tests verify recognition, header, encrypted payload, readiness and CRC for Normal32 and Multiplayer16; native probe verifies host SWI 0x25 HLE |
 | Two authenticated users can join a room | PASS | HTTP/WebSocket integration opens two account sessions and enforces host/guest slots |
-| Compatible mixed ROMs use participant saves | PASS | FireRed/LeafGreen-style ROM IDs acquire independent account/ROM revision locks |
+| Mixed GBA ROMs negotiate over one cable | PASS | Room admission uses the generic GBA SIO capability while cartridge saves retain independent account/ROM revision locks |
 | Cable transfer barrier works | PASS | Both slots must submit the same monotonic sequence before either receives `link-pair` |
 | Disconnect replay works | PASS | Reconnect `sync` replays a completed pair or pending host offer without advancing sequence |
 | Link checkpoints are paired | PASS | A checkpoint becomes resumable only after both participant state payloads arrive |

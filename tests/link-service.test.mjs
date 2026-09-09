@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { MemoryDatabase } from '../lib/database.mjs';
-import { LinkService, compatibilityForRom } from '../lib/link-service.mjs';
+import {
+  LINK_CORE_VERSION,
+  LINK_PROTOCOL_VERSION,
+  LinkService,
+  compatibilityForRom,
+} from '../lib/link-service.mjs';
 
 const hostRom = {
   id: 'a'.repeat(64), platform: 'gba', gameCode: 'BPRK', title: 'FireRed', filename: 'fire.gba',
@@ -16,16 +21,35 @@ async function setup(serviceOptions = {}) {
   await database.upsertRom(hostRom);
   await database.upsertRom(guestRom);
   await database.putSave('host', hostRom.id, 'battery', Buffer.alloc(131072, 1), 1);
-  await database.putSave('guest', guestRom.id, 'battery', Buffer.alloc(131072, 2), 1);
+  await database.putSave('guest', hostRom.id, 'battery', Buffer.alloc(131072, 2), 1);
   const service = new LinkService({ database, now: () => 1000, ...serviceOptions });
   const created = await service.createRoom({ accountId: 'host', romId: hostRom.id });
   await service.joinRoom({
     roomId: created.room.id,
     accountId: 'guest',
     inviteCode: created.inviteCode,
-    romId: guestRom.id,
+    romId: hostRom.id,
   });
   return { database, service, roomId: created.room.id, inviteCode: created.inviteCode };
+}
+
+async function activate(service, roomId) {
+  await service.setReady({ roomId, accountId: 'host', ready: true });
+  await service.setReady({ roomId, accountId: 'guest', ready: true });
+  await service.startRoom({ roomId, accountId: 'host' });
+}
+
+function sioEnvelope(overrides = {}) {
+  return {
+    sequence: 0,
+    mode: 2,
+    bits: 16,
+    speed: 3,
+    initiatorSlot: 0,
+    data: 0x1234,
+    ticks: 8520,
+    ...overrides,
+  };
 }
 
 function fakeTimers() {
@@ -53,29 +77,139 @@ function fakeTimers() {
   };
 }
 
-test('Pokemon Gen 3 ROMs in the same region share a cable compatibility group', () => {
-  assert.equal(compatibilityForRom(hostRom).gameGroup, 'pokemon-gen3:K');
-  assert.deepEqual(compatibilityForRom(hostRom), compatibilityForRom(guestRom));
-  assert.notEqual(
-    compatibilityForRom(hostRom).gameGroup,
-    compatibilityForRom({ ...guestRom, gameCode: 'BPGE' }).gameGroup,
-  );
+test('GBA ROM compatibility uses one generic SIO v3 capability', () => {
+  const compatibility = compatibilityForRom(hostRom);
+  assert.equal(LINK_CORE_VERSION, 'vba-1.7.2-generic-sio-v3');
+  assert.equal(LINK_PROTOCOL_VERSION, 'gba-sio-v3');
+  assert.equal(compatibility.gameGroup, 'gba-sio');
+  assert.deepEqual(compatibility, compatibilityForRom({ ...hostRom, gameCode: 'AX4E' }));
+  assert.deepEqual(compatibility, compatibilityForRom({ ...hostRom, id: guestRom.id }));
 });
 
-test('standalone ROM compatibility groups retain the complete SHA-256 identity', () => {
-  const rom = {
-    id: 'c'.repeat(64), platform: 'gba', gameCode: 'AX4E', title: 'Mario', filename: 'mario.gba',
+test('room admission lets the ROMs negotiate compatibility over the generic cable', async () => {
+  const database = new MemoryDatabase();
+  await database.upsertRom(hostRom);
+  await database.upsertRom(guestRom);
+  const service = new LinkService({ database, now: () => 1000 });
+  const created = await service.createRoom({ accountId: 'host', romId: hostRom.id });
+
+  const joined = await service.joinRoom({
+    roomId: created.room.id,
+    accountId: 'guest',
+    inviteCode: created.inviteCode,
+    romId: guestRom.id,
+  });
+  assert.equal(joined.participants[1].romId, guestRom.id);
+});
+
+test('Single-Pak guest joins without ROM/save lock and host finalizes independently', async () => {
+  const database = new MemoryDatabase();
+  await database.upsertRom(hostRom);
+  const hostBefore = Buffer.alloc(256, 0x11);
+  const guestBefore = Buffer.alloc(256, 0x22);
+  await database.putSave('host', hostRom.id, 'battery', hostBefore, 1);
+  await database.putSave('guest', hostRom.id, 'battery', guestBefore, 1);
+  const service = new LinkService({ database, now: () => 1000 });
+  const created = await service.createRoom({ accountId: 'host', romId: hostRom.id });
+  const roomId = created.room.id;
+  const joined = await service.joinRoom({
+    roomId,
+    accountId: 'guest',
+    inviteCode: created.inviteCode,
+    bootKind: 'multiboot-client',
+  });
+  assert.deepEqual(joined.participants.map((participant) => ({
+    slot: participant.slot,
+    bootKind: participant.bootKind,
+    romId: participant.romId,
+  })), [
+    { slot: 0, bootKind: 'cartridge', romId: hostRom.id },
+    { slot: 1, bootKind: 'multiboot-client', romId: null },
+  ]);
+  assert.equal(database.linkSaveLocks.size, 1);
+  assert.equal(database.playAdmissionLocks.size, 2);
+
+  await activate(service, roomId);
+  const messages = [];
+  service.on('message', (event) => messages.push(event));
+  await service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: { type: 'sio-state', mode: 15, siocnt: 0x0008, rcnt: 0x0007, epoch: 1 },
+  });
+  assert.ok(messages.some((event) => event.targetAccountId === 'host' &&
+    event.message.type === 'sio-state' && event.message.mode === 15));
+  await service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { type: 'checkpoint', sequence: 0, state: Buffer.from('host-state').toString('base64') },
+  });
+  assert.ok(messages.some((event) => event.message.type === 'checkpoint-saved'));
+  assert.equal((await database.getLatestLinkCheckpointPair(roomId)).checkpoints.length, 1);
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: { type: 'checkpoint', sequence: 1, state: Buffer.from('guest-state').toString('base64') },
+  }), { code: 'CHECKPOINT_NOT_APPLICABLE' });
+  await assert.rejects(service.submitBattery({
+    roomId, accountId: 'guest', payload: Buffer.alloc(256, 0x33),
+  }), { code: 'BATTERY_NOT_APPLICABLE' });
+
+  const hostAfter = Buffer.alloc(256, 0x44);
+  const completed = await service.submitBattery({
+    roomId, accountId: 'host', payload: hostAfter,
+  });
+  assert.equal(completed.status, 'completed');
+  assert.deepEqual((await database.getSave('host', hostRom.id, 'battery')).payload, hostAfter);
+  assert.deepEqual((await database.getSave('guest', hostRom.id, 'battery')).payload, guestBefore);
+  assert.equal(database.linkSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
+});
+
+test('remote join validates bootKind and rejects ROM-backed multiboot clients', async () => {
+  const database = new MemoryDatabase();
+  await database.upsertRom(hostRom);
+  const service = new LinkService({ database, now: () => 1000 });
+  const created = await service.createRoom({ accountId: 'host', romId: hostRom.id });
+  const input = {
+    roomId: created.room.id,
+    accountId: 'guest',
+    inviteCode: created.inviteCode,
   };
-  const compatibility = compatibilityForRom(rom);
-  assert.equal(compatibility.gameGroup, `rom:${rom.id}`);
-  assert.equal(compatibility.gameGroup.length, 68);
+  await assert.rejects(service.joinRoom({ ...input, bootKind: 'bios' }), {
+    code: 'BOOT_KIND_INVALID',
+  });
+  await assert.rejects(service.joinRoom({
+    ...input, bootKind: 'multiboot-client', romId: hostRom.id,
+  }), { code: 'MULTIBOOT_ROM_INVALID' });
+  await assert.rejects(service.joinRoom({ ...input, bootKind: 'cartridge' }), {
+    code: 'ROM_NOT_FOUND',
+  });
+
+  const joined = await service.joinRoom({ ...input, bootKind: 'multiboot-client' });
+  assert.equal(joined.participants[1].bootKind, 'multiboot-client');
 });
 
-test('two accounts ready and exchange one virtual cable transfer', async () => {
+test('aborting a Single-Pak room releases host save and both admission locks', async () => {
+  const database = new MemoryDatabase();
+  await database.upsertRom(hostRom);
+  const service = new LinkService({ database, now: () => 1000 });
+  const created = await service.createRoom({ accountId: 'host', romId: hostRom.id });
+  await service.joinRoom({
+    roomId: created.room.id,
+    accountId: 'guest',
+    inviteCode: created.inviteCode,
+    bootKind: 'multiboot-client',
+  });
+  await service.abortRoom({ roomId: created.room.id, accountId: 'guest', reason: 'cancelled' });
+  assert.equal(database.linkSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
+  await database.putSave('host', hostRom.id, 'battery', Buffer.alloc(256, 1));
+});
+
+test('two accounts ready and exchange one generic Multiplayer SIO transfer', async () => {
   const { database, service, roomId } = await setup();
-  assert.equal((await service.setReady({ roomId, accountId: 'host', ready: true })).status, 'waiting');
-  assert.equal((await service.setReady({ roomId, accountId: 'guest', ready: true })).status, 'ready');
-  assert.equal((await service.startRoom({ roomId, accountId: 'host' })).status, 'active');
+  await activate(service, roomId);
 
   const messages = [];
   service.on('message', (event) => messages.push(event));
@@ -88,18 +222,25 @@ test('two accounts ready and exchange one virtual cable transfer', async () => {
   await service.handleMessage({
     roomId,
     accountId: 'host',
-    message: { type: 'link-offer', sequence: 0, speed: 3, data: 0x1234, ticks: 0 },
+    message: { type: 'sio-offer', ...sioEnvelope() },
   });
   await service.handleMessage({
     roomId,
     accountId: 'guest',
-    message: { type: 'link-response', sequence: 0, speed: 3, data: 0xabcd, ticks: 0 },
+    message: { type: 'sio-response', ...sioEnvelope({ data: 0xabcd }) },
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(persistedRoomReads, 0, 'word transfers must not query persistent room state');
-  assert.ok(messages.some((event) => event.targetAccountId === 'guest' && event.message.type === 'link-offer'));
-  assert.deepEqual(messages.find((event) => event.message.type === 'link-pair').message, {
-    type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd,
+  assert.ok(messages.some((event) => event.targetAccountId === 'guest' && event.message.type === 'sio-offer'));
+  assert.deepEqual(messages.find((event) => event.message.type === 'sio-pair').message, {
+    type: 'sio-pair',
+    sequence: 0,
+    mode: 2,
+    bits: 16,
+    speed: 3,
+    initiatorSlot: 0,
+    ticks: 8520,
+    dataBySlot: [0x1234, 0xabcd],
   });
   messages.length = 0;
   await service.handleMessage({
@@ -108,17 +249,194 @@ test('two accounts ready and exchange one virtual cable transfer', async () => {
   assert.deepEqual(messages[0], {
     roomId,
     targetAccountId: 'guest',
-    message: { type: 'link-pair', sequence: 0, speed: 3, ticks: 0, masterData: 0x1234, slaveData: 0xabcd },
+    message: {
+      type: 'sio-pair',
+      sequence: 0,
+      mode: 2,
+      bits: 16,
+      speed: 3,
+      initiatorSlot: 0,
+      ticks: 8520,
+      dataBySlot: [0x1234, 0xabcd],
+    },
+  });
+});
+
+test('slot 1 can initiate Normal32 and sync relays its pending offer to slot 0', async () => {
+  const { service, roomId } = await setup();
+  await activate(service, roomId);
+  const messages = [];
+  service.on('message', (event) => messages.push(event));
+  const offer = {
+    type: 'sio-offer',
+    ...sioEnvelope({
+      mode: 1,
+      bits: 32,
+      speed: 1,
+      initiatorSlot: 1,
+      data: 0xfedcba98,
+      ticks: 2048,
+    }),
+  };
+
+  await service.handleMessage({ roomId, accountId: 'guest', message: offer });
+  assert.deepEqual(messages[0], {
+    roomId,
+    targetAccountId: 'host',
+    message: offer,
   });
   messages.length = 0;
   await service.handleMessage({
-    roomId, accountId: 'host', message: { type: 'link-release', sequence: 1 },
+    roomId,
+    accountId: 'host',
+    message: { type: 'sync', sequence: 0 },
   });
   assert.deepEqual(messages[0], {
     roomId,
-    targetAccountId: 'guest',
-    message: { type: 'link-release', sequence: 1 },
+    targetAccountId: 'host',
+    message: offer,
   });
+
+  messages.length = 0;
+  await service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { ...offer, type: 'sio-response', data: 0x89abcdef },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(messages.find((event) => event.message.type === 'sio-pair').message, {
+    type: 'sio-pair',
+    sequence: 0,
+    mode: 1,
+    bits: 32,
+    speed: 1,
+    initiatorSlot: 1,
+    ticks: 2048,
+    dataBySlot: [0x89abcdef, 0xfedcba98],
+  });
+});
+
+test('slot 1 cannot initiate Multiplayer transfers', async () => {
+  const { service, roomId } = await setup();
+  await activate(service, roomId);
+
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: {
+      type: 'sio-offer',
+      ...sioEnvelope({ initiatorSlot: 1 }),
+    },
+  }), { code: 'INVALID_TRANSFER_ROLE' });
+});
+
+test('malformed SIO transfer and state envelopes are rejected', async () => {
+  const { service, roomId } = await setup();
+  await activate(service, roomId);
+  const malformedTransfers = [
+    sioEnvelope({ mode: 3 }),
+    sioEnvelope({ mode: 0, bits: 16 }),
+    sioEnvelope({ speed: 4 }),
+    sioEnvelope({ mode: 0, bits: 8, speed: 2 }),
+    sioEnvelope({ initiatorSlot: 2 }),
+    sioEnvelope({ data: -1 }),
+    sioEnvelope({ data: 0x1_0000_0000 }),
+    sioEnvelope({ mode: 0, bits: 8, speed: 1, data: 0x100 }),
+    sioEnvelope({ ticks: -1 }),
+    sioEnvelope({ ticks: 0x8000_0000 }),
+    sioEnvelope({ sequence: 0.5 }),
+  ];
+  for (const envelope of malformedTransfers) {
+    await assert.rejects(service.handleMessage({
+      roomId,
+      accountId: 'host',
+      message: { type: 'sio-offer', ...envelope },
+    }), { code: 'SIO_TRANSFER_INVALID' });
+  }
+
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: { type: 'sio-response', ...sioEnvelope() },
+  }), { code: 'INVALID_TRANSFER_ROLE' });
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { type: 'sio-state', mode: 2, siocnt: 0x1_0000, rcnt: 0, epoch: 0 },
+  }), { code: 'SIO_STATE_INVALID' });
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { type: 'sio-state', mode: 15, siocnt: 0x0008, rcnt: 0x0007, epoch: 0 },
+  }), { code: 'SIO_STATE_INVALID' });
+  await service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { type: 'sio-state', mode: 8, siocnt: 0, rcnt: 0x80a0, epoch: 1 },
+  });
+
+  await service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { type: 'sio-offer', ...sioEnvelope() },
+  });
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: { type: 'sio-response', ...sioEnvelope({ speed: 2, data: 0xabcd }) },
+  }), { code: 'TRANSFER_MISMATCH' });
+  await service.abortRoom({ roomId, accountId: 'host', reason: 'test cleanup' });
+});
+
+test('SIO state is validated and relayed only to the peer without persistence', async () => {
+  const { database, service, roomId } = await setup();
+  await activate(service, roomId);
+  const messages = [];
+  service.on('message', (event) => messages.push(event));
+  let persistedCalls = 0;
+  const originalCheckpoint = database.putLinkCheckpointPair.bind(database);
+  database.putLinkCheckpointPair = async (...args) => {
+    persistedCalls += 1;
+    return originalCheckpoint(...args);
+  };
+
+  await service.handleMessage({
+    roomId,
+    accountId: 'guest',
+    message: {
+      type: 'sio-state', mode: 0, siocnt: 0x4081, rcnt: 0x8000, epoch: 7, ignored: true,
+    },
+  });
+  assert.deepEqual(messages, [{
+    roomId,
+    targetAccountId: 'host',
+    message: { type: 'sio-state', mode: 0, siocnt: 0x4081, rcnt: 0x8000, epoch: 7 },
+  }]);
+  assert.equal(persistedCalls, 0);
+});
+
+test('duplicate SIO submissions are idempotent and broadcast each event once', async () => {
+  const { service, roomId } = await setup();
+  await activate(service, roomId);
+  const messages = [];
+  service.on('message', (event) => messages.push(event));
+  const offer = { type: 'sio-offer', ...sioEnvelope() };
+  const response = { type: 'sio-response', ...sioEnvelope({ data: 0xabcd }) };
+
+  await service.handleMessage({ roomId, accountId: 'host', message: offer });
+  await service.handleMessage({ roomId, accountId: 'host', message: { ...offer } });
+  await assert.rejects(service.handleMessage({
+    roomId,
+    accountId: 'host',
+    message: { ...offer, data: 0x9999 },
+  }), { code: 'DUPLICATE_CONFLICT' });
+  assert.equal(messages.filter((event) => event.message.type === 'sio-offer').length, 1);
+
+  await service.handleMessage({ roomId, accountId: 'guest', message: response });
+  await new Promise((resolve) => setImmediate(resolve));
+  await service.handleMessage({ roomId, accountId: 'guest', message: { ...response } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.filter((event) => event.message.type === 'sio-pair').length, 1);
 });
 
 test('battery saves commit as one participant-specific ROM pair', async () => {
@@ -136,7 +454,7 @@ test('battery saves commit as one participant-specific ROM pair', async () => {
   const completed = await service.submitBattery({ roomId, accountId: 'guest', payload: guestBattery });
   assert.equal(completed.status, 'completed');
   assert.deepEqual((await database.getSave('host', hostRom.id, 'battery')).payload, hostBattery);
-  assert.deepEqual((await database.getSave('guest', guestRom.id, 'battery')).payload, guestBattery);
+  assert.deepEqual((await database.getSave('guest', hostRom.id, 'battery')).payload, guestBattery);
 });
 
 test('service startup aborts unrecoverable in-process rooms and releases save locks', async () => {
@@ -159,7 +477,7 @@ test('creating a replacement room aborts the stale runtime room and releases bot
   assert.equal((await database.getLinkRoom(roomId)).status, 'aborted');
   assert.equal(service.coordinator.getRoom({ roomId, accountId: 'host' }).status, 'aborted');
 
-  await database.putSave('guest', guestRom.id, 'battery', Buffer.alloc(131072, 5));
+  await database.putSave('guest', hostRom.id, 'battery', Buffer.alloc(131072, 5));
   await assert.rejects(
     database.putSave('host', hostRom.id, 'battery', Buffer.alloc(131072, 6)),
     { code: 'SAVE_LOCKED' },
@@ -194,7 +512,7 @@ test('disconnect grace is cancelled on reconnect and later auto-aborts the room'
   assert.equal(timers.active().length, 1);
   assert.equal(timers.active()[0].delay, 1_234);
   await assert.rejects(
-    database.putSave('guest', guestRom.id, 'battery', Buffer.alloc(131072, 7)),
+    database.putSave('guest', hostRom.id, 'battery', Buffer.alloc(131072, 7)),
     { code: 'SAVE_LOCKED' },
   );
 
@@ -210,7 +528,7 @@ test('disconnect grace is cancelled on reconnect and later auto-aborts the room'
   assert.ok(messages.some((event) => event.message.type === 'aborted'
     && event.message.reason === 'disconnect grace expired'));
   await database.putSave('host', hostRom.id, 'battery', Buffer.alloc(131072, 8));
-  await database.putSave('guest', guestRom.id, 'battery', Buffer.alloc(131072, 9));
+  await database.putSave('guest', hostRom.id, 'battery', Buffer.alloc(131072, 9));
 });
 
 test('explicit abort clears disconnect timers and releases both locks immediately', async () => {
@@ -224,5 +542,5 @@ test('explicit abort clears disconnect timers and releases both locks immediatel
   await timers.runAll();
   assert.equal((await database.getLinkRoom(roomId)).status, 'aborted');
   await database.putSave('host', hostRom.id, 'battery', Buffer.alloc(131072, 10));
-  await database.putSave('guest', guestRom.id, 'battery', Buffer.alloc(131072, 11));
+  await database.putSave('guest', hostRom.id, 'battery', Buffer.alloc(131072, 11));
 });

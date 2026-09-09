@@ -1,58 +1,57 @@
-import { hostTransferData, isSlaveHandshake } from './link-message-queue.js';
-
-const POKEMON_GEN3_CODES = new Set(['BPR', 'BPG', 'BPE', 'AXV', 'AXP']);
-
-export function requiresIrqReleaseGate(gameCode) {
-  return POKEMON_GEN3_CODES.has(String(gameCode || '').toUpperCase().slice(0, 3));
-}
-
-export function applyDirectCablePair(host, guest, state) {
-  if (!host?._vba_link_request_pending()) return { ...state, applied: false };
-  const sequence = Number(host._vba_link_request_sequence());
-  if (sequence === state.lastPairSequence) return { ...state, applied: false };
-  const rawData = Number(host._vba_link_request_data());
-  const masterData = hostTransferData(rawData, state.guestHandshakePending);
-  const speed = Number(host._vba_link_request_speed());
-  const ticks = Number(host._vba_link_request_ticks());
-  const slaveData = Number(guest._vba_link_prepare_remote(sequence, speed, masterData, ticks));
-  if (slaveData < 0) return { ...state, applied: false };
-  if (!host._vba_link_apply_pair(sequence, speed, masterData, slaveData) ||
-      !guest._vba_link_apply_pair(sequence, speed, masterData, slaveData)) {
-    throw new Error('Direct local cable pair failed');
-  }
+export function sioPortState(core) {
   return {
-    applied: true,
-    sequence,
-    masterData,
-    slaveData,
-    lastPairSequence: sequence,
-    guestHandshakePending: isSlaveHandshake(slaveData),
+    mode: Number(core._vba_link_mode()),
+    siocnt: Number(core._vba_link_siocnt()),
+    rcnt: Number(core._vba_link_rcnt()),
+    epoch: Number(core._vba_link_state_epoch()),
   };
 }
 
-export function releaseDirectCableGuest(
-  host, guest, lastReleaseSequence, waitForIrqDisable = false,
-) {
-  if (!host || !guest?._vba_link_guest_held() || host._vba_link_waiting() ||
-      host._vba_link_transfer_active() || host._vba_link_request_pending() ||
-      (waitForIrqDisable && (Number(host._vba_link_siocnt()) & 0x4000))) {
-    return { released: false, lastReleaseSequence };
+export function synchronizeDirectCableState(first, second) {
+  const states = [sioPortState(first), sioPortState(second)];
+  first._vba_link_set_peer_state(states[1].mode, states[1].siocnt, states[1].rcnt);
+  second._vba_link_set_peer_state(states[0].mode, states[0].siocnt, states[0].rcnt);
+  return states;
+}
+
+export function pendingSioOffer(core) {
+  if (!core?._vba_link_request_pending()) return null;
+  return {
+    sequence: Number(core._vba_link_request_sequence()),
+    mode: Number(core._vba_link_request_mode()),
+    bits: Number(core._vba_link_request_bits()),
+    speed: Number(core._vba_link_request_speed()),
+    initiatorSlot: Number(core._vba_link_request_initiator()),
+    data: Number(core._vba_link_request_data()) >>> 0,
+    ticks: Number(core._vba_link_request_ticks()),
+  };
+}
+
+export function applyDirectSioTransfer(cores, state) {
+  synchronizeDirectCableState(cores[0], cores[1]);
+  const offers = cores.map(pendingSioOffer).filter(Boolean)
+    .filter((offer) => offer.sequence !== state.lastPairSequence)
+    .sort((left, right) => left.sequence - right.sequence || left.initiatorSlot - right.initiatorSlot);
+  const offer = offers[0];
+  if (!offer) return { ...state, applied: false };
+  const responder = cores[offer.initiatorSlot === 0 ? 1 : 0];
+  const status = Number(responder._vba_link_prepare_remote(
+    offer.sequence, offer.mode, offer.bits, offer.speed,
+    offer.initiatorSlot, offer.data, offer.ticks,
+  ));
+  if (status <= 0) return { ...state, applied: false };
+  const dataBySlot = [0, 1].map((slot) => slot === offer.initiatorSlot
+    ? offer.data : Number(responder._vba_link_response_data()) >>> 0);
+  for (const core of cores) {
+    if (!core._vba_link_apply_transfer(
+      offer.sequence, offer.mode, offer.bits, offer.speed,
+      offer.initiatorSlot, dataBySlot[0], dataBySlot[1],
+    )) throw new Error('Direct local SIO transfer failed');
   }
-  const sequence = Number(host._vba_link_request_sequence());
-  if (sequence === lastReleaseSequence) return { released: false, lastReleaseSequence };
-  guest._vba_link_cancel_wait();
-  return { released: true, lastReleaseSequence: sequence };
-}
-
-export function directCableIdle(runtimes) {
-  return runtimes.every((runtime) => runtime.core &&
-    !runtime.core._vba_link_waiting() && !runtime.core._vba_link_transfer_active() &&
-    !runtime.core._vba_link_request_pending());
-}
-
-export function guestCableResponsePending(host, guest) {
-  return Boolean(host?._vba_link_request_pending() && guest &&
-    Number(host._vba_link_request_sequence()) === Number(guest._vba_link_request_sequence()) &&
-    !guest._vba_link_waiting() && !guest._vba_link_transfer_active() &&
-    !guest._vba_link_guest_held());
+  return {
+    applied: true,
+    ...offer,
+    dataBySlot,
+    lastPairSequence: offer.sequence,
+  };
 }

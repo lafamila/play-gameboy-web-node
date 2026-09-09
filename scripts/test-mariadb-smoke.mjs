@@ -105,6 +105,49 @@ try {
   await repeated.pool.execute(`DELETE FROM link_save_locks WHERE room_id='legacy-room'`);
 
   const now = Date.now();
+  await repeated.createLinkRoom({
+    id: 'single-pak-remote', accountId: 'single-pak-host', romId: ROM_A, now,
+  });
+  await repeated.joinLinkRoom('single-pak-remote', {
+    accountId: 'single-pak-guest', romId: null, bootKind: 'multiboot-client',
+  }, now + 1);
+  const singlePakRemote = await repeated.getLinkRoom('single-pak-remote');
+  assert.deepEqual(singlePakRemote.participants.map(({ bootKind, romId, saveRevision }) => ({
+    bootKind, romId, saveRevision,
+  })), [
+    { bootKind: 'cartridge', romId: ROM_A, saveRevision: 0 },
+    { bootKind: 'multiboot-client', romId: null, saveRevision: null },
+  ]);
+  const [singlePakRemoteLocks] = await repeated.pool.execute(
+    'SELECT account_id FROM link_save_locks WHERE room_id = ?',
+    ['single-pak-remote'],
+  );
+  assert.equal(singlePakRemoteLocks.length, 1);
+  await repeated.abortLinkRoom('single-pak-remote', now + 2);
+
+  const singlePakLocal = await repeated.createLocalLinkSession({
+    id: 'single-pak-local', ownerAccountId: 'single-pak-local-host',
+    player2AccountId: null, player2Mode: 'guest', leaseExpiresAt: now + 60_000, now: now + 3,
+    participants: [
+      { slot: 0, accountId: 'single-pak-local-host', profileKey: 'primary',
+        romId: ROM_A, bootKind: 'cartridge' },
+      { slot: 1, accountId: 'single-pak-local-host', profileKey: 'guest-p2',
+        romId: null, bootKind: 'multiboot-client' },
+    ],
+  });
+  assert.deepEqual(singlePakLocal.participants.map(({ bootKind, romId, saveRevision }) => ({
+    bootKind, romId, saveRevision,
+  })), [
+    { bootKind: 'cartridge', romId: ROM_A, saveRevision: 0 },
+    { bootKind: 'multiboot-client', romId: null, saveRevision: null },
+  ]);
+  const [singlePakLocalLocks] = await repeated.pool.execute(
+    'SELECT account_id FROM local_save_locks WHERE local_session_id = ?',
+    ['single-pak-local'],
+  );
+  assert.equal(singlePakLocalLocks.length, 1);
+  await repeated.abortLocalLinkSession('single-pak-local', now + 4);
+
   const makeLocal = (id, secondAccount, firstRom, secondRom) => repeated.createLocalLinkSession({
     id, ownerAccountId: 'race-owner', player2AccountId: secondAccount,
     player2Mode: 'account', leaseExpiresAt: now + 60_000, now,
@@ -199,7 +242,8 @@ try {
   assert.equal(admissions.length, 0);
   await repeated.close();
   console.log(JSON.stringify({ migrationConcurrency: 'passed', legacyPreservation: 'passed',
-    admissionRace: 'passed', pairedRollback: 'passed', gamepadMapping: 'passed' }));
+    admissionRace: 'passed', pairedRollback: 'passed', gamepadMapping: 'passed',
+    singlePakPersistence: 'passed' }));
 } finally {
   await admin.query(`DROP DATABASE IF EXISTS \`${name}\``);
   await admin.end();

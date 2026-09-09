@@ -9,8 +9,9 @@
     "test": "node --test tests/*.test.mjs",
     "test:core": "bash scripts/test-native-core.sh",
     "test:browser": "bash scripts/test-browser.sh",
+    "test:mario": "node scripts/test-mario-classic.mjs",
     "test:mariadb": "node scripts/test-mariadb-smoke.mjs",
-    "verify": "npm test && npm run test:core && npm run test:browser"
+    "verify": "npm test && npm run test:core && npm run test:browser && npm run test:mario"
   },
   "engines": {
     "node": ">=22"

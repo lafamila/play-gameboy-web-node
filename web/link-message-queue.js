@@ -1,14 +1,3 @@
-export const MASTER_HANDSHAKE = 0x8fff;
-export const SLAVE_HANDSHAKE = 0xb9a0;
-
-export function hostTransferData(data, guestHandshakePending = false) {
-  return guestHandshakePending || data === SLAVE_HANDSHAKE ? MASTER_HANDSHAKE : data;
-}
-
-export function isSlaveHandshake(data) {
-  return data === SLAVE_HANDSHAKE;
-}
-
 export class LinkMessageQueue {
   constructor() {
     this.offers = new Map();
@@ -23,11 +12,17 @@ export class LinkMessageQueue {
   }
 
   enqueueOffer(message) {
+    // A repeated offer can be the server replaying a response that was lost
+    // with the previous WebSocket. Server submissions are idempotent.
+    this.prepared.delete(message.sequence);
     this.offers.set(message.sequence, { ...message });
   }
 
   enqueuePair(message) {
-    this.pairs.set(message.sequence, { ...message });
+    this.pairs.set(message.sequence, {
+      ...message,
+      dataBySlot: [...message.dataBySlot],
+    });
   }
 
   drain(adapter) {
@@ -36,42 +31,37 @@ export class LinkMessageQueue {
     if (adapter.transferActive()) return false;
 
     const pair = this.pairs.get(sequence);
-    if (adapter.slot === 1) {
-      const offer = !this.prepared.has(sequence) && (this.offers.get(sequence) ?? (pair ? {
-        sequence,
-        speed: pair.speed,
-        data: pair.masterData,
-        ticks: pair.ticks,
-      } : null));
-      if (offer) {
-        const slaveData = adapter.prepareRemote(offer.sequence, offer.speed, offer.data, offer.ticks);
-        if (slaveData < 0) return false;
-        if (!adapter.sendResponse({
-          type: 'link-response',
-          sequence: offer.sequence,
-          speed: offer.speed,
-          data: slaveData,
-          ticks: offer.ticks,
-        })) return false;
-        this.offers.delete(sequence);
-        this.prepared.add(sequence);
-      }
+    if (pair) {
+      const applied = adapter.applyTransfer(pair);
+      if (!applied) return false;
+      this.pairs.delete(sequence);
+      this.offers.delete(sequence);
+      this.prepared.delete(sequence);
+      adapter.onPairApplied(pair);
+      return true;
     }
 
-    if (adapter.transferActive()) return false;
-    if (!pair) return false;
-    const applied = adapter.applyPair(
-      pair.sequence,
-      pair.speed,
-      pair.masterData,
-      pair.slaveData,
-    );
-    if (!applied) return false;
-    this.pairs.delete(sequence);
+    const offer = !this.prepared.has(sequence) ? this.offers.get(sequence) : null;
+    if (!offer || offer.initiatorSlot === adapter.slot) return false;
+    const status = adapter.prepareRemote(offer);
+    if (status < 0) {
+      this.offers.delete(sequence);
+      return false;
+    }
+    if (status === 0) return false;
+    if (!adapter.sendResponse({
+      type: 'sio-response',
+      sequence: offer.sequence,
+      mode: offer.mode,
+      bits: offer.bits,
+      speed: offer.speed,
+      initiatorSlot: offer.initiatorSlot,
+      data: adapter.responseData(),
+      ticks: offer.ticks,
+    })) return false;
     this.offers.delete(sequence);
-    this.prepared.delete(sequence);
-    adapter.onPairApplied(pair);
-    return true;
+    this.prepared.add(sequence);
+    return false;
   }
 
   get pendingOffers() { return this.offers.size; }

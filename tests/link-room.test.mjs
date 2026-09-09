@@ -4,10 +4,22 @@ import test from 'node:test';
 import { LinkRoomCoordinator } from '../lib/link-room.mjs';
 
 const compatibility = {
-  coreVersion: 'vba-link-web-1.7.2+wasm.4',
-  protocolVersion: 'gba-cable-v1',
-  gameGroup: 'pokemon-gen3:k',
+  coreVersion: 'vba-1.7.2-generic-sio-v3',
+  protocolVersion: 'gba-sio-v3',
+  gameGroup: 'rom:exact-rom-hash',
 };
+
+function transfer(overrides = {}) {
+  return {
+    mode: 2,
+    bits: 16,
+    speed: 3,
+    initiatorSlot: 0,
+    data: 0x1234,
+    ticks: 8520,
+    ...overrides,
+  };
+}
 
 function hasCode(code) {
   return (error) => {
@@ -49,7 +61,14 @@ test('room admission assigns two distinct authenticated accounts and validates t
   assert.equal(waiting.id, 'generated-room');
   assert.equal(waiting.status, 'waiting');
   assert.deepEqual(waiting.participants, [
-    { slot: 0, accountId: 'host-account', connected: true, ready: false, romHash: 'host-rom' },
+    {
+      slot: 0,
+      accountId: 'host-account',
+      connected: true,
+      ready: false,
+      bootKind: 'cartridge',
+      romHash: 'host-rom',
+    },
     null,
   ]);
   assert.equal(JSON.stringify(waiting).includes('sha256:invite-hash'), false);
@@ -122,16 +141,17 @@ test('room admission assigns two distinct authenticated accounts and validates t
   );
 });
 
-test('serial transfers are a monotonic two-slot barrier with idempotent duplicates', async () => {
+test('SIO transfers are a monotonic two-slot barrier with idempotent duplicates', async () => {
   const coordinator = createActiveRoom();
   const first = coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'host-account',
     sequence: 0,
-    payload: { outgoing: 0x12, clock: 512 },
+    phase: 'offer',
+    payload: transfer({ data: 0x12 }),
   });
   let settled = false;
-  first.then(() => { settled = true; });
+  first.promise.then(() => { settled = true; });
   await Promise.resolve();
   assert.equal(settled, false);
 
@@ -139,65 +159,78 @@ test('serial transfers are a monotonic two-slot barrier with idempotent duplicat
     roomId: 'room-1',
     accountId: 'host-account',
     sequence: 0,
-    payload: { outgoing: 0x12, clock: 512 },
+    phase: 'offer',
+    payload: transfer({ data: 0x12 }),
   });
-  assert.strictEqual(duplicate, first);
+  assert.equal(duplicate.accepted, false);
+  assert.strictEqual(duplicate.promise, first.promise);
   assert.throws(() => coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'host-account',
     sequence: 0,
-    payload: { outgoing: 0x13, clock: 512 },
+    phase: 'offer',
+    payload: transfer({ data: 0x13 }),
   }), hasCode('DUPLICATE_CONFLICT'));
   assert.throws(() => coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'guest-account',
     sequence: 1,
-    payload: { outgoing: 0x34, clock: 512 },
+    phase: 'response',
+    payload: transfer({ data: 0x34 }),
   }), hasCode('INVALID_SEQUENCE'));
 
   const second = coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'guest-account',
     sequence: 0,
-    payload: { outgoing: 0x34, clock: 512 },
+    phase: 'response',
+    payload: transfer({ data: 0x34 }),
   });
-  assert.strictEqual(second, first);
-  const result = await first;
+  assert.strictEqual(second.promise, first.promise);
+  const result = await first.promise;
   assert.deepEqual(result, {
     sequence: 0,
-    payloads: [
-      { slot: 0, accountId: 'host-account', payload: { outgoing: 0x12, clock: 512 } },
-      { slot: 1, accountId: 'guest-account', payload: { outgoing: 0x34, clock: 512 } },
-    ],
+    mode: 2,
+    bits: 16,
+    speed: 3,
+    initiatorSlot: 0,
+    ticks: 8520,
+    dataBySlot: [0x12, 0x34],
   });
-  assert.strictEqual(await second, result);
+  assert.strictEqual(await second.promise, result);
   assert.equal(coordinator.getRoom({ roomId: 'room-1', accountId: 'host-account' }).nextTransferSequence, 1);
 
-  assert.deepEqual(await coordinator.submitTransfer({
+  const completedDuplicate = coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'host-account',
     sequence: 0,
-    payload: { outgoing: 0x12, clock: 512 },
-  }), result);
+    phase: 'offer',
+    payload: transfer({ data: 0x12 }),
+  });
+  assert.equal(completedDuplicate.accepted, false);
+  assert.deepEqual(await completedDuplicate.promise, result);
   assert.throws(() => coordinator.submitTransfer({
     roomId: 'room-1',
     accountId: 'host-account',
     sequence: 2,
-    payload: 0x55,
+    phase: 'offer',
+    payload: transfer(),
   }), hasCode('INVALID_SEQUENCE'));
 });
 
 test('disconnect pauses barriers and a compatible reconnect resumes the active room', async () => {
   const coordinator = createActiveRoom();
   const pending = coordinator.submitTransfer({
-    roomId: 'room-1', accountId: 'host-account', sequence: 0, payload: Uint8Array.of(0x11),
+    roomId: 'room-1', accountId: 'host-account', sequence: 0,
+    phase: 'offer', payload: transfer({ data: 0x11 }),
   });
   const paused = coordinator.disconnect({ roomId: 'room-1', accountId: 'guest-account' });
   assert.equal(paused.status, 'active');
   assert.equal(paused.paused, true);
   assert.equal(paused.participants[1].connected, false);
   assert.throws(() => coordinator.submitTransfer({
-    roomId: 'room-1', accountId: 'guest-account', sequence: 0, payload: Uint8Array.of(0x22),
+    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
+    phase: 'response', payload: transfer({ data: 0x22 }),
   }), hasCode('ROOM_PAUSED'));
   assert.throws(() => coordinator.reconnect({
     roomId: 'room-1', accountId: 'guest-account', ...compatibility, coreVersion: 'other-core',
@@ -209,28 +242,122 @@ test('disconnect pauses barriers and a compatible reconnect resumes the active r
   assert.equal(resumed.paused, false);
   assert.equal(resumed.participants[1].connected, true);
   coordinator.submitTransfer({
-    roomId: 'room-1', accountId: 'guest-account', sequence: 0, payload: Uint8Array.of(0x22),
+    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
+    phase: 'response', payload: transfer({ data: 0x22 }),
   });
-  const result = await pending;
-  assert.deepEqual([...result.payloads[0].payload], [0x11]);
-  assert.deepEqual([...result.payloads[1].payload], [0x22]);
+  const result = await pending.promise;
+  assert.deepEqual(result.dataBySlot, [0x11, 0x22]);
   assert.equal(coordinator.syncTransfer({
     roomId: 'room-1', accountId: 'host-account', sequence: 0,
   }).status, 'completed');
 });
 
-test('reconnect sync exposes a pending host offer without advancing the barrier', () => {
+test('reconnect sync exposes a pending offer from either initiator without advancing the barrier', () => {
   const coordinator = createActiveRoom();
   coordinator.submitTransfer({
-    roomId: 'room-1', accountId: 'host-account', sequence: 0,
-    payload: { speed: 3, data: 0x1234 },
+    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
+    phase: 'offer',
+    payload: transfer({ mode: 1, bits: 32, initiatorSlot: 1, data: 0x89abcdef }),
   });
   assert.deepEqual(coordinator.syncTransfer({
-    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
-  }), { status: 'waiting-for-guest', hostPayload: { speed: 3, data: 0x1234 } });
+    roomId: 'room-1', accountId: 'host-account', sequence: 0,
+  }), {
+    status: 'waiting-for-response',
+    initiatorSlot: 1,
+    offer: transfer({ mode: 1, bits: 32, initiatorSlot: 1, data: 0x89abcdef }),
+  });
   assert.equal(coordinator.getRoom({
     roomId: 'room-1', accountId: 'host-account',
   }).nextTransferSequence, 0);
+});
+
+test('only slot 0 can initiate Multiplayer while slot 1 can initiate Normal transfers', async () => {
+  const coordinator = createActiveRoom();
+  assert.throws(() => coordinator.submitTransfer({
+    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
+    phase: 'offer', payload: transfer({ initiatorSlot: 1 }),
+  }), hasCode('INVALID_TRANSFER_ROLE'));
+
+  const offer = coordinator.submitTransfer({
+    roomId: 'room-1', accountId: 'guest-account', sequence: 0,
+    phase: 'offer',
+    payload: transfer({ mode: 0, bits: 8, initiatorSlot: 1, data: 0xfe }),
+  });
+  coordinator.submitTransfer({
+    roomId: 'room-1', accountId: 'host-account', sequence: 0,
+    phase: 'response',
+    payload: transfer({ mode: 0, bits: 8, initiatorSlot: 1, data: 0xdc }),
+  });
+  assert.deepEqual((await offer.promise).dataBySlot, [0xdc, 0xfe]);
+});
+
+test('multiboot guests participate in ready/start but not persistence barriers', async () => {
+  const coordinator = new LinkRoomCoordinator();
+  coordinator.createRoom({
+    roomId: 'single-pak-room',
+    accountId: 'host-account',
+    inviteSecretHash: 'sha256:invite-hash',
+    romHash: 'host-rom',
+    ...compatibility,
+  });
+  const joined = coordinator.joinRoom({
+    roomId: 'single-pak-room',
+    accountId: 'guest-account',
+    inviteSecretHash: 'sha256:invite-hash',
+    bootKind: 'multiboot-client',
+    romHash: null,
+    ...compatibility,
+  });
+  assert.deepEqual(joined.participants[1], {
+    slot: 1,
+    accountId: 'guest-account',
+    connected: true,
+    ready: false,
+    bootKind: 'multiboot-client',
+    romHash: null,
+  });
+  coordinator.setReady({ roomId: 'single-pak-room', accountId: 'host-account' });
+  coordinator.setReady({ roomId: 'single-pak-room', accountId: 'guest-account' });
+  coordinator.startRoom({ roomId: 'single-pak-room', accountId: 'host-account' });
+
+  const checkpoint = coordinator.submitCheckpoint({
+    roomId: 'single-pak-room',
+    accountId: 'host-account',
+    sequence: 0,
+    state: { frame: 120 },
+  });
+  assert.equal(checkpoint.accepted, true);
+  assert.deepEqual(checkpoint.checkpoint.states, [{
+    slot: 0,
+    accountId: 'host-account',
+    state: { frame: 120 },
+  }]);
+  assert.throws(() => coordinator.submitCheckpoint({
+    roomId: 'single-pak-room',
+    accountId: 'guest-account',
+    sequence: 1,
+    state: { frame: 120 },
+  }), hasCode('CHECKPOINT_NOT_APPLICABLE'));
+
+  const commit = await coordinator.finish({
+    roomId: 'single-pak-room',
+    accountId: 'host-account',
+    batteryMetadata: { sha256: 'host-battery', byteLength: 131072 },
+  });
+  assert.equal(commit.checkpoint.sequence, 0);
+  assert.deepEqual(commit.batteryMetadata, [{
+    slot: 0,
+    accountId: 'host-account',
+    metadata: { sha256: 'host-battery', byteLength: 131072 },
+  }]);
+  assert.equal(coordinator.getRoom({
+    roomId: 'single-pak-room', accountId: 'guest-account',
+  }).status, 'completed');
+  assert.throws(() => coordinator.finish({
+    roomId: 'single-pak-room',
+    accountId: 'guest-account',
+    batteryMetadata: { sha256: 'none', byteLength: 0 },
+  }), hasCode('BATTERY_NOT_APPLICABLE'));
 });
 
 test('checkpoint sequence advances only after both slot states are paired', () => {
@@ -303,8 +430,8 @@ test('finish waits for both battery metadata submissions and yields one atomic c
   assert.equal(commit.roomId, 'room-1');
   assert.deepEqual(commit.compatibility, compatibility);
   assert.deepEqual(commit.participants, [
-    { slot: 0, accountId: 'host-account' },
-    { slot: 1, accountId: 'guest-account' },
+    { slot: 0, accountId: 'host-account', bootKind: 'cartridge' },
+    { slot: 1, accountId: 'guest-account', bootKind: 'cartridge' },
   ]);
   assert.equal(commit.checkpoint.sequence, 0);
   assert.deepEqual(commit.batteryMetadata.map((entry) => entry.metadata), [hostMetadata, guestMetadata]);
@@ -322,15 +449,16 @@ test('finish waits for both battery metadata submissions and yields one atomic c
 
 test('abort rejects pending barriers and never exposes a commit package', async () => {
   const transferRoom = createActiveRoom('transfer-room');
-  const transfer = transferRoom.submitTransfer({
-    roomId: 'transfer-room', accountId: 'host-account', sequence: 0, payload: 0x66,
+  const pendingTransfer = transferRoom.submitTransfer({
+    roomId: 'transfer-room', accountId: 'host-account', sequence: 0,
+    phase: 'offer', payload: transfer({ data: 0x66 }),
   });
   const aborted = transferRoom.abort({
     roomId: 'transfer-room', accountId: 'guest-account', reason: 'guest cancelled',
   });
   assert.equal(aborted.status, 'aborted');
   assert.equal(aborted.abortReason, 'guest cancelled');
-  await assert.rejects(transfer, hasCode('ROOM_ABORTED'));
+  await assert.rejects(pendingTransfer.promise, hasCode('ROOM_ABORTED'));
   assert.equal(transferRoom.getCommitPackage({ roomId: 'transfer-room', accountId: 'host-account' }), null);
   assert.equal(transferRoom.abort({
     roomId: 'transfer-room', accountId: 'host-account', reason: 'ignored duplicate',

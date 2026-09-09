@@ -92,6 +92,7 @@ test('two-player link rooms track participant state and lock battery saves', asy
   assert.deepEqual(active.participants[0], {
     accountId: 'host',
     romId: FIRE_RED_ROM_ID,
+    bootKind: 'cartridge',
     slot: 0,
     ready: true,
     connected: true,
@@ -99,6 +100,55 @@ test('two-player link rooms track participant state and lock battery saves', asy
     joinedAt: 20,
     updatedAt: 23,
   });
+});
+
+test('Single-Pak rooms persist an ephemeral guest without ROM or save lock', async () => {
+  const database = await databaseWithRom();
+  await database.putSave('host', FIRE_RED_ROM_ID, 'battery', Buffer.from('host-before'), 10);
+  await database.createLinkRoom({
+    id: 'single-pak-room', romId: FIRE_RED_ROM_ID, accountId: 'host', now: 20,
+  });
+  const joined = await database.joinLinkRoom('single-pak-room', {
+    accountId: 'guest', bootKind: 'multiboot-client', romId: null,
+  }, 21);
+  assert.deepEqual(joined.participants.map((participant) => ({
+    accountId: participant.accountId,
+    bootKind: participant.bootKind,
+    romId: participant.romId,
+    saveRevision: participant.saveRevision,
+  })), [
+    {
+      accountId: 'host', bootKind: 'cartridge', romId: FIRE_RED_ROM_ID, saveRevision: 1,
+    },
+    {
+      accountId: 'guest', bootKind: 'multiboot-client', romId: null, saveRevision: null,
+    },
+  ]);
+  assert.equal(database.linkSaveLocks.size, 1);
+  await database.putSave('guest', FIRE_RED_ROM_ID, 'battery', Buffer.from('guest-unlocked'), 22);
+
+  const checkpoint = await database.putLinkCheckpointPair('single-pak-room', 0, [
+    { accountId: 'host', payload: Buffer.from('host-state') },
+  ], 23);
+  assert.equal(checkpoint.checkpoints.length, 1);
+  await assert.rejects(database.putLinkCheckpoint(
+    'single-pak-room', 'guest', 1, Buffer.from('ephemeral'), 24,
+  ), { code: 'LINK_CHECKPOINT_NOT_APPLICABLE' });
+
+  const committed = await database.commitPairedBatterySaves('single-pak-room', [
+    { accountId: 'host', payload: Buffer.from('host-after') },
+  ], 25);
+  assert.deepEqual(committed.saves, [{ accountId: 'host', revision: 2 }]);
+  assert.equal(
+    (await database.getSave('host', FIRE_RED_ROM_ID, 'battery')).payload.toString(),
+    'host-after',
+  );
+  assert.equal(
+    (await database.getSave('guest', FIRE_RED_ROM_ID, 'battery')).payload.toString(),
+    'guest-unlocked',
+  );
+  assert.equal(database.linkSaveLocks.size, 0);
+  assert.equal(database.playAdmissionLocks.size, 0);
 });
 
 test('link checkpoints are exposed only as complete participant pairs', async () => {

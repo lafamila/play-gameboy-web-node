@@ -347,6 +347,7 @@ async function handleRequest(context) {
           accountId: session.accountId,
           inviteCode: body.inviteCode,
           romId: body.romId,
+          bootKind: body.bootKind,
         });
         return json(response, 200, { room });
       }
@@ -493,6 +494,7 @@ async function handleRequest(context) {
       player2Mode,
       player1RomId: body.player1RomId,
       player2RomId: body.player2RomId,
+      player2BootKind: body.player2BootKind ?? body.bootKind,
     });
     return json(response, 201, {
       session: publicLocalSession(localSession),
@@ -695,6 +697,7 @@ function publicLocalSession(session) {
     participants: session.participants.map((participant) => ({
       slot: participant.slot,
       romId: participant.romId,
+      bootKind: participant.bootKind,
       profileKey: participant.profileKey,
       ready: Boolean(participant.ready),
     })),
@@ -811,22 +814,20 @@ function appendHeader(response, name, value) {
 function localLinkDiagnostic(value) {
   const result = {};
   for (const key of [
-    'lastPairSequence', 'lastReleaseSequence', 'pairCount', 'pumpBurst',
+    'lastPairSequence', 'pairCount',
   ]) {
     if (Number.isSafeInteger(value?.[key])) result[key] = value[key];
-  }
-  if (typeof value?.guestHandshakePending === 'boolean') {
-    result.guestHandshakePending = value.guestHandshakePending;
   }
   result.players = Array.isArray(value?.players) ? value.players.slice(0, 2).map((player) => {
     const state = {};
     for (const key of [
-      'slot', 'player', 'sequence', 'requestData', 'requestTicks', 'linkTime',
-      'siocnt', 'rcnt', 'frameCount', 'emulationSteps', 'pumpBurst',
+      'slot', 'player', 'sequence', 'mode', 'requestMode', 'requestBits',
+      'requestInitiator', 'requestData', 'requestTicks', 'linkTime',
+      'siocnt', 'rcnt', 'frameCount', 'emulationSteps', 'cycleDebt',
     ]) {
       if (Number.isSafeInteger(player?.[key])) state[key] = player[key];
     }
-    for (const key of ['waiting', 'transferActive', 'requestPending', 'guestHeld']) {
+    for (const key of ['waiting', 'transferActive', 'requestPending']) {
       if (typeof player?.[key] === 'boolean') state[key] = player[key];
     }
     return state;
@@ -861,7 +862,7 @@ function attachLinkWebSockets({ server, config, database, auth, linkService }) {
   function trace(event, fields = {}) {
     if (!config.linkDebug) return;
     if (Number.isSafeInteger(fields.sequence) &&
-        ['link-offer', 'link-response', 'link-pair'].includes(fields.type) &&
+        ['sio-offer', 'sio-response', 'sio-pair'].includes(fields.type) &&
         fields.sequence >= 10 && fields.sequence % 100 !== 0) return;
     console.info('[link]', JSON.stringify({ event, ...fields }));
   }
@@ -871,15 +872,15 @@ function attachLinkWebSockets({ server, config, database, auth, linkService }) {
     if (!state || typeof state !== 'object' || Array.isArray(state)) return {};
     const fields = {};
     for (const key of [
-      'slot', 'corePlayer', 'sequence', 'requestData', 'requestTicks', 'linkTime',
+      'slot', 'corePlayer', 'sequence', 'mode', 'requestMode', 'requestBits',
+      'requestInitiator', 'requestData', 'requestTicks', 'linkTime',
       'siocnt', 'rcnt', 'siodata8', 'lastOfferSequence', 'pendingOffers', 'pendingPairs',
       'preparedResponses', 'frameCount',
+      'cycleDebt',
     ]) {
       if (Number.isSafeInteger(state[key])) fields[key] = state[key];
     }
-    for (const key of [
-      'waiting', 'transferActive', 'requestPending', 'guestHeld', 'guestHandshakePending',
-    ]) {
+    for (const key of ['waiting', 'transferActive', 'requestPending']) {
       if (typeof state[key] === 'boolean') fields[key] = state[key];
     }
     return fields;
@@ -921,13 +922,21 @@ function attachLinkWebSockets({ server, config, database, auth, linkService }) {
     }
     trace('send', {
       roomId, targetAccountId, targetCount, type: message?.type, sequence: message?.sequence,
-      ...(['link-offer', 'link-response'].includes(message?.type)
-        ? { data: message?.data, ticks: message?.ticks }
-        : message?.type === 'link-pair'
+      ...(['sio-offer', 'sio-response'].includes(message?.type)
+        ? {
+            mode: message?.mode,
+            bits: message?.bits,
+            initiatorSlot: message?.initiatorSlot,
+            data: message?.data,
+            ticks: message?.ticks,
+          }
+        : message?.type === 'sio-pair'
           ? {
+              mode: message?.mode,
+              bits: message?.bits,
+              initiatorSlot: message?.initiatorSlot,
               ticks: message?.ticks,
-              masterData: message?.masterData,
-              slaveData: message?.slaveData,
+              dataBySlot: message?.dataBySlot,
             }
           : {}),
     });
@@ -977,8 +986,14 @@ function attachLinkWebSockets({ server, config, database, auth, linkService }) {
         catch { throw new AuthError(400, 'Invalid link message JSON'); }
         trace('receive', {
           roomId, accountId, type: message?.type, sequence: message?.sequence,
-          ...(['link-offer', 'link-response'].includes(message?.type)
-            ? { data: message?.data, ticks: message?.ticks }
+          ...(['sio-offer', 'sio-response'].includes(message?.type)
+            ? {
+                mode: message?.mode,
+                bits: message?.bits,
+                initiatorSlot: message?.initiatorSlot,
+                data: message?.data,
+                ticks: message?.ticks,
+              }
             : {}),
         });
         if (message?.type === 'diagnostic') {

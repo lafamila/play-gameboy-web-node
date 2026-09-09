@@ -56,10 +56,10 @@ Single Play page
 ```
 
 - 싱글 플레이는 브라우저의 기존 VBA 1.7.2 WASM 코어를 사용한다.
-- GBA 링크방은 VBA Link 1.72의 multiplayer register/timing 로직을 이식한 같은 코어를 사용한다.
+- GBA 링크방은 같은 VBA 1.7.2 코어의 하드웨어 지향 SIO 계층을 사용한다. Normal 8/32-bit와 Multiplayer 16-bit는 mode/width/baud/IRQ 계약 하나로 처리하며 ROM/game code별 분기를 금지한다.
 - 서버는 영상/프레임을 중계하지 않고 serial transfer sequence만 동기화한다.
-- 각 참가자는 자신의 ROM과 account-scoped battery save를 사용한다.
-- 링크 종료 시 두 battery save를 한 DB transaction으로 함께 반영한다.
+- cartridge 참가자는 자신의 ROM과 account-scoped battery save를 사용한다. Single-Pak `multiboot-client` 참가자는 ROM/save lock 없이 동작하는 임시 수신자다.
+- 링크 종료 시 cartridge 참가자들의 battery save만 한 DB transaction으로 함께 반영한다.
 - 명시적 Leave/Abort는 방 전체를 종료하고 양쪽 save lock을 즉시 해제한다.
 - 비정상 disconnect는 60초 동안 재접속을 허용한 뒤 자동 abort하며, 같은 계정/ROM으로 새 방을 만들면 stale room을 먼저 정리한다.
 - 활성 링크방에서는 가속과 개별 quick load/import를 금지한다.
@@ -75,9 +75,11 @@ Single Play page
 - remote Ready/Start도 persisted expected status를 row lock에서 검증하며 abort 이후 terminal room을 되살릴 수 없다. 동일 checkpoint retry는 저장된 pair/metadata와 완전히 같을 때만 idempotent하다.
 - real-core cable probe export는 `VBA_LINK_TEST_PROBE` browser test build에만 포함하고 `.build/core-probe`에서 실행 후 삭제한다. production `core/dist`에는 probe surface가 없다.
 - local 2P와 remote Room은 server/UI 양쪽에서 상호 배타다. direct local cable은 두 독립 WASM memory 사이에서만 교환하며 WebSocket을 만들지 않는다.
-- remote Room과 local 2P는 `pumpLinkRuntime`의 동일한 코어 진행 순서(`drain → offer/run → drain → release`)를 공유한다. transport만 각각 WebSocket barrier와 in-memory pair로 분리한다.
-- GBA multiplayer 연결 중에는 `RCNT`의 SC/SD/SI cable input을 코어가 합성한다. guest IRQ release 지연은 Pokémon Gen 3 호환 그룹에만 적용하고 다른 ROM은 host idle 시 해제한다.
-- local split 진입/P2 Load만으로 session/lock을 만들거나 P1을 pause하지 않는다. 두 runtime은 독립 실행·autosave하고 Ready는 local UI state만 바꾼다. P1 Start 시에만 양쪽 battery flush 후 session/lock → server Ready → initial paired checkpoint → cable attach 순서로 전환한다.
+- remote Room과 local 2P는 링크 중 두 코어를 4,096-cycle slice로 진행한다. frame 단위 실행은 한 프레임에 여러 번 통신하는 게임에서 responder를 앞서가게 하므로 사용하지 않으며, transport만 각각 WebSocket barrier와 in-memory pair로 분리한다.
+- GBA 연결 중에는 현재 SIO mode와 peer port state로 `SIOCNT`/`RCNT` cable input을 코어가 합성한다. 특정 ROM, 게임 코드, 전송 payload를 검사하거나 수정하지 않는다.
+- Single-Pak은 host 게임의 documented MultiBoot 흐름과 clean-room receiver를 사용한다. 수신 완료 후 같은 VBA 코어의 WRAM multiboot 경로로 전환하며 Nintendo BIOS는 배포하지 않는다.
+- Wireless Adapter, JoyBus 및 특수 cartridge peripheral은 현재 범위 밖이다.
+- local split 진입/P2 Load만으로 session/lock을 만들거나 P1을 pause하지 않는다. cartridge runtime은 독립 실행·autosave하고 Ready는 local UI state만 바꾼다. P1 Start 시에만 cartridge battery flush 후 session/lock → server Ready → 가능한 initial checkpoint → cable attach 순서로 전환한다.
 - cable preparing/active 중에만 speed와 개별 quick load/import/export를 막고, P2 audio는 기본 mute다. P1/P2 gamepad는 index 0/1로 고정한다.
 - local 2P 독립 실행 중에는 P1/P2 각각 quick save/load와 `2x` speed를 사용할 수 있다. cable preparing/active에서는 두 runtime 모두 해당 제어를 표시하되 비활성화하고, cable 자체는 화면 프레임 기준 정상 속도로 유지한다.
 - P1/P2의 screen, playback bar, touch controller, keymap은 `player-runtime-template`과 `mountPlayerRuntime`을 공유한다. 플레이어별로는 element ID, keymap, 초기 mute, cable Start 소유권만 설정한다.
